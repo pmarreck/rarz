@@ -1,0 +1,21 @@
+# PLAN
+
+- [x] Create initial RAR format specification draft (`RAR_SPECIFICATION.md`) (2026-02-19 EST)
+- [x] Add architecture constraints: Zig in-memory core + C FFI + C drop-in CLI (`rarz`) (2026-02-19 EST)
+- [x] Add required LLM cleanroom attestation header template with signed/date requirement (2026-02-19 EST)
+- [ ] Define and freeze C ABI surface (versioning, opaque handles, memory-buffer-first APIs)
+- [ ] Scaffold Zig core library crate with no direct filesystem/process I/O
+- [ ] Implement C CLI wrapper `rarz` that routes all operations through C FFI (dogfood gate)
+- [ ] Build argument-compatibility matrix against official `rar` CLI grammar (supported subset)
+- [ ] Build binary fixture corpus (official-tool generated + real-world samples)
+- [ ] Implement signature scanner with SFX prefix support
+- [ ] Implement bounded reader primitives (`le`, `vint`, checked seeks)
+- [ ] Implement RAR 1.5-4.x structural parser + header CRC checks
+- [ ] Implement RAR5 structural parser + header CRC checks + extras parser
+- [ ] Implement validation policy mapping (`signature|structural|full`, encrypted-content handling)
+- [ ] Add deterministic 5x corruption harness with seed-based PRNG
+- [ ] Classify corruption opacity per RAR profile (`transparent|opaque|mixed`)
+- [ ] Add payload integrity verification for unencrypted supported methods
+- [ ] Add interoperability gate A: official-encoded archives decode in `rarz`
+- [ ] Add writer MVP (RAR5 store-only) and interoperability gate B: `rarz` output decodes in official tools
+- [ ] Expand method support and multi-volume reconstruction behavior

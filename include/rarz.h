@@ -96,12 +96,14 @@ typedef struct {
 rarz_validation_result rarz_validate(const uint8_t *data, size_t len);
 
 /* ========================================================================== */
-/* Extraction (store method only)                                             */
+/* Extraction                                                                 */
 /* ========================================================================== */
 
 /**
  * Extract file by index to caller-provided buffer.
- * Returns: bytes written on success, -1 on error, -2 if buffer too small.
+ * Supports both stored and compressed files (all RAR versions: v15/v20/v26/v29/v50/v70).
+ * Returns: bytes written on success, -1 on error, -2 if buffer too small,
+ *          -3 on decompression error.
  */
 int64_t rarz_extract_to_buffer(const rarz_archive *archive, uint32_t index,
                                uint8_t *out_buf, size_t out_len);

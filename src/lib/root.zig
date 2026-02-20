@@ -22,6 +22,7 @@ pub const rar5_headers = @import("rar5_headers.zig");
 pub const reader = @import("reader.zig");
 pub const policy = @import("policy.zig");
 pub const writer = @import("writer.zig");
+const dispatch = @import("decompress/dispatch.zig");
 
 // ============================================================================
 // Archive Handle (opaque to C callers)
@@ -273,38 +274,63 @@ export fn rarz_extract_to_buffer(
 		if (index >= files.len) return -1;
 		const f = files[index];
 
-		// Only support store method (method == 0)
-		if (f.compression.method != 0) return -1;
-
 		const data_size = f.header.data_size orelse return -1;
-		if (data_size > out_len) return -2;
 
 		// header_start is relative to block_data; add block_data_offset for full archive offset
 		const header_end = a.block_data_offset + f.header.header_start + 4 + f.header.crc_data_len;
 		if (header_end + data_size > a.data.len) return -1;
-		const file_data = a.data[header_end .. header_end + @as(usize, @intCast(data_size))];
+		const packed_data = a.data[header_end .. header_end + @as(usize, @intCast(data_size))];
 
-		@memcpy(buf[0..file_data.len], file_data);
-		return @intCast(file_data.len);
+		if (f.compression.method == 0) {
+			// Store: direct copy
+			if (data_size > out_len) return -2;
+			@memcpy(buf[0..packed_data.len], packed_data);
+			return @intCast(packed_data.len);
+		}
+
+		// Compressed: decompress via dispatch
+		if (f.unpacked_size > out_len) return -2;
+		const decompressed = dispatch.decompressRar5(
+			std.heap.page_allocator,
+			packed_data,
+			f.unpacked_size,
+			f.compression,
+		) catch return -3; // -3 = decompression error
+		defer std.heap.page_allocator.free(decompressed);
+		@memcpy(buf[0..decompressed.len], decompressed);
+		return @intCast(decompressed.len);
 	}
 
 	if (a.rar4_files) |files| {
 		if (index >= files.len) return -1;
 		const f = files[index];
 
-		// Only support store method (method == 0)
-		if (f.method != 0) return -1;
-
-		if (f.packed_size > out_len) return -2;
-
 		// header_offset is relative to block_data; add block_data_offset for full archive offset
 		const data_start = a.block_data_offset + f.block.header_offset + f.block.head_size;
 		const data_end = data_start + @as(usize, @intCast(f.packed_size));
 		if (data_end > a.data.len) return -1;
-		const file_data = a.data[data_start..data_end];
+		const packed_data = a.data[data_start..data_end];
 
-		@memcpy(buf[0..file_data.len], file_data);
-		return @intCast(file_data.len);
+		if (f.method == 0) {
+			// Store: direct copy
+			if (f.packed_size > out_len) return -2;
+			@memcpy(buf[0..packed_data.len], packed_data);
+			return @intCast(packed_data.len);
+		}
+
+		// Compressed: decompress via dispatch
+		if (f.unpacked_size > out_len) return -2;
+		const decompressed = dispatch.decompressRar4(
+			std.heap.page_allocator,
+			packed_data,
+			f.unpacked_size,
+			f.unpack_version,
+			f.method,
+			f.block.flags,
+		) catch return -3; // -3 = decompression error
+		defer std.heap.page_allocator.free(decompressed);
+		@memcpy(buf[0..decompressed.len], decompressed);
+		return @intCast(decompressed.len);
 	}
 
 	return -1;
@@ -943,4 +969,5 @@ comptime {
 	_ = @import("decompress/unpack29.zig");
 	_ = @import("decompress/unpack20.zig");
 	_ = @import("decompress/unpack15.zig");
+	_ = @import("decompress/dispatch.zig");
 }

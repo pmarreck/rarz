@@ -72,11 +72,11 @@ See: `docs/plans/2026-02-20-phase2-decompression.md`
 - [ ] Build argument-compatibility matrix against official `rar` CLI grammar
 
 ## Phase 4: Distribution + CI
-- [ ] Add MIT License (`LICENSE`)
-- [ ] Add `build.zig.zon` for Zig package manager consumption
-- [ ] Create `rarz` repo on GitHub, set SSH remote, push
-- [ ] Create README.md with project overview and usage
-- [ ] Add Garnix CI configuration (`garnix.yaml` or `flake.nix` CI outputs)
-- [ ] Add GitHub Actions CI across 5 platforms (macOS Intel/ARM, Linux Intel/ARM, Windows Intel)
-- [ ] Verify CI passes on all platforms
-- [ ] Add CI badges to top of README.md
+- [x] Add MIT License (`LICENSE`) (2026-02-20 EST)
+- [x] Add `build.zig.zon` for Zig package manager consumption (2026-02-20 EST)
+- [x] Create `rarz` repo on GitHub, set SSH remote, push (2026-02-20 EST)
+- [x] Create README.md with project overview and usage (2026-02-20 EST)
+- [x] Add Garnix CI configuration (`garnix.yaml` + `flake.nix` CI outputs) (2026-02-20 EST)
+- [x] Add GitHub Actions CI across 4 platforms: macOS ARM, Linux Intel/ARM, Windows Intel (2026-02-20 EST)
+- [x] Verify CI passes on all platforms (2026-02-20 EST)
+- [x] Add CI badges to top of README.md (2026-02-20 EST)

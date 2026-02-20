@@ -1,5 +1,8 @@
 # rarz
 
+[![CI](https://github.com/pmarreck/rarz/actions/workflows/ci.yml/badge.svg)](https://github.com/pmarreck/rarz/actions/workflows/ci.yml)
+[![built with garnix](https://img.shields.io/endpoint.svg?url=https://garnix.io/api/badges/pmarreck/rarz)](https://garnix.io/repo/pmarreck/rarz)
+
 A clean-room RAR archive toolkit: parser, validator, extractor, and writer.
 
 Written in Zig with a C FFI and drop-in C CLI.

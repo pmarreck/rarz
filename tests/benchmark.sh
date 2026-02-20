@@ -9,7 +9,8 @@ set -euo pipefail
 #   - Archive creation speed (store mode only for rarz, compressed for rar)
 # =============================================================================
 
-RARZ="zig-out/bin/rarz"
+PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+RARZ="$PROJECT_ROOT/zig-out/bin/rarz"
 ITERATIONS=${BENCHMARK_ITERATIONS:-5}  # number of timing iterations
 
 # Ensure tools exist
@@ -115,7 +116,7 @@ for level in 0 1 2 3 4 5; do
 	# rarz only does store (m0) currently
 	if [ "$level" -eq 0 ]; then
 		rarz_archive="$tmpdir/rarz_store.rar"
-		cd "$(dirname "$0")/../.."  # back to project root
+		cd "$PROJECT_ROOT"
 		# Create individual file archives isn't great — use the API
 		# For now, create a single-file store archive
 		"$RARZ" a "$rarz_archive" "$tmpdir/corpus/text_200k.txt" "$tmpdir/corpus/code_150k.c" "$tmpdir/corpus/random_256k.bin" >/dev/null 2>&1 || true
@@ -162,7 +163,7 @@ echo "╠═══════════════════════�
 printf "║ %-22s │ %10s │ %10s │ %10s ║\n" "Archive" "unrar" "rarz" "Speedup"
 echo "╠══════════════════════════════════════════════════════════════════════╣"
 
-cd "$(dirname "$0")/../.."  # back to project root
+cd "$PROJECT_ROOT"
 
 for level in 0 1 3 5; do
 	archive="$tmpdir/rar_m${level}.rar"

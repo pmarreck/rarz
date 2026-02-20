@@ -934,4 +934,5 @@ comptime {
 	_ = reader;
 	_ = policy;
 	_ = writer;
+	_ = @import("decompress/bitreader.zig");
 }

@@ -215,47 +215,37 @@ export fn rarz_validate(data_ptr: ?[*]const u8, len: usize) RarzValidationResult
 	const slice = if (data_ptr) |d| d[0..len] else return invalid_result;
 	if (len == 0) return invalid_result;
 
-	// Depth 0: signature check
-	const format = detect.detect_format(slice, 0);
-	const family = format.family orelse return RarzValidationResult{
-		.is_valid = 0,
-		.depth = 0,
-		.family = 0,
-		.has_encrypted = 0,
-		.block_count = 0,
-		.file_count = 0,
-		.error_msg = "no RAR signature found",
+	// Delegate to the canonical validation implementation in policy.zig
+	const result = policy.validate(slice);
+
+	const family_code: i32 = if (result.family) |f| switch (f) {
+		.rar14 => @as(i32, 14),
+		.rar15 => @as(i32, 15),
+		.rar50 => @as(i32, 50),
+	} else 0;
+
+	const depth_code: i32 = switch (result.depth) {
+		.signature => 0,
+		.structural => 1,
+		.full => 2,
 	};
 
-	const family_code: i32 = switch (family) {
-		.rar14 => 14,
-		.rar15 => 15,
-		.rar50 => 50,
+	// All error messages from policy.validate are compile-time string literals,
+	// which are null-terminated in memory, so the pointer cast is safe.
+	const error_msg: ?[*:0]const u8 = if (result.error_message) |msg|
+		@ptrCast(msg.ptr)
+	else
+		null;
+
+	return RarzValidationResult{
+		.is_valid = @intFromBool(result.is_valid),
+		.depth = depth_code,
+		.family = family_code,
+		.has_encrypted = @intFromBool(result.has_encrypted_content),
+		.block_count = result.block_count,
+		.file_count = result.file_count,
+		.error_msg = error_msg,
 	};
-
-	// Depth 1: structural validation (walk blocks)
-	const block_data = slice[format.signature_offset + format.signature_len ..];
-
-	switch (family) {
-		.rar50 => {
-			return validateRar5Blocks(block_data, family_code);
-		},
-		.rar15 => {
-			return validateRar4Blocks(block_data, family_code);
-		},
-		.rar14 => {
-			// RAR 1.4 — signature-only validation
-			return RarzValidationResult{
-				.is_valid = 1,
-				.depth = 0,
-				.family = family_code,
-				.has_encrypted = 0,
-				.block_count = 0,
-				.file_count = 0,
-				.error_msg = null,
-			};
-		},
-	}
 }
 
 export fn rarz_extract_to_buffer(
@@ -406,142 +396,12 @@ fn collectRar4Files(alloc: std.mem.Allocator, block_data: []const u8) ![]rar4_he
 	return files.toOwnedSlice(alloc);
 }
 
-fn validateRar5Blocks(block_data: []const u8, family_code: i32) RarzValidationResult {
-	var block_count: u32 = 0;
-	var file_count: u32 = 0;
-	var has_encrypted: i32 = 0;
-	var all_crcs_valid = true;
-
-	var iter = rar5_headers.walk_blocks(block_data);
-	while (true) {
-		const block_opt = iter.next() catch {
-			return RarzValidationResult{
-				.is_valid = 0,
-				.depth = 1,
-				.family = family_code,
-				.has_encrypted = has_encrypted,
-				.block_count = block_count,
-				.file_count = file_count,
-				.error_msg = "block parse error",
-			};
-		};
-		const block = block_opt orelse break;
-		block_count += 1;
-
-		// Validate header CRC for each block
-		const header = switch (block) {
-			.main => |m| m.header,
-			.file => |f| f.header,
-			.service => |s| s.header,
-			.crypt => |c| c,
-			.end_archive => |e| e.header,
-			.unknown => |u| u,
-		};
-		if (!rar5_headers.validate_header_crc(block_data, header)) {
-			all_crcs_valid = false;
-		}
-
-		switch (block) {
-			.file => file_count += 1,
-			.crypt => has_encrypted = 1,
-			else => {},
-		}
-	}
-
-	if (!all_crcs_valid) {
-		return RarzValidationResult{
-			.is_valid = 0,
-			.depth = 1,
-			.family = family_code,
-			.has_encrypted = has_encrypted,
-			.block_count = block_count,
-			.file_count = file_count,
-			.error_msg = "header CRC mismatch",
-		};
-	}
-
-	const depth: i32 = if (block_count > 0) 1 else 0;
-	return RarzValidationResult{
-		.is_valid = 1,
-		.depth = depth,
-		.family = family_code,
-		.has_encrypted = has_encrypted,
-		.block_count = block_count,
-		.file_count = file_count,
-		.error_msg = null,
-	};
-}
-
-fn validateRar4Blocks(block_data: []const u8, family_code: i32) RarzValidationResult {
-	var block_count: u32 = 0;
-	var file_count: u32 = 0;
-	var has_encrypted: i32 = 0;
-
-	var iter = rar4_headers.walk_blocks(block_data);
-	while (true) {
-		const block_opt = iter.next() catch {
-			return RarzValidationResult{
-				.is_valid = 0,
-				.depth = 1,
-				.family = family_code,
-				.has_encrypted = has_encrypted,
-				.block_count = block_count,
-				.file_count = file_count,
-				.error_msg = "block parse error",
-			};
-		};
-		const block = block_opt orelse break;
-		block_count += 1;
-
-		switch (block) {
-			.file => |fh| {
-				file_count += 1;
-				const fflags = rar4_headers.parse_file_flags(fh.block.flags);
-				if (fflags.password) has_encrypted = 1;
-			},
-			.main => |m| {
-				const mflags = m.flags;
-				if (mflags.password) has_encrypted = 1;
-			},
-			else => {},
-		}
-	}
-
-	const depth: i32 = if (block_count > 0) 1 else 0;
-	return RarzValidationResult{
-		.is_valid = 1,
-		.depth = depth,
-		.family = family_code,
-		.has_encrypted = has_encrypted,
-		.block_count = block_count,
-		.file_count = file_count,
-		.error_msg = null,
-	};
-}
-
 // ============================================================================
 // Test helpers — build minimal RAR5 archives for testing
 // ============================================================================
 
 const testing = std.testing;
-
-/// Encode a u64 as a RAR5 vint. Returns number of bytes written.
-fn encode_vint(value: u64, buf: []u8) usize {
-	var v = value;
-	var i: usize = 0;
-	while (true) {
-		buf[i] = @intCast(v & 0x7F);
-		v >>= 7;
-		if (v != 0) {
-			buf[i] |= 0x80;
-			i += 1;
-		} else {
-			i += 1;
-			break;
-		}
-	}
-	return i;
-}
+const encode_vint = reader.encode_vint;
 
 /// Build a RAR5 block into `out`. Returns number of bytes written.
 /// CRC32 is computed and placed at bytes 0..3.
@@ -819,6 +679,7 @@ test "rarz_validate returns valid for archive with file" {
 	const result = rarz_validate(&buf, archive_len);
 	try testing.expectEqual(@as(i32, 1), result.is_valid);
 	try testing.expectEqual(@as(i32, 50), result.family);
+	try testing.expectEqual(@as(i32, 2), result.depth); // full (payload CRC verified)
 	try testing.expectEqual(@as(u32, 1), result.file_count);
 	try testing.expectEqual(@as(u32, 3), result.block_count); // main + file + end
 }

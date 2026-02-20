@@ -8,6 +8,10 @@ const integrity = @import("integrity.zig");
 const detect = @import("detect.zig");
 const rar5_headers = @import("rar5_headers.zig");
 const policy = @import("policy.zig");
+const reader_mod = @import("reader.zig");
+
+pub const encode_vint = reader_mod.encode_vint;
+pub const vint_size = reader_mod.vint_size;
 
 // ============================================================================
 // Types
@@ -25,39 +29,6 @@ pub const WriteError = error{
 	NameTooLong,
 	TooManyFiles,
 };
-
-// ============================================================================
-// Vint encoding
-// ============================================================================
-
-/// Encode a u64 as a RAR5 vint into out. Returns number of bytes written.
-pub fn encode_vint(value: u64, out: []u8) usize {
-	var v = value;
-	var i: usize = 0;
-	while (true) {
-		out[i] = @intCast(v & 0x7F);
-		v >>= 7;
-		if (v != 0) {
-			out[i] |= 0x80;
-			i += 1;
-		} else {
-			i += 1;
-			break;
-		}
-	}
-	return i;
-}
-
-/// Calculate how many bytes a vint encoding would take.
-pub fn vint_size(value: u64) usize {
-	var v = value;
-	var size: usize = 1;
-	while (v > 0x7F) {
-		v >>= 7;
-		size += 1;
-	}
-	return size;
-}
 
 // ============================================================================
 // Block writers
@@ -207,8 +178,6 @@ fn write_file_block(out: []u8, pos: usize, entry: FileEntry) usize {
 /// Calculate the size of a file block (header + data) for one entry.
 fn file_block_size(entry: FileEntry) usize {
 	const data_size: u64 = if (entry.is_directory) 0 else entry.data.len;
-	const data_crc = integrity.crc32(entry.data);
-	_ = data_crc;
 
 	// File flags
 	var file_flags: u64 = 0;

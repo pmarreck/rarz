@@ -381,24 +381,7 @@ pub fn walk_blocks(data: []const u8) BlockIterator {
 // Tests
 // ============================================================================
 
-/// Test helper: encode a u64 as a RAR5 vint into buf, returning the number
-/// of bytes written.
-fn encode_vint(value: u64, buf: []u8) usize {
-	var v = value;
-	var i: usize = 0;
-	while (true) {
-		buf[i] = @intCast(v & 0x7F);
-		v >>= 7;
-		if (v != 0) {
-			buf[i] |= 0x80;
-			i += 1;
-		} else {
-			i += 1;
-			break;
-		}
-	}
-	return i;
-}
+const encode_vint = reader_mod.encode_vint;
 
 /// Build a complete header byte slice for testing. Returns the number of
 /// bytes written into `out`. The CRC32 is computed and placed at bytes 0..3.

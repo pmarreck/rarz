@@ -37,23 +37,7 @@ pub const ValidationResult = struct {
 // Helpers
 // ============================================================================
 
-/// Encode a u64 as a RAR5 vint, returning the number of bytes written.
-fn encode_vint(value: u64, buf: []u8) usize {
-	var v = value;
-	var i: usize = 0;
-	while (true) {
-		buf[i] = @intCast(v & 0x7F);
-		v >>= 7;
-		if (v != 0) {
-			buf[i] |= 0x80;
-			i += 1;
-		} else {
-			i += 1;
-			break;
-		}
-	}
-	return i;
-}
+const encode_vint = reader_mod.encode_vint;
 
 /// Write a u16 in little-endian into a buffer at the given offset.
 fn write_u16_le(buf: []u8, offset: usize, val: u16) void {

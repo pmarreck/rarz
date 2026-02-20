@@ -71,6 +71,39 @@ pub const Reader = struct {
 	}
 };
 
+// ============================================================================
+// Standalone vint encoding (inverse of Reader.read_vint)
+// ============================================================================
+
+/// Encode a u64 as a RAR5 vint into `out`. Returns number of bytes written.
+pub fn encode_vint(value: u64, out: []u8) usize {
+	var v = value;
+	var i: usize = 0;
+	while (true) {
+		out[i] = @intCast(v & 0x7F);
+		v >>= 7;
+		if (v != 0) {
+			out[i] |= 0x80;
+			i += 1;
+		} else {
+			i += 1;
+			break;
+		}
+	}
+	return i;
+}
+
+/// Calculate the encoded byte length of a RAR5 vint without writing.
+pub fn vint_size(value: u64) usize {
+	var v = value;
+	var size: usize = 1;
+	while (v > 0x7F) {
+		v >>= 7;
+		size += 1;
+	}
+	return size;
+}
+
 // === TESTS ===
 
 test "read_u8 returns byte and advances" {

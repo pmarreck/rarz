@@ -33,12 +33,11 @@ const ArchiveHandle = struct {
 	block_data_offset: usize, // offset from data start to first block (after signature)
 	rar4_files: ?[]rar4_headers.FileHeader,
 	rar5_files: ?[]rar5_headers.FileBlock,
-	allocator: std.mem.Allocator,
+	arena: std.heap.ArenaAllocator,
 
 	fn deinit(self: *ArchiveHandle) void {
-		if (self.rar4_files) |files| self.allocator.free(files);
-		if (self.rar5_files) |files| self.allocator.free(files);
-		self.allocator.destroy(self);
+		self.arena.deinit();
+		std.heap.page_allocator.destroy(self);
 	}
 
 	fn fileCount(self: *const ArchiveHandle) u32 {
@@ -67,26 +66,39 @@ export fn rarz_detect_format(data_ptr: ?[*]const u8, len: usize) i32 {
 	} else 0;
 }
 
+export fn rarz_detect_format_sfx(data_ptr: ?[*]const u8, len: usize, max_sfx_offset: usize) i32 {
+	const slice = if (data_ptr) |d| d[0..len] else return 0;
+	if (len == 0) return 0;
+	const result = detect.detect_format(slice, max_sfx_offset);
+	return if (result.family) |f| switch (f) {
+		.rar14 => @as(i32, 14),
+		.rar15 => @as(i32, 15),
+		.rar50 => @as(i32, 50),
+	} else 0;
+}
+
+
 export fn rarz_open(data_ptr: ?[*]const u8, len: usize) ?*ArchiveHandle {
 	const slice = if (data_ptr) |d| d[0..len] else return null;
 	if (len == 0) return null;
-
-	const alloc = std.heap.page_allocator;
 
 	const format = detect.detect_format(slice, 0);
 	const family = format.family orelse return null;
 
 	const block_offset = format.signature_offset + format.signature_len;
 
-	const handle = alloc.create(ArchiveHandle) catch return null;
+	// Allocate handle from page_allocator (arena lives inside it)
+	const handle = std.heap.page_allocator.create(ArchiveHandle) catch return null;
 	handle.* = .{
 		.data = slice,
 		.family = family,
 		.block_data_offset = block_offset,
 		.rar4_files = null,
 		.rar5_files = null,
-		.allocator = alloc,
+		.arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
 	};
+
+	const alloc = handle.arena.allocator();
 
 	// Parse file entries based on format family
 	switch (family) {
@@ -94,7 +106,7 @@ export fn rarz_open(data_ptr: ?[*]const u8, len: usize) ?*ArchiveHandle {
 			// Skip past the RAR5 signature to reach blocks
 			const block_data = slice[block_offset..];
 			handle.rar5_files = collectRar5Files(alloc, block_data) catch {
-				alloc.destroy(handle);
+				handle.deinit();
 				return null;
 			};
 		},
@@ -102,7 +114,7 @@ export fn rarz_open(data_ptr: ?[*]const u8, len: usize) ?*ArchiveHandle {
 			// Skip past the RAR1.5-4.x signature to reach blocks
 			const block_data = slice[block_offset..];
 			handle.rar4_files = collectRar4Files(alloc, block_data) catch {
-				alloc.destroy(handle);
+				handle.deinit();
 				return null;
 			};
 		},
@@ -311,12 +323,17 @@ const RarzCreateFileEntry = extern struct {
 export fn rarz_calculate_archive_size(entries_ptr: ?[*]const RarzCreateFileEntry, count: u32) i64 {
 	const entries = if (entries_ptr) |p| p[0..count] else return -1;
 
-	// Convert to writer.FileEntry array (on stack for small counts, heap for large)
+	// Convert to writer.FileEntry array (stack for small counts, heap for large)
 	var writer_entries_buf: [64]writer.FileEntry = undefined;
-	if (count > 64) return -1; // limit for stack allocation
+	const heap_alloc = std.heap.page_allocator;
+	const writer_entries: []writer.FileEntry = if (count <= 64)
+		writer_entries_buf[0..count]
+	else
+		heap_alloc.alloc(writer.FileEntry, count) catch return -1;
+	defer if (count > 64) heap_alloc.free(writer_entries);
 
 	for (entries, 0..) |e, i| {
-		writer_entries_buf[i] = .{
+		writer_entries[i] = .{
 			.name = if (e.name) |n| n[0..e.name_len] else "",
 			.data = if (e.data) |d| d[0..@as(usize, @intCast(e.data_len))] else "",
 			.mtime = e.mtime,
@@ -324,7 +341,7 @@ export fn rarz_calculate_archive_size(entries_ptr: ?[*]const RarzCreateFileEntry
 		};
 	}
 
-	return @intCast(writer.calculate_archive_size(writer_entries_buf[0..count]));
+	return @intCast(writer.calculate_archive_size(writer_entries));
 }
 
 export fn rarz_create_archive(
@@ -336,11 +353,17 @@ export fn rarz_create_archive(
 	const entries = if (entries_ptr) |p| p[0..count] else return -1;
 	const buf = out_buf orelse return -1;
 
+	// Convert to writer.FileEntry array (stack for small counts, heap for large)
 	var writer_entries_buf: [64]writer.FileEntry = undefined;
-	if (count > 64) return -1;
+	const heap_alloc = std.heap.page_allocator;
+	const writer_entries: []writer.FileEntry = if (count <= 64)
+		writer_entries_buf[0..count]
+	else
+		heap_alloc.alloc(writer.FileEntry, count) catch return -1;
+	defer if (count > 64) heap_alloc.free(writer_entries);
 
 	for (entries, 0..) |e, i| {
-		writer_entries_buf[i] = .{
+		writer_entries[i] = .{
 			.name = if (e.name) |n| n[0..e.name_len] else "",
 			.data = if (e.data) |d| d[0..@as(usize, @intCast(e.data_len))] else "",
 			.mtime = e.mtime,
@@ -348,7 +371,7 @@ export fn rarz_create_archive(
 		};
 	}
 
-	const result = writer.write_archive(writer_entries_buf[0..count], buf[0..out_len]) catch |err| {
+	const result = writer.write_archive(writer_entries, buf[0..out_len]) catch |err| {
 		return switch (err) {
 			error.BufferTooSmall => @as(i64, -2),
 			error.NameTooLong, error.TooManyFiles => @as(i64, -1),
@@ -798,6 +821,97 @@ test "rarz_create_archive null entries returns -1" {
 	const result = rarz_create_archive(null, 0, &buf, buf.len);
 	try testing.expectEqual(@as(i64, -1), result);
 }
+
+test "rarz_create_archive supports more than 64 files" {
+	// Create 65 tiny file entries to exceed the old 64-file stack limit
+	const file_count = 65;
+	var c_entries: [file_count]RarzCreateFileEntry = undefined;
+	var names: [file_count][8]u8 = undefined;
+
+	for (0..file_count) |i| {
+		// Generate unique filenames like "f000.txt", "f001.txt", ...
+		const name_buf = &names[i];
+		_ = std.fmt.bufPrint(name_buf, "f{d:0>3}.txt", .{i}) catch unreachable;
+		c_entries[i] = .{
+			.name = name_buf,
+			.name_len = 8,
+			.data = "x", // 1-byte file content
+			.data_len = 1,
+			.mtime = 0,
+			.is_directory = 0,
+		};
+	}
+
+	// Calculate archive size — must not return -1
+	const needed = rarz_calculate_archive_size(&c_entries, file_count);
+	try testing.expect(needed > 0);
+
+	// Create archive into a heap-allocated buffer (too large for stack)
+	const alloc = std.heap.page_allocator;
+	const archive_buf = try alloc.alloc(u8, @intCast(needed));
+	defer alloc.free(archive_buf);
+
+	const written = rarz_create_archive(&c_entries, file_count, archive_buf.ptr, archive_buf.len);
+	try testing.expect(written > 0);
+	try testing.expectEqual(needed, written);
+
+	// Open the archive and verify file count
+	const handle = rarz_open(archive_buf.ptr, @intCast(written));
+	try testing.expect(handle != null);
+	defer rarz_close(handle);
+
+	try testing.expectEqual(@as(u32, file_count), rarz_file_count(handle));
+}
+
+test "rarz_detect_format_sfx detects RAR5 after garbage prefix" {
+	// Build a synthetic SFX archive: 128 bytes of garbage + RAR5 signature + padding
+	var sfx_buf: [256]u8 = undefined;
+	const garbage_prefix_len = 128;
+
+	// Fill prefix with junk
+	@memset(sfx_buf[0..garbage_prefix_len], 0xCC);
+
+	// Place RAR5 signature right after the garbage prefix
+	@memcpy(sfx_buf[garbage_prefix_len..][0..detect.RAR50_SIG.len], &detect.RAR50_SIG);
+
+	// Fill rest with zeros
+	@memset(sfx_buf[garbage_prefix_len + detect.RAR50_SIG.len ..], 0x00);
+
+	const total_len = sfx_buf.len;
+
+	// rarz_detect_format (max_sfx_offset=0) should NOT find it
+	try testing.expectEqual(@as(i32, 0), rarz_detect_format(&sfx_buf, total_len));
+
+	// rarz_detect_format_sfx with sufficient offset should find the RAR5 signature
+	try testing.expectEqual(@as(i32, 50), rarz_detect_format_sfx(&sfx_buf, total_len, 256));
+}
+
+test "rarz_detect_format_sfx returns 0 when offset too small" {
+	var sfx_buf: [256]u8 = undefined;
+	const garbage_prefix_len = 128;
+
+	@memset(sfx_buf[0..garbage_prefix_len], 0xCC);
+	@memcpy(sfx_buf[garbage_prefix_len..][0..detect.RAR50_SIG.len], &detect.RAR50_SIG);
+	@memset(sfx_buf[garbage_prefix_len + detect.RAR50_SIG.len ..], 0x00);
+
+	// max_sfx_offset too small to reach the signature at offset 128
+	try testing.expectEqual(@as(i32, 0), rarz_detect_format_sfx(&sfx_buf, sfx_buf.len, 64));
+}
+
+test "rarz_detect_format_sfx handles null pointer" {
+	try testing.expectEqual(@as(i32, 0), rarz_detect_format_sfx(null, 0, 256));
+}
+
+test "rarz_detect_format_sfx with zero offset behaves like rarz_detect_format" {
+	// Direct RAR5 signature at offset 0
+	const sig = detect.RAR50_SIG ++ [_]u8{ 0x00, 0x00 };
+	try testing.expectEqual(@as(i32, 50), rarz_detect_format_sfx(&sig, sig.len, 0));
+
+	// Garbage data
+	const garbage = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE, 0x01, 0x02 };
+	try testing.expectEqual(@as(i32, 0), rarz_detect_format_sfx(&garbage, garbage.len, 0));
+}
+
 
 comptime {
 	_ = detect;

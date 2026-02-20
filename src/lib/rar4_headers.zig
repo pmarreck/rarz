@@ -55,7 +55,7 @@ pub const BlockHeader = struct {
 	header_type: HeaderType,
 	flags: u16,
 	head_size: u16,
-	data_size: ?u32,
+	data_size: ?u64,
 	header_offset: usize,
 };
 
@@ -107,8 +107,8 @@ pub fn parse_block_header(r: *Reader) ParseError!BlockHeader {
 
 	if (head_size < 7) return error.HeaderTooSmall;
 
-	const data_size: ?u32 = if (flags & LONG_BLOCK != 0)
-		r.read_u32_le() catch return error.EndOfData
+	const data_size: ?u64 = if (flags & LONG_BLOCK != 0)
+		@as(u64, r.read_u32_le() catch return error.EndOfData)
 	else
 		null;
 
@@ -181,8 +181,16 @@ pub fn parse_file_header(r: *Reader, block: BlockHeader) ParseError!FileHeader {
 	// Normalize method: subtract 0x30
 	const method = method_raw -% 0x30;
 
+	// Update the block's data_size to the full 64-bit packed_size when
+	// the large flag is set. The base block header only stores the low
+	// 32 bits; without this, the block iterator would misalign for >4GB files.
+	var updated_block = block;
+	if (flags.large and block.data_size != null) {
+		updated_block.data_size = packed_size;
+	}
+
 	return FileHeader{
-		.block = block,
+		.block = updated_block,
 		.packed_size = packed_size,
 		.unpacked_size = unpacked_size,
 		.host_os = host_os,
@@ -240,10 +248,19 @@ pub const BlockIterator = struct {
 			_ => .{ .other = block },
 		};
 
-		// Advance past the entire header
-		const header_size: usize = block.head_size;
-		const data_size: usize = if (block.data_size) |ds| ds else 0;
-		self.pos += header_size + data_size;
+		// Advance past the entire header + data payload.
+		// For file blocks with the large flag, the data_size in the file header's
+		// block has been updated to the full 64-bit packed_size.
+		const effective_block = switch (result) {
+			.file => |fh| fh.block,
+			.mark => |b| b,
+			.main => |m| m.block,
+			.end_archive => |b| b,
+			.other => |b| b,
+		};
+		const header_size: usize = effective_block.head_size;
+		const data_size: u64 = effective_block.data_size orelse 0;
+		self.pos += header_size + @as(usize, @intCast(data_size));
 
 		return result;
 	}
@@ -286,7 +303,7 @@ test "parse_block_header reads 7-byte header" {
 	try testing.expectEqual(HeaderType.main, block.header_type);
 	try testing.expectEqual(@as(u16, 0x0001), block.flags);
 	try testing.expectEqual(@as(u16, 7), block.head_size);
-	try testing.expectEqual(@as(?u32, null), block.data_size);
+	try testing.expectEqual(@as(?u64, null), block.data_size);
 	try testing.expectEqual(@as(usize, 0), block.header_offset);
 	try testing.expectEqual(@as(usize, 7), r.position());
 }
@@ -307,7 +324,7 @@ test "parse_block_header with LONG_BLOCK reads data_size" {
 	try testing.expectEqual(HeaderType.file, block.header_type);
 	try testing.expectEqual(@as(u16, 0x8000), block.flags);
 	try testing.expectEqual(@as(u16, 11), block.head_size);
-	try testing.expectEqual(@as(?u32, 0x00010000), block.data_size);
+	try testing.expectEqual(@as(?u64, 0x00010000), block.data_size);
 	try testing.expectEqual(@as(usize, 11), r.position());
 }
 
@@ -552,6 +569,89 @@ test "walk_blocks handles empty remaining data" {
 	var iter = walk_blocks(data);
 	const result = try iter.next();
 	try testing.expectEqual(@as(?ArchiveBlock, null), result);
+}
+
+test "block iterator advances correctly for >4GB file (large flag)" {
+	// Construct a synthetic RAR4 archive with a file block that has the large flag set,
+	// claiming a packed_size > 4GB. After the file block + its data, there's an end_archive
+	// block. The iterator must use the full 64-bit data_size to skip correctly.
+	//
+	// We can't allocate 4GB of data in a test, so we construct the scenario differently:
+	// We build a file block header with packed_size = 0x1_0000_0100 (just over 4GB).
+	// The data_size in the base block header (LONG_BLOCK) will be the low 32 bits: 0x0000_0100.
+	// If the iterator only uses the 32-bit data_size, it would skip only 0x100 bytes of data.
+	// If it uses the full 64-bit value, it would skip 0x1_0000_0100 bytes.
+	//
+	// Since we can't have that much data, we instead verify the parsed BlockHeader.data_size
+	// is the full 64-bit value by checking what the iterator computes for the file block.
+	//
+	// Strategy: build a file block with large flag, parse it, and verify data_size is 64-bit.
+
+	const filename = "huge.bin";
+	// File block header layout for a large file:
+	// Base header (7 bytes): crc(2) + type(1) + flags(2) + head_size(2)
+	// data_size (4 bytes): LONG_BLOCK -> low 32 bits of packed_size
+	// File-specific (25 bytes): packed_size_low(4) + unpacked_size_low(4) + host_os(1) +
+	//   file_crc(4) + mtime(4) + version(1) + method(1) + name_size(2) + attrs(4)
+	// Large extension (8 bytes): packed_size_high(4) + unpacked_size_high(4)
+	// Filename
+
+	const flags: u16 = LONG_BLOCK | LHD_LARGE; // 0x8100
+	const base_header_size: u16 = 7;
+	const data_size_field: usize = 4; // LONG_BLOCK adds 4 bytes to base
+	const file_fields: usize = 25; // standard file-specific fields
+	const large_ext: usize = 8; // packed_high + unpacked_high
+	const head_size: u16 = base_header_size + @as(u16, @intCast(data_size_field)) + @as(u16, @intCast(file_fields)) + @as(u16, @intCast(large_ext)) + @as(u16, @intCast(filename.len));
+
+	var data: [128]u8 = undefined;
+	var off: usize = 0;
+
+	// Base header
+	write_u16_le(&data, off, 0x0000); off += 2; // head_crc (we don't validate in iterator)
+	data[off] = 0x74; off += 1; // header_type = file
+	write_u16_le(&data, off, flags); off += 2; // flags: LONG_BLOCK | LHD_LARGE
+	write_u16_le(&data, off, head_size); off += 2; // head_size
+
+	// data_size (low 32 bits of packed_size) - LONG_BLOCK field
+	const packed_size_low: u32 = 0x0000_0100;
+	write_u32_le(&data, off, packed_size_low); off += 4;
+
+	// File-specific fields
+	write_u32_le(&data, off, packed_size_low); off += 4; // packed_size_low (same as data_size)
+	write_u32_le(&data, off, 0x0000_0200); off += 4; // unpacked_size_low
+	data[off] = 0x00; off += 1; // host_os
+	write_u32_le(&data, off, 0x12345678); off += 4; // file_crc
+	write_u32_le(&data, off, 0x00000000); off += 4; // mtime
+	data[off] = 29; off += 1; // unpack_version
+	data[off] = 0x30; off += 1; // method (store)
+	write_u16_le(&data, off, @as(u16, filename.len)); off += 2; // name_size
+	write_u32_le(&data, off, 0x00000000); off += 4; // attributes
+
+	// Large extension: high 32 bits
+	const packed_size_high: u32 = 0x0000_0001; // packed = 0x1_0000_0100
+	const unpacked_size_high: u32 = 0x0000_0002; // unpacked = 0x2_0000_0200
+	write_u32_le(&data, off, packed_size_high); off += 4;
+	write_u32_le(&data, off, unpacked_size_high); off += 4;
+
+	// Filename
+	@memcpy(data[off..][0..filename.len], filename);
+	off += filename.len;
+
+	// Parse through the block iterator
+	var iter = walk_blocks(data[0..off]);
+	const result = try iter.next();
+	try testing.expect(result != null);
+
+	const file_block = result.?.file;
+
+	// Verify the file header has full 64-bit packed_size
+	try testing.expectEqual(@as(u64, 0x1_0000_0100), file_block.packed_size);
+	try testing.expectEqual(@as(u64, 0x2_0000_0200), file_block.unpacked_size);
+
+	// Critical check: the block's data_size must be the full 64-bit packed_size,
+	// not just the low 32 bits. This is what the iterator uses to advance.
+	try testing.expect(file_block.block.data_size != null);
+	try testing.expectEqual(@as(u64, 0x1_0000_0100), file_block.block.data_size.?);
 }
 
 test "method normalization subtracts 0x30" {

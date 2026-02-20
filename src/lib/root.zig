@@ -937,4 +937,10 @@ comptime {
 	_ = @import("decompress/bitreader.zig");
 	_ = @import("decompress/huffman.zig");
 	_ = @import("decompress/lz.zig");
+	_ = @import("decompress/filters.zig");
+	_ = @import("decompress/unpack50.zig");
+	_ = @import("decompress/ppm.zig");
+	_ = @import("decompress/unpack29.zig");
+	_ = @import("decompress/unpack20.zig");
+	_ = @import("decompress/unpack15.zig");
 }

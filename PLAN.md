@@ -70,3 +70,13 @@ See: `docs/plans/2026-02-20-phase2-decompression.md`
 - [ ] Multi-volume awareness and reconstruction
 - [ ] RAR5 compression for write path
 - [ ] Build argument-compatibility matrix against official `rar` CLI grammar
+
+## Phase 4: Distribution + CI
+- [ ] Add MIT License (`LICENSE`)
+- [ ] Add `build.zig.zon` for Zig package manager consumption
+- [ ] Create `rarz` repo on GitHub, set SSH remote, push
+- [ ] Create README.md with project overview and usage
+- [ ] Add Garnix CI configuration (`garnix.yaml` or `flake.nix` CI outputs)
+- [ ] Add GitHub Actions CI across 5 platforms (macOS Intel/ARM, Linux Intel/ARM, Windows Intel)
+- [ ] Verify CI passes on all platforms
+- [ ] Add CI badges to top of README.md

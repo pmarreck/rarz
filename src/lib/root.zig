@@ -935,5 +935,6 @@ comptime {
 	_ = policy;
 	_ = writer;
 	_ = @import("decompress/bitreader.zig");
+	_ = @import("decompress/huffman.zig");
 	_ = @import("decompress/lz.zig");
 }

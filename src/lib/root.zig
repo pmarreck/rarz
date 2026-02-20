@@ -16,6 +16,7 @@
 
 pub const detect = @import("detect.zig");
 pub const integrity = @import("integrity.zig");
+pub const rar4_headers = @import("rar4_headers.zig");
 pub const reader = @import("reader.zig");
 
 export fn rarz_abi_version() u32 {
@@ -30,5 +31,6 @@ test "abi version is 1" {
 comptime {
 	_ = detect;
 	_ = integrity;
+	_ = rar4_headers;
 	_ = reader;
 }

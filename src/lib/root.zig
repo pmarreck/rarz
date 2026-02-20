@@ -15,6 +15,7 @@
 //! Date: 2026-02-19
 
 pub const detect = @import("detect.zig");
+pub const integrity = @import("integrity.zig");
 pub const reader = @import("reader.zig");
 
 export fn rarz_abi_version() u32 {
@@ -28,5 +29,6 @@ test "abi version is 1" {
 
 comptime {
 	_ = detect;
+	_ = integrity;
 	_ = reader;
 }

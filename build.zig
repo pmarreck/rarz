@@ -31,6 +31,7 @@ pub fn build(b: *std.Build) void {
 	exe.root_module.addCSourceFile(.{ .file = b.path("src/cli/main.c") });
 	exe.root_module.addIncludePath(b.path("include"));
 	exe.linkLibrary(lib);
+	exe.root_module.link_libc = true;
 	b.installArtifact(exe);
 
 	// Run step

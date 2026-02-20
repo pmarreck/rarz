@@ -3,8 +3,16 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <errno.h>
+#ifndef _WIN32
 #include <libgen.h>
+#endif
 #include "rarz.h"
+
+#ifdef _WIN32
+#define MKDIR(path) mkdir(path)
+#else
+#define MKDIR(path) mkdir(path, 0755)
+#endif
 
 /* ========================================================================== */
 /* Command enum + parser                                                      */
@@ -109,11 +117,11 @@ static int mkdirs(const char *path) {
 	for (char *p = tmp + 1; *p; p++) {
 		if (*p == '/') {
 			*p = '\0';
-			if (mkdir(tmp, 0755) != 0 && errno != EEXIST) return -1;
+			if (MKDIR(tmp) != 0 && errno != EEXIST) return -1;
 			*p = '/';
 		}
 	}
-	if (mkdir(tmp, 0755) != 0 && errno != EEXIST) return -1;
+	if (MKDIR(tmp) != 0 && errno != EEXIST) return -1;
 	return 0;
 }
 

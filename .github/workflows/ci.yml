@@ -12,21 +12,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-13
-            name: macOS Intel
-            target: x86_64-macos
-          - os: macos-14
+          - os: macos-15
             name: macOS ARM
-            target: aarch64-macos
           - os: ubuntu-latest
             name: Linux Intel
-            target: x86_64-linux
           - os: ubuntu-24.04-arm
             name: Linux ARM
-            target: aarch64-linux
           - os: windows-latest
             name: Windows Intel
-            target: x86_64-windows
 
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}

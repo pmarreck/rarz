@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+mode="ReleaseFast"
+zig_args=()
+
+for arg in "$@"; do
+    case "$arg" in
+        --debug) mode="Debug" ;;
+        --test)
+            exec nix develop -c zig build test
+            ;;
+        *) zig_args+=("$arg") ;;
+    esac
+done
+
+exec nix develop -c zig build "-Doptimize=${mode}" "${zig_args[@]}"

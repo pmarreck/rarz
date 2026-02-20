@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+errors=0
+
+echo "=== Zig unit tests ==="
+if ! nix develop -c zig build test; then
+    ((errors++))
+fi
+
+if [ -d tests/cli ]; then
+    echo "=== CLI tests ==="
+    for t in tests/cli/test_*.sh; do
+        [ -f "$t" ] || continue
+        echo "  running $t"
+        if ! bash "$t"; then
+            ((errors++))
+        fi
+    done
+fi
+
+if [ "$errors" -gt 0 ]; then
+    echo "FAILED: $errors test suite(s)"
+    exit "$errors"
+fi
+
+echo "ALL TESTS PASSED"

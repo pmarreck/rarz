@@ -343,8 +343,8 @@ fn validate_rar5_payload(data: []const u8, sig_offset: usize, sig_len: u8) Valid
 
 		switch (block) {
 			.file => |f| {
-				// Only verify store-method files with CRC32
-				if (f.compression.method == 0 and f.has_crc32) {
+				// Only verify store-method files
+				if (f.compression.method == 0) {
 					if (f.header.data_size) |ds| {
 						// data_size bytes follow the header
 						const total_header = 4 + f.header.crc_data_len;
@@ -352,14 +352,40 @@ fn validate_rar5_payload(data: []const u8, sig_offset: usize, sig_len: u8) Valid
 						const payload_end = payload_start + @as(usize, @intCast(ds));
 						if (payload_end <= data.len) {
 							const payload = data[payload_start..payload_end];
-							const computed_crc = integrity.crc32(payload);
-							if (computed_crc != f.data_crc32.?) {
-								structural.is_valid = false;
-								structural.depth = .full;
-								structural.error_message = "payload CRC32 mismatch";
-								return structural;
+
+							// Check CRC32 if present
+							if (f.has_crc32) {
+								const computed_crc = integrity.crc32(payload);
+								if (computed_crc != f.data_crc32.?) {
+									structural.is_valid = false;
+									structural.depth = .full;
+									structural.error_message = "payload CRC32 mismatch";
+									return structural;
+								}
+								checked_payload = true;
 							}
-							checked_payload = true;
+
+							// Check BLAKE2sp hash if present in extra records
+							if (f.extra_data) |extra_bytes| {
+								const alloc = std.heap.page_allocator;
+								const extra_records = rar5_headers.parse_extra_records(extra_bytes, alloc) catch {
+									// If we can't parse extra records, skip BLAKE2sp check
+									continue;
+								};
+								defer alloc.free(extra_records);
+
+								if (rar5_headers.extract_blake2sp_hash(extra_records)) |expected_hash| {
+									var computed_hash: [32]u8 = undefined;
+									integrity.blake2sp(payload, &computed_hash);
+									if (!std.mem.eql(u8, &computed_hash, &expected_hash)) {
+										structural.is_valid = false;
+										structural.depth = .full;
+										structural.error_message = "payload BLAKE2sp mismatch";
+										return structural;
+									}
+									checked_payload = true;
+								}
+							}
 						}
 					}
 				}
@@ -884,6 +910,196 @@ test "validate returns invalid at full depth for payload CRC mismatch" {
 	try testing.expect(!result.is_valid);
 	try testing.expectEqual(ValidationDepth.full, result.depth);
 	try testing.expect(std.mem.eql(u8, result.error_message.?, "payload CRC32 mismatch"));
+}
+
+// --- Test: BLAKE2sp payload verification passes with correct hash ---
+
+test "validate checks BLAKE2sp hash from extra record" {
+	var archive: [1024]u8 = undefined;
+	var pos: usize = 0;
+
+	// RAR5 signature
+	@memcpy(archive[pos..][0..8], &detect_mod.RAR50_SIG);
+	pos += 8;
+
+	// Main block
+	var main_body: [16]u8 = undefined;
+	const main_body_len = encode_vint(0, &main_body);
+	pos += build_rar5_block(archive[pos..], 1, 0, main_body[0..main_body_len]);
+
+	// File block with store method, CRC32, BLAKE2sp extra record, and data area
+	const payload = "Hello, BLAKE2sp!";
+	const payload_crc = integrity.crc32(payload);
+	var blake2sp_hash: [32]u8 = undefined;
+	integrity.blake2sp(payload, &blake2sp_hash);
+	{
+		var body: [256]u8 = undefined;
+		var bpos: usize = 0;
+		// file_flags: has_crc32 (0x04)
+		bpos += encode_vint(0x04, body[bpos..]);
+		// unpacked_size
+		bpos += encode_vint(payload.len, body[bpos..]);
+		// attributes
+		bpos += encode_vint(0x20, body[bpos..]);
+		// data_crc32 (u32 LE)
+		std.mem.writeInt(u32, body[bpos..][0..4], payload_crc, .little);
+		bpos += 4;
+		// compression_info = 0 (store)
+		bpos += encode_vint(0, body[bpos..]);
+		// host_os = 0
+		bpos += encode_vint(0, body[bpos..]);
+		// name_length + name
+		bpos += encode_vint(8, body[bpos..]);
+		@memcpy(body[bpos..][0..8], "test.txt");
+		bpos += 8;
+
+		// Build extra area: HASH record (type=0x02) with BLAKE2sp hash
+		var extra_area: [64]u8 = undefined;
+		var epos: usize = 0;
+		// Extra record: field_size = 1 (type vint) + 1 (hash_type vint) + 32 (hash) = 34
+		epos += encode_vint(34, extra_area[epos..]); // field_size
+		epos += encode_vint(0x02, extra_area[epos..]); // field_type = HASH
+		epos += encode_vint(0x00, extra_area[epos..]); // hash_type = BLAKE2sp
+		@memcpy(extra_area[epos..][0..32], &blake2sp_hash);
+		epos += 32;
+
+		// Build header manually with HFL_EXTRA (0x01) + HFL_DATA (0x02) = 0x03
+		var tmp: [512]u8 = undefined;
+		var tpos: usize = 0;
+		var contents: [512]u8 = undefined;
+		var cpos: usize = 0;
+
+		// header_type = 2 (file)
+		cpos += encode_vint(2, contents[cpos..]);
+		// header_flags = 0x03 (HFL_EXTRA | HFL_DATA)
+		cpos += encode_vint(0x03, contents[cpos..]);
+		// extra_size (because HFL_EXTRA is set)
+		cpos += encode_vint(epos, contents[cpos..]);
+		// data_size (because HFL_DATA is set)
+		cpos += encode_vint(payload.len, contents[cpos..]);
+		// body (file-specific fields)
+		@memcpy(contents[cpos..][0..bpos], body[0..bpos]);
+		cpos += bpos;
+		// extra area
+		@memcpy(contents[cpos..][0..epos], extra_area[0..epos]);
+		cpos += epos;
+
+		// header_size vint
+		tpos += encode_vint(cpos, tmp[tpos..]);
+		@memcpy(tmp[tpos..][0..cpos], contents[0..cpos]);
+		tpos += cpos;
+
+		// CRC32 over header_size_vint + contents
+		const crc = integrity.crc32(tmp[0..tpos]);
+
+		// Write CRC32
+		std.mem.writeInt(u32, archive[pos..][0..4], crc, .little);
+		@memcpy(archive[pos + 4 ..][0..tpos], tmp[0..tpos]);
+		pos += 4 + tpos;
+
+		// Write data area (the payload)
+		@memcpy(archive[pos..][0..payload.len], payload);
+		pos += payload.len;
+	}
+
+	// End block
+	var end_body: [16]u8 = undefined;
+	const end_body_len = encode_vint(0, &end_body);
+	pos += build_rar5_block(archive[pos..], 5, 0, end_body[0..end_body_len]);
+
+	const result = validate(archive[0..pos]);
+	try testing.expect(result.is_valid);
+	try testing.expectEqual(ValidationDepth.full, result.depth);
+	try testing.expectEqual(detect_mod.RarFamily.rar50, result.family.?);
+}
+
+// --- Test: BLAKE2sp payload verification fails with wrong hash ---
+
+test "validate returns invalid for BLAKE2sp hash mismatch" {
+	var archive: [1024]u8 = undefined;
+	var pos: usize = 0;
+
+	// RAR5 signature
+	@memcpy(archive[pos..][0..8], &detect_mod.RAR50_SIG);
+	pos += 8;
+
+	// Main block
+	var main_body: [16]u8 = undefined;
+	const main_body_len = encode_vint(0, &main_body);
+	pos += build_rar5_block(archive[pos..], 1, 0, main_body[0..main_body_len]);
+
+	// File block with store method, correct CRC32, but WRONG BLAKE2sp hash
+	const payload = "Hello, BLAKE2sp!";
+	const payload_crc = integrity.crc32(payload);
+	var wrong_hash: [32]u8 = undefined;
+	@memset(&wrong_hash, 0xAA); // intentionally wrong hash
+	{
+		var body: [256]u8 = undefined;
+		var bpos: usize = 0;
+		// file_flags: has_crc32 (0x04)
+		bpos += encode_vint(0x04, body[bpos..]);
+		// unpacked_size
+		bpos += encode_vint(payload.len, body[bpos..]);
+		// attributes
+		bpos += encode_vint(0x20, body[bpos..]);
+		// data_crc32 (u32 LE) — correct CRC so we get past CRC32 check
+		std.mem.writeInt(u32, body[bpos..][0..4], payload_crc, .little);
+		bpos += 4;
+		// compression_info = 0 (store)
+		bpos += encode_vint(0, body[bpos..]);
+		// host_os = 0
+		bpos += encode_vint(0, body[bpos..]);
+		// name_length + name
+		bpos += encode_vint(8, body[bpos..]);
+		@memcpy(body[bpos..][0..8], "test.txt");
+		bpos += 8;
+
+		// Build extra area: HASH record with wrong BLAKE2sp hash
+		var extra_area: [64]u8 = undefined;
+		var epos: usize = 0;
+		epos += encode_vint(34, extra_area[epos..]); // field_size
+		epos += encode_vint(0x02, extra_area[epos..]); // field_type = HASH
+		epos += encode_vint(0x00, extra_area[epos..]); // hash_type = BLAKE2sp
+		@memcpy(extra_area[epos..][0..32], &wrong_hash);
+		epos += 32;
+
+		// Build header manually with HFL_EXTRA (0x01) + HFL_DATA (0x02) = 0x03
+		var tmp: [512]u8 = undefined;
+		var tpos: usize = 0;
+		var contents: [512]u8 = undefined;
+		var cpos: usize = 0;
+
+		cpos += encode_vint(2, contents[cpos..]); // type = file
+		cpos += encode_vint(0x03, contents[cpos..]); // flags = HFL_EXTRA | HFL_DATA
+		cpos += encode_vint(epos, contents[cpos..]); // extra_size
+		cpos += encode_vint(payload.len, contents[cpos..]); // data_size
+		@memcpy(contents[cpos..][0..bpos], body[0..bpos]);
+		cpos += bpos;
+		@memcpy(contents[cpos..][0..epos], extra_area[0..epos]);
+		cpos += epos;
+
+		tpos += encode_vint(cpos, tmp[tpos..]);
+		@memcpy(tmp[tpos..][0..cpos], contents[0..cpos]);
+		tpos += cpos;
+
+		const crc = integrity.crc32(tmp[0..tpos]);
+		std.mem.writeInt(u32, archive[pos..][0..4], crc, .little);
+		@memcpy(archive[pos + 4 ..][0..tpos], tmp[0..tpos]);
+		pos += 4 + tpos;
+
+		@memcpy(archive[pos..][0..payload.len], payload);
+		pos += payload.len;
+	}
+
+	// End block
+	var end_body: [16]u8 = undefined;
+	const end_body_len = encode_vint(0, &end_body);
+	pos += build_rar5_block(archive[pos..], 5, 0, end_body[0..end_body_len]);
+
+	const result = validate(archive[0..pos]);
+	try testing.expect(!result.is_valid);
+	try testing.expectEqual(ValidationDepth.full, result.depth);
+	try testing.expect(std.mem.eql(u8, result.error_message.?, "payload BLAKE2sp mismatch"));
 }
 
 // --- Test: RAR4 encrypted archive detection ---

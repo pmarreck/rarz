@@ -100,6 +100,10 @@ pub const ParseError = error{
 	HeaderTooLarge,
 };
 
+// Extra record type constants
+pub const EXTRA_FILE_HASH: u64 = 0x02;
+pub const HASH_TYPE_BLAKE2SP: u64 = 0x00;
+
 /// Maximum allowed header size: 2 MiB.
 const MAX_HEADER_SIZE: u64 = 2 * 1024 * 1024;
 
@@ -300,6 +304,24 @@ pub fn parse_extra_records(data: []const u8, allocator: std.mem.Allocator) ![]Ex
 	}
 
 	return records.toOwnedSlice(allocator);
+}
+
+/// Extract BLAKE2sp hash from extra records, if present.
+/// Returns the 32-byte hash if a HASH extra record with BLAKE2sp type is found.
+pub fn extract_blake2sp_hash(extra_records: []const ExtraRecord) ?[32]u8 {
+	for (extra_records) |rec| {
+		if (rec.field_type == EXTRA_FILE_HASH) {
+			// Parse: hash_type vint + 32-byte hash
+			var r = reader_mod.Reader.init(rec.data);
+			const hash_type = r.read_vint() catch continue;
+			if (hash_type != HASH_TYPE_BLAKE2SP) continue;
+			const hash_bytes = r.read_bytes(32) catch continue;
+			var result: [32]u8 = undefined;
+			@memcpy(&result, hash_bytes);
+			return result;
+		}
+	}
+	return null;
 }
 
 /// Validate the header CRC32 against the stored value.
@@ -749,6 +771,68 @@ test "parse_extra_records parses multiple records" {
 
 	try testing.expectEqual(@as(u64, 0x03), records[1].field_type);
 	try testing.expectEqualSlices(u8, &[_]u8{0xCC}, records[1].data);
+}
+
+test "extract_blake2sp_hash returns hash from HASH extra record" {
+	// Build an extra area with a HASH record: type=0x02, hash_type=0x00 (BLAKE2sp), 32-byte hash
+	var extra: [64]u8 = undefined;
+	var epos: usize = 0;
+
+	var expected_hash: [32]u8 = undefined;
+	for (&expected_hash, 0..) |*b, i| b.* = @intCast(i);
+
+	// Record: field_size = 1 (type vint) + 1 (hash_type vint) + 32 (hash) = 34
+	epos += encode_vint(34, extra[epos..]); // field_size
+	epos += encode_vint(0x02, extra[epos..]); // field_type = HASH
+	epos += encode_vint(0x00, extra[epos..]); // hash_type = BLAKE2sp
+	@memcpy(extra[epos..][0..32], &expected_hash);
+	epos += 32;
+
+	const records = try parse_extra_records(extra[0..epos], testing.allocator);
+	defer testing.allocator.free(records);
+
+	const result = extract_blake2sp_hash(records);
+	try testing.expect(result != null);
+	try testing.expectEqualSlices(u8, &expected_hash, &result.?);
+}
+
+test "extract_blake2sp_hash returns null when no HASH record" {
+	// Build an extra area with a non-HASH record
+	var extra: [64]u8 = undefined;
+	var epos: usize = 0;
+
+	// Record: field_type=0x03 (HTIME), data = [0xCC]
+	epos += encode_vint(2, extra[epos..]); // field_size
+	epos += encode_vint(0x03, extra[epos..]); // field_type = HTIME
+	extra[epos] = 0xCC;
+	epos += 1;
+
+	const records = try parse_extra_records(extra[0..epos], testing.allocator);
+	defer testing.allocator.free(records);
+
+	const result = extract_blake2sp_hash(records);
+	try testing.expect(result == null);
+}
+
+test "extract_blake2sp_hash skips non-BLAKE2sp hash types" {
+	// Build a HASH record with an unknown hash type (not 0x00)
+	var extra: [64]u8 = undefined;
+	var epos: usize = 0;
+
+	var dummy_hash: [32]u8 = undefined;
+	@memset(&dummy_hash, 0xFF);
+
+	epos += encode_vint(34, extra[epos..]); // field_size
+	epos += encode_vint(0x02, extra[epos..]); // field_type = HASH
+	epos += encode_vint(0x01, extra[epos..]); // hash_type = unknown (not BLAKE2sp)
+	@memcpy(extra[epos..][0..32], &dummy_hash);
+	epos += 32;
+
+	const records = try parse_extra_records(extra[0..epos], testing.allocator);
+	defer testing.allocator.free(records);
+
+	const result = extract_blake2sp_hash(records);
+	try testing.expect(result == null);
 }
 
 test "walk_blocks iterates through blocks" {

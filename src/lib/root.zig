@@ -913,6 +913,19 @@ test "rarz_detect_format_sfx with zero offset behaves like rarz_detect_format" {
 }
 
 
+test "rarz_open and rarz_close 100 times (arena allocator stress)" {
+	var buf: [1024]u8 = undefined;
+	const file_data = "stress test";
+	const archive_len = build_rar5_with_file(&buf, "stress.txt", file_data);
+
+	for (0..100) |_| {
+		const handle = rarz_open(&buf, archive_len);
+		try testing.expect(handle != null);
+		try testing.expectEqual(@as(u32, 1), rarz_file_count(handle));
+		rarz_close(handle);
+	}
+}
+
 comptime {
 	_ = detect;
 	_ = integrity;

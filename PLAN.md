@@ -3,6 +3,7 @@
 - [x] Create initial RAR format specification draft (`RAR_SPECIFICATION.md`) (2026-02-19 EST)
 - [x] Add architecture constraints: Zig in-memory core + C FFI + C drop-in CLI (`rarz`) (2026-02-19 EST)
 - [x] Add required LLM cleanroom attestation header template with signed/date requirement (2026-02-19 EST)
+- [x] Add exhaustive English compression-algorithm spec derived from unRAR eval (`RAR_COMPRESSION_ALGORITHMS_EXHAUSTIVE.md`) (2026-02-20 EST)
 - [ ] Define and freeze C ABI surface (versioning, opaque handles, memory-buffer-first APIs)
 - [ ] Scaffold Zig core library crate with no direct filesystem/process I/O
 - [ ] Implement C CLI wrapper `rarz` that routes all operations through C FFI (dogfood gate)

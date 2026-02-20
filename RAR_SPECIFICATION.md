@@ -4,6 +4,8 @@ Status: Draft v0.1 (implementation-planning quality)
 
 Date: 2026-02-19
 
+See also: `RAR_COMPRESSION_ALGORITHMS_EXHAUSTIVE.md` for an exhaustive English algorithm inventory traced to unRAR 7.2.4 evaluation references.
+
 ## 1. Purpose
 This document defines a practical, implementation-ready specification for a clean-room Zig project (`rarz`) that can:
 - parse and validate RAR archives,

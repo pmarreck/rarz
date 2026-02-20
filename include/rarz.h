@@ -99,6 +99,35 @@ rarz_validation_result rarz_validate(const uint8_t *data, size_t len);
 int64_t rarz_extract_to_buffer(const rarz_archive *archive, uint32_t index,
                                uint8_t *out_buf, size_t out_len);
 
+/* ========================================================================== */
+/* Archive creation (store method only)                                       */
+/* ========================================================================== */
+
+/** File entry for archive creation (input). */
+typedef struct {
+	const char *name;       /* UTF-8, NOT null-terminated */
+	uint32_t name_len;
+	const uint8_t *data;    /* file content */
+	uint64_t data_len;
+	uint32_t mtime;         /* DOS timestamp */
+	uint8_t is_directory;
+} rarz_create_file_entry;
+
+/**
+ * Calculate required buffer size for a store-only RAR5 archive.
+ * Returns size on success, -1 on error.
+ */
+int64_t rarz_calculate_archive_size(const rarz_create_file_entry *entries,
+                                    uint32_t count);
+
+/**
+ * Create a store-only RAR5 archive from file entries.
+ * Returns bytes written on success, -1 on error, -2 if buffer too small.
+ */
+int64_t rarz_create_archive(const rarz_create_file_entry *entries,
+                            uint32_t count,
+                            uint8_t *out_buf, size_t out_len);
+
 #ifdef __cplusplus
 }
 #endif

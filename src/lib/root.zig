@@ -21,6 +21,7 @@ pub const rar4_headers = @import("rar4_headers.zig");
 pub const rar5_headers = @import("rar5_headers.zig");
 pub const reader = @import("reader.zig");
 pub const policy = @import("policy.zig");
+pub const writer = @import("writer.zig");
 
 // ============================================================================
 // Archive Handle (opaque to C callers)
@@ -305,6 +306,66 @@ export fn rarz_extract_to_buffer(
 	}
 
 	return -1;
+}
+
+/// C-compatible file entry struct for archive creation (input).
+const RarzCreateFileEntry = extern struct {
+	name: ?[*]const u8,
+	name_len: u32,
+	data: ?[*]const u8,
+	data_len: u64,
+	mtime: u32,
+	is_directory: u8,
+};
+
+export fn rarz_calculate_archive_size(entries_ptr: ?[*]const RarzCreateFileEntry, count: u32) i64 {
+	const entries = if (entries_ptr) |p| p[0..count] else return -1;
+
+	// Convert to writer.FileEntry array (on stack for small counts, heap for large)
+	var writer_entries_buf: [64]writer.FileEntry = undefined;
+	if (count > 64) return -1; // limit for stack allocation
+
+	for (entries, 0..) |e, i| {
+		writer_entries_buf[i] = .{
+			.name = if (e.name) |n| n[0..e.name_len] else "",
+			.data = if (e.data) |d| d[0..@as(usize, @intCast(e.data_len))] else "",
+			.mtime = e.mtime,
+			.is_directory = e.is_directory != 0,
+		};
+	}
+
+	return @intCast(writer.calculate_archive_size(writer_entries_buf[0..count]));
+}
+
+export fn rarz_create_archive(
+	entries_ptr: ?[*]const RarzCreateFileEntry,
+	count: u32,
+	out_buf: ?[*]u8,
+	out_len: usize,
+) i64 {
+	const entries = if (entries_ptr) |p| p[0..count] else return -1;
+	const buf = out_buf orelse return -1;
+
+	var writer_entries_buf: [64]writer.FileEntry = undefined;
+	if (count > 64) return -1;
+
+	for (entries, 0..) |e, i| {
+		writer_entries_buf[i] = .{
+			.name = if (e.name) |n| n[0..e.name_len] else "",
+			.data = if (e.data) |d| d[0..@as(usize, @intCast(e.data_len))] else "",
+			.mtime = e.mtime,
+			.is_directory = e.is_directory != 0,
+		};
+	}
+
+	const result = writer.write_archive(writer_entries_buf[0..count], buf[0..out_len]) catch |err| {
+		return switch (err) {
+			error.BufferTooSmall => @as(i64, -2),
+			error.NameTooLong, error.TooManyFiles => @as(i64, -1),
+		};
+	};
+
+	return @intCast(result);
 }
 
 // ============================================================================
@@ -807,6 +868,76 @@ test "rarz_extract_to_buffer returns -1 for null handle" {
 	try testing.expectEqual(@as(i64, -1), rarz_extract_to_buffer(null, 0, &out, out.len));
 }
 
+test "rarz_create_archive and rarz_open round-trip" {
+	// Create an archive via the C FFI
+	const name = "round.txt";
+	const data = "round trip test data";
+	const c_entries = [_]RarzCreateFileEntry{.{
+		.name = name.ptr,
+		.name_len = name.len,
+		.data = data.ptr,
+		.data_len = data.len,
+		.mtime = 0x5C000000,
+		.is_directory = 0,
+	}};
+
+	// Calculate size
+	const needed = rarz_calculate_archive_size(&c_entries, 1);
+	try testing.expect(needed > 0);
+
+	// Create archive
+	var archive_buf: [4096]u8 = undefined;
+	const written = rarz_create_archive(&c_entries, 1, &archive_buf, archive_buf.len);
+	try testing.expect(written > 0);
+	try testing.expectEqual(needed, written);
+
+	// Open the archive we just created
+	const handle = rarz_open(&archive_buf, @intCast(written));
+	try testing.expect(handle != null);
+	defer rarz_close(handle);
+
+	// Verify file count
+	try testing.expectEqual(@as(u32, 1), rarz_file_count(handle));
+
+	// Verify file info
+	var entry: RarzFileEntry = undefined;
+	const info_result = rarz_file_info(handle, 0, &entry);
+	try testing.expectEqual(@as(i32, 0), info_result);
+	try testing.expectEqual(@as(u32, name.len), entry.name_len);
+	try testing.expectEqualSlices(u8, name, entry.name.?[0..entry.name_len]);
+	try testing.expectEqual(@as(u64, data.len), entry.unpacked_size);
+	try testing.expectEqual(@as(u8, 0), entry.method); // store
+
+	// Extract and verify content
+	var extract_buf: [256]u8 = undefined;
+	const extracted = rarz_extract_to_buffer(handle, 0, &extract_buf, extract_buf.len);
+	try testing.expectEqual(@as(i64, @intCast(data.len)), extracted);
+	try testing.expectEqualSlices(u8, data, extract_buf[0..@intCast(extracted)]);
+}
+
+test "rarz_create_archive returns -2 for small buffer" {
+	const name = "test.txt";
+	const data = "hello";
+	const c_entries = [_]RarzCreateFileEntry{.{
+		.name = name.ptr,
+		.name_len = name.len,
+		.data = data.ptr,
+		.data_len = data.len,
+		.mtime = 0,
+		.is_directory = 0,
+	}};
+
+	var tiny: [8]u8 = undefined;
+	const result = rarz_create_archive(&c_entries, 1, &tiny, tiny.len);
+	try testing.expectEqual(@as(i64, -2), result);
+}
+
+test "rarz_create_archive null entries returns -1" {
+	var buf: [256]u8 = undefined;
+	const result = rarz_create_archive(null, 0, &buf, buf.len);
+	try testing.expectEqual(@as(i64, -1), result);
+}
+
 comptime {
 	_ = detect;
 	_ = integrity;
@@ -814,4 +945,5 @@ comptime {
 	_ = rar5_headers;
 	_ = reader;
 	_ = policy;
+	_ = writer;
 }

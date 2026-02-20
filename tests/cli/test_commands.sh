@@ -96,9 +96,71 @@ if ! "$RARZ" extract "$tmpdir/test.rar" "$tmpdir/out2" >/dev/null 2>&1; then
 	((errors++))
 fi
 
-# Test: rarz a (should be stubbed)
-if "$RARZ" a "$tmpdir/new.rar" "$tmpdir/hello.txt" 2>/dev/null; then
-	echo "FAIL: rarz a should exit non-zero (not yet implemented)"
+# Test: rarz a (create store archive)
+if ! "$RARZ" a "$tmpdir/created.rar" "$tmpdir/hello.txt" "$tmpdir/world.txt" >/dev/null 2>&1; then
+	echo "FAIL: rarz a should succeed creating archive"
+	((errors++))
+fi
+
+# Test: created archive is valid according to rarz
+if [ -f "$tmpdir/created.rar" ]; then
+	output=$("$RARZ" t "$tmpdir/created.rar" 2>&1)
+	if [[ "$output" != *"VALID"* ]]; then
+		echo "FAIL: rarz-created archive should validate as VALID"
+		((errors++))
+	fi
+
+	# Test: created archive is readable by official unrar
+	if ! unrar t "$tmpdir/created.rar" >/dev/null 2>&1; then
+		echo "FAIL: rarz-created archive should be valid for unrar"
+		((errors++))
+	fi
+
+	# Test: extract rarz-created archive and verify contents
+	mkdir -p "$tmpdir/rarz_out"
+	if unrar x -o+ "$tmpdir/created.rar" "$tmpdir/rarz_out/" >/dev/null 2>&1; then
+		if [ ! -f "$tmpdir/rarz_out/hello.txt" ]; then
+			echo "FAIL: unrar should extract hello.txt from rarz archive"
+			((errors++))
+		elif [ "$(cat "$tmpdir/rarz_out/hello.txt")" != "hello rarz" ]; then
+			echo "FAIL: unrar-extracted hello.txt content mismatch"
+			((errors++))
+		fi
+		if [ ! -f "$tmpdir/rarz_out/world.txt" ]; then
+			echo "FAIL: unrar should extract world.txt from rarz archive"
+			((errors++))
+		elif [ "$(cat "$tmpdir/rarz_out/world.txt")" != "world" ]; then
+			echo "FAIL: unrar-extracted world.txt content mismatch"
+			((errors++))
+		fi
+	else
+		echo "FAIL: unrar x should succeed on rarz-created archive"
+		((errors++))
+	fi
+
+	# Test: rarz can also list the created archive
+	output=$("$RARZ" l "$tmpdir/created.rar" 2>&1)
+	if [[ "$output" != *"hello.txt"* ]]; then
+		echo "FAIL: rarz l should list hello.txt in created archive"
+		((errors++))
+	fi
+
+	# Test: rarz can extract the created archive
+	mkdir -p "$tmpdir/rarz_extract"
+	if "$RARZ" x "$tmpdir/created.rar" "$tmpdir/rarz_extract" >/dev/null 2>&1; then
+		if [ ! -f "$tmpdir/rarz_extract/hello.txt" ]; then
+			echo "FAIL: rarz x should extract hello.txt from created archive"
+			((errors++))
+		elif [ "$(cat "$tmpdir/rarz_extract/hello.txt")" != "hello rarz" ]; then
+			echo "FAIL: rarz-extracted hello.txt content mismatch"
+			((errors++))
+		fi
+	else
+		echo "FAIL: rarz x should succeed on rarz-created archive"
+		((errors++))
+	fi
+else
+	echo "FAIL: rarz a did not create the archive file"
 	((errors++))
 fi
 

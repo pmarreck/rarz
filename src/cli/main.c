@@ -461,13 +461,120 @@ static int cmd_extract(const char *archive_path, const char *dest_dir) {
 }
 
 /* ========================================================================== */
-/* cmd_add (stub)                                                             */
+/* cmd_add — create store-only RAR5 archive                                   */
 /* ========================================================================== */
 
 static int cmd_add(int argc, char **argv) {
-	(void)argc;
-	(void)argv;
-	fprintf(stderr, "error: 'add' command is not yet implemented\n");
+	const char *archive_path = argv[2];
+	int file_count = argc - 3;
+	int max_files = 64;
+
+	if (file_count > max_files) {
+		fprintf(stderr, "error: too many files (max %d)\n", max_files);
+		return 1;
+	}
+
+	if (file_count == 0) {
+		fprintf(stderr, "error: no files specified\n");
+		return 1;
+	}
+
+	/* Read all input files */
+	rarz_create_file_entry entries[64];
+	uint8_t *file_buffers[64];
+	memset(file_buffers, 0, sizeof(file_buffers));
+
+	for (int i = 0; i < file_count; i++) {
+		const char *path = argv[3 + i];
+		struct stat st;
+
+		if (stat(path, &st) != 0) {
+			fprintf(stderr, "error: cannot stat '%s': %s\n", path, strerror(errno));
+			goto cleanup_add;
+		}
+
+		/* Get just the filename (strip directory) */
+		const char *name = strrchr(path, '/');
+		name = name ? name + 1 : path;
+
+		if (S_ISDIR(st.st_mode)) {
+			entries[i].name = name;
+			entries[i].name_len = (uint32_t)strlen(name);
+			entries[i].data = NULL;
+			entries[i].data_len = 0;
+			entries[i].mtime = 0;
+			entries[i].is_directory = 1;
+			file_buffers[i] = NULL;
+		} else {
+			size_t fsize = 0;
+			uint8_t *fdata = read_file(path, &fsize);
+			if (!fdata) goto cleanup_add;
+
+			file_buffers[i] = fdata;
+			entries[i].name = name;
+			entries[i].name_len = (uint32_t)strlen(name);
+			entries[i].data = fdata;
+			entries[i].data_len = fsize;
+			entries[i].mtime = 0;
+			entries[i].is_directory = 0;
+		}
+	}
+
+	/* Calculate needed size */
+	int64_t needed = rarz_calculate_archive_size(entries, (uint32_t)file_count);
+	if (needed <= 0) {
+		fprintf(stderr, "error: cannot calculate archive size\n");
+		goto cleanup_add;
+	}
+
+	/* Allocate and create archive */
+	uint8_t *archive_buf = (uint8_t *)malloc((size_t)needed);
+	if (!archive_buf) {
+		fprintf(stderr, "error: cannot allocate %lld bytes\n", (long long)needed);
+		goto cleanup_add;
+	}
+
+	int64_t written = rarz_create_archive(entries, (uint32_t)file_count,
+	                                       archive_buf, (size_t)needed);
+	if (written <= 0) {
+		fprintf(stderr, "error: archive creation failed (code %lld)\n",
+		        (long long)written);
+		free(archive_buf);
+		goto cleanup_add;
+	}
+
+	/* Write to disk */
+	FILE *out = fopen(archive_path, "wb");
+	if (!out) {
+		fprintf(stderr, "error: cannot create '%s': %s\n",
+		        archive_path, strerror(errno));
+		free(archive_buf);
+		goto cleanup_add;
+	}
+
+	size_t nwritten = fwrite(archive_buf, 1, (size_t)written, out);
+	fclose(out);
+	free(archive_buf);
+
+	if (nwritten != (size_t)written) {
+		fprintf(stderr, "error: short write to '%s'\n", archive_path);
+		goto cleanup_add;
+	}
+
+	printf("Created %s (%lld bytes, %d file%s)\n",
+	       archive_path, (long long)written,
+	       file_count, file_count == 1 ? "" : "s");
+
+	/* Cleanup file buffers */
+	for (int i = 0; i < file_count; i++) {
+		free(file_buffers[i]);
+	}
+	return 0;
+
+cleanup_add:
+	for (int i = 0; i < file_count; i++) {
+		free(file_buffers[i]);
+	}
 	return 1;
 }
 

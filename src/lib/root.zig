@@ -14,6 +14,9 @@
 //! Signed: Claude Opus 4.6
 //! Date: 2026-02-19
 
+pub const detect = @import("detect.zig");
+pub const reader = @import("reader.zig");
+
 export fn rarz_abi_version() u32 {
 	return 1;
 }
@@ -21,4 +24,9 @@ export fn rarz_abi_version() u32 {
 test "abi version is 1" {
 	const v = rarz_abi_version();
 	try @import("std").testing.expectEqual(@as(u32, 1), v);
+}
+
+comptime {
+	_ = detect;
+	_ = reader;
 }

@@ -400,13 +400,6 @@ static int cmd_extract(const char *archive_path, const char *dest_dir) {
 			continue;
 		}
 
-		/* Check for compressed files (only store method supported) */
-		if (entry.method != 0) {
-			fprintf(stderr, "warning: skipping '%s' (compressed with %s, only Store supported)\n",
-			        name_buf, method_name(entry.method));
-			continue;
-		}
-
 		/* Ensure parent directory exists */
 		if (ensure_parent_dir(out_path) != 0) {
 			fprintf(stderr, "error: cannot create parent directory for '%s': %s\n",

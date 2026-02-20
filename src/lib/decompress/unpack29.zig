@@ -220,7 +220,7 @@ pub const Unpack29State = struct {
             const sym = huffman.decodeNumber(self.br, &bc_table) catch |err| {
                 return switch (err) {
                     error.EndOfData => Unpack29Error.EndOfData,
-                    error.InvalidCode => Unpack29Error.CorruptData,
+
                     error.InvalidTable => Unpack29Error.CorruptData,
                 };
             };
@@ -298,7 +298,7 @@ pub const Unpack29State = struct {
         const slot = huffman.decodeNumber(self.br, &self.rc) catch |err| {
             return switch (err) {
                 error.EndOfData => Unpack29Error.EndOfData,
-                error.InvalidCode => Unpack29Error.CorruptData,
+
                 error.InvalidTable => Unpack29Error.CorruptData,
             };
         };
@@ -316,7 +316,7 @@ pub const Unpack29State = struct {
         const slot = huffman.decodeNumber(self.br, &self.dc) catch |err| {
             return switch (err) {
                 error.EndOfData => Unpack29Error.EndOfData,
-                error.InvalidCode => Unpack29Error.CorruptData,
+
                 error.InvalidTable => Unpack29Error.CorruptData,
             };
         };
@@ -340,7 +340,7 @@ pub const Unpack29State = struct {
             const low = huffman.decodeNumber(self.br, &self.ldc) catch |err| {
                 return switch (err) {
                     error.EndOfData => Unpack29Error.EndOfData,
-                    error.InvalidCode => Unpack29Error.CorruptData,
+
                     error.InvalidTable => Unpack29Error.CorruptData,
                 };
             };
@@ -373,7 +373,7 @@ pub const Unpack29State = struct {
         const symbol = huffman.decodeNumber(self.br, &self.mc) catch |err| {
             return switch (err) {
                 error.EndOfData => Unpack29Error.EndOfData,
-                error.InvalidCode => Unpack29Error.CorruptData,
+
                 error.InvalidTable => Unpack29Error.CorruptData,
             };
         };

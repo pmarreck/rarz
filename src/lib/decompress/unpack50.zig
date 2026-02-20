@@ -39,33 +39,21 @@ const MAX_TOTAL_SYMBOLS: usize = NC + DC_RAR7 + LDC + RC;
 const SlotEntry = struct { base: u32, extra: u5 };
 
 /// Length decoding table: slot -> (base_length, extra_bits).
-/// Slots 0-7:  length = slot + 2, no extra bits.
-/// From slot 8 onward, extra bits increase by 1 for every pair of slots.
+/// Matches unRAR's SlotToLength exactly:
+///   Slots 0-7: length = 2 + slot, no extra bits.
+///   Slots 8+:  LBits = slot/4 - 1, base = 2 + (4 | (slot & 3)) << LBits
+/// Extra bits increase every 4 slots (not every 2).
 const LENGTH_TABLE: [RC]SlotEntry = blk: {
     var table: [RC]SlotEntry = undefined;
     // Slots 0-7: direct mapping
     for (0..8) |i| {
         table[i] = .{ .base = @intCast(i + 2), .extra = 0 };
     }
-    // Slots 8+: paired, with increasing extra bits
-    var base: u32 = 10;
-    var extra: u5 = 1;
-    var slot: usize = 8;
-    while (slot < RC) {
-        const range: u32 = @as(u32, 1) << extra;
-        // First of pair
-        if (slot < RC) {
-            table[slot] = .{ .base = base, .extra = extra };
-            base += range;
-            slot += 1;
-        }
-        // Second of pair
-        if (slot < RC) {
-            table[slot] = .{ .base = base, .extra = extra };
-            base += range;
-            slot += 1;
-        }
-        extra += 1;
+    // Slots 8+: groups of 4 with increasing extra bits
+    for (8..RC) |slot| {
+        const lbits: u5 = @intCast(slot / 4 - 1);
+        const base: u32 = 2 + (@as(u32, 4 | @as(u32, slot & 3)) << lbits);
+        table[slot] = .{ .base = base, .extra = lbits };
     }
     break :blk table;
 };
@@ -175,9 +163,32 @@ pub fn readTables(state: *Unpack50State) !void {
     huffman.freeDecodeTable(&state.rd, allocator);
 
     // Stage 1: Read 20 code-length code lengths (4 bits each)
-    var cl_lengths: [CODE_LENGTH_SYMBOLS]u8 = undefined;
-    for (0..CODE_LENGTH_SYMBOLS) |i| {
-        cl_lengths[i] = @intCast(try br.readBits(4));
+    // Special handling: value 15 followed by another 4-bit value:
+    //   - If the second value is 0, the actual length IS 15
+    //   - If non-zero, it means (value+2) consecutive zero entries (run-length)
+    var cl_lengths: [CODE_LENGTH_SYMBOLS]u8 = [_]u8{0} ** CODE_LENGTH_SYMBOLS;
+    {
+        var ci: usize = 0;
+        while (ci < CODE_LENGTH_SYMBOLS) {
+            const length: u8 = @intCast(try br.readBits(4));
+            if (length == 15) {
+                const zero_count_raw: u8 = @intCast(try br.readBits(4));
+                if (zero_count_raw == 0) {
+                    cl_lengths[ci] = 15;
+                    ci += 1;
+                } else {
+                    // Run of (zero_count_raw + 2) zeros
+                    var zc: usize = @as(usize, zero_count_raw) + 2;
+                    while (zc > 0 and ci < CODE_LENGTH_SYMBOLS) : (zc -= 1) {
+                        cl_lengths[ci] = 0;
+                        ci += 1;
+                    }
+                }
+            } else {
+                cl_lengths[ci] = length;
+                ci += 1;
+            }
+        }
     }
 
     // Build the code-length Huffman table
@@ -187,6 +198,12 @@ pub fn readTables(state: *Unpack50State) !void {
     if (!cl_table.valid) return error.InvalidTable;
 
     // Stage 2: Decode actual code lengths for the full alphabet
+    // RAR5 code-length symbols (from unRAR ReadTables50):
+    //   0-15: direct code length (no delta encoding in RAR5)
+    //   16:   repeat previous length, 3 + readBits(3) = 3-10 times
+    //   17:   repeat previous length, 11 + readBits(7) = 11-138 times
+    //   18:   zero fill (short), 3 + readBits(3) = 3-10 times
+    //   19:   zero fill (long), 11 + readBits(7) = 11-138 times
     const dc: u16 = if (state.is_rar7) DC_RAR7 else DC_RAR5;
     const total_symbols: usize = @as(usize, NC) + dc + LDC + RC;
     var code_lengths: [MAX_TOTAL_SYMBOLS]u8 = [_]u8{0} ** MAX_TOTAL_SYMBOLS;
@@ -196,29 +213,41 @@ pub fn readTables(state: *Unpack50State) !void {
         const sym = try huffman.decodeNumber(br, &cl_table);
 
         if (sym < 16) {
-            // Direct code length
+            // Direct code length (RAR5 uses direct assignment, not delta encoding)
             code_lengths[i] = @intCast(sym);
             i += 1;
         } else if (sym == 16) {
-            // Repeat previous length: 3 + readBits(2) times
-            if (i == 0) return error.InvalidData;
-            const repeat_count = 3 + try br.readBits(2);
-            const prev_len = code_lengths[i - 1];
-            var j: u32 = 0;
-            while (j < repeat_count and i < total_symbols) : (j += 1) {
-                code_lengths[i] = prev_len;
-                i += 1;
+            // Repeat previous length (short): 3 + readBits(3) = 3-10 times
+            const repeat_count = 3 + try br.readBits(3);
+            if (i > 0) {
+                const prev_len = code_lengths[i - 1];
+                var j: u32 = 0;
+                while (j < repeat_count and i < total_symbols) : (j += 1) {
+                    code_lengths[i] = prev_len;
+                    i += 1;
+                }
             }
         } else if (sym == 17) {
-            // Zero run: 3 + readBits(3) times
+            // Repeat previous length (long): 11 + readBits(7) = 11-138 times
+            const repeat_count = 11 + try br.readBits(7);
+            if (i > 0) {
+                const prev_len = code_lengths[i - 1];
+                var j: u32 = 0;
+                while (j < repeat_count and i < total_symbols) : (j += 1) {
+                    code_lengths[i] = prev_len;
+                    i += 1;
+                }
+            }
+        } else if (sym == 18) {
+            // Zero run (short): 3 + readBits(3) = 3-10 times
             const zero_count = 3 + try br.readBits(3);
             var j: u32 = 0;
             while (j < zero_count and i < total_symbols) : (j += 1) {
                 code_lengths[i] = 0;
                 i += 1;
             }
-        } else if (sym == 18) {
-            // Long zero run: 11 + readBits(7) times
+        } else if (sym == 19) {
+            // Zero run (long): 11 + readBits(7) = 11-138 times
             const zero_count = 11 + try br.readBits(7);
             var j: u32 = 0;
             while (j < zero_count and i < total_symbols) : (j += 1) {
@@ -229,6 +258,9 @@ pub fn readTables(state: *Unpack50State) !void {
             return error.InvalidData;
         }
     }
+
+    // Note: RAR5 does NOT use delta encoding between blocks (unlike RAR3).
+    // Each block's code lengths are decoded fresh.
 
     // Stage 3: Split the combined code lengths into 4 tables and build them
     var offset: usize = 0;
@@ -303,29 +335,70 @@ fn readFilterSize(br: *BitReader) !usize {
 // Main Decoder Loop
 // ============================================================================
 
-/// Decode one block of compressed data. Returns true if more blocks follow.
+/// Read and decode one block of compressed data. Returns true if more blocks follow.
+///
+/// RAR5 block header format (from unRAR ReadBlockHeader):
+///   1. Byte-align the bit reader
+///   2. Read 8-bit flags byte:
+///      - bits 0-2: BlockBitSize = (flags & 7) + 1 (valid bits in last byte)
+///      - bits 3-4: ByteCount = ((flags >> 3) & 3) + 1 (bytes for size, max 3)
+///      - bit 6: LastBlockInFile
+///      - bit 7: TablePresent
+///   3. Read 8-bit checksum
+///   4. Read ByteCount bytes for BlockSize (little-endian)
+///   5. Verify: checksum == 0x5a ^ flags ^ BlockSize_byte0 ^ BlockSize_byte1 ^ BlockSize_byte2
 fn decodeBlock(state: *Unpack50State, unpacked_size: u64) !bool {
     const br = &state.br;
 
-    // Block header
-    const table_present = try br.readBit();
-    const is_last_block = try br.readBit();
+    // Step 1: Byte-align
+    br.alignByte();
 
-    // Read block size (in bits) — this is the size of the compressed block data
-    // RAR5 uses a variable-length encoding for this
-    const block_bits_count = try readBlockBitsCount(br);
+    // Step 2: Read 8-bit block flags
+    const flags: u8 = @intCast(try br.readBits(8));
+    const block_bit_size: u4 = @intCast((flags & 7) + 1); // 1-8 valid bits in last byte
+    const byte_count: u2 = @intCast(((flags >> 3) & 3) + 1); // 1-3 bytes for size
+    if (byte_count == 4) return error.InvalidData; // ByteCount 4 is reserved/invalid
+    const is_last_block = (flags & 0x40) != 0;
+    const table_present = (flags & 0x80) != 0;
 
-    if (table_present == 1) {
+    // Step 3: Read 8-bit checksum
+    const saved_checksum: u8 = @intCast(try br.readBits(8));
+
+    // Step 4: Read ByteCount bytes for BlockSize (little-endian)
+    var block_size: u32 = 0;
+    for (0..byte_count) |i| {
+        const b: u32 = try br.readBits(8);
+        block_size += b << @intCast(i * 8);
+    }
+
+    // Step 5: Verify checksum
+    const computed_checksum: u8 = 0x5a ^ flags ^ @as(u8, @truncate(block_size)) ^ @as(u8, @truncate(block_size >> 8)) ^ @as(u8, @truncate(block_size >> 16));
+    if (computed_checksum != saved_checksum) return error.InvalidData;
+
+    // Block data starts at the current byte position
+    const block_start_byte = br.bit_pos / 8;
+
+    if (table_present) {
         try readTables(state);
     }
 
     if (!state.tables_loaded) return error.InvalidData;
 
-    // Calculate the end bit position for this block
-    const block_end_bit = br.bit_pos + block_bits_count;
+    // Block spans block_size bytes from block_start_byte.
+    // Last byte has block_bit_size valid bits.
+    // Total valid bits = (block_size - 1) * 8 + block_bit_size
+    // But for the end check: we stop when byte pos > last byte, or
+    // byte pos == last byte and bit offset >= block_bit_size
+    const block_end_byte = block_start_byte + block_size;
 
     // Decode symbols until we exhaust the block or reach the target size
-    while (br.bit_pos < block_end_bit and state.written_size < unpacked_size) {
+    while (state.written_size < unpacked_size) {
+        // Check if we've consumed the block
+        const cur_byte = br.bit_pos / 8;
+        const cur_bit: u4 = @intCast(br.bit_pos % 8);
+        if (cur_byte > block_end_byte -| 1) break;
+        if (cur_byte == block_end_byte -| 1 and cur_bit >= block_bit_size) break;
+
         const symbol: u32 = try huffman.decodeNumber(br, &state.ld);
 
         if (symbol < 256) {
@@ -362,8 +435,20 @@ fn decodeBlock(state: *Unpack50State, unpacked_size: u64) !bool {
         } else {
             // New match: symbol >= 262
             const length_slot: u32 = symbol - 262;
-            const length = try decodeLengthSlot(br, length_slot);
+            var length = try decodeLengthSlot(br, length_slot);
             const distance = try decodeDistance(br, &state.dd, &state.ldd);
+
+            // Distance-dependent length adjustment (matches unRAR):
+            // Longer distances get +1 to +3 added to the length.
+            if (distance > 0x100) {
+                length += 1;
+                if (distance > 0x2000) {
+                    length += 1;
+                    if (distance > 0x40000) {
+                        length += 1;
+                    }
+                }
+            }
 
             // Shift prev_distances right, insert new at [0]
             state.prev_distances[3] = state.prev_distances[2];
@@ -377,24 +462,7 @@ fn decodeBlock(state: *Unpack50State, unpacked_size: u64) !bool {
         }
     }
 
-    return is_last_block == 0; // more blocks if not last
-}
-
-/// Read the block bit count from the bitstream.
-/// RAR5 encodes this as: read 2 bits of width prefix, then read that many bytes.
-/// 00 -> 7 bits follow (max 127)
-/// 01 -> 11 bits follow (max 2047)
-/// 10 -> 18 bits follow (max 262143)
-/// 11 -> 25 bits follow (max 33554431)
-fn readBlockBitsCount(br: *BitReader) !usize {
-    const prefix = try br.readBits(2);
-    return switch (prefix) {
-        0 => @as(usize, try br.readBits(7)),
-        1 => @as(usize, try br.readBits(11)),
-        2 => @as(usize, try br.readBits(18)),
-        3 => @as(usize, try br.readBits(25)),
-        else => unreachable,
-    };
+    return !is_last_block; // more blocks if not last
 }
 
 // ============================================================================
@@ -436,10 +504,13 @@ pub fn decompress(
         }
     }
 
-    // Copy decompressed data from the window
+    // Copy decompressed data from the window.
+    // Use write_pos as start_offset (not out_size) because the last match may
+    // overshoot unpacked_size, making write_pos > written_size. We always want
+    // to read from the beginning of the window (position 0).
     const out_size: usize = @intCast(@min(unpacked_size, state.written_size));
     const output = try allocator.alloc(u8, out_size);
-    _ = state.window.copyToOutput(output, out_size, out_size);
+    _ = state.window.copyToOutput(output, state.window.write_pos, out_size);
 
     return output;
 }
@@ -457,32 +528,41 @@ test "LENGTH_TABLE: slots 0-7 are direct" {
     }
 }
 
-test "LENGTH_TABLE: slot 8-9 have 1 extra bit" {
-    try testing.expectEqual(@as(u32, 10), LENGTH_TABLE[8].base);
+test "LENGTH_TABLE: slots 8-11 have 1 extra bit (groups of 4)" {
+    // LBits = slot/4 - 1 = 1 for slots 8-11
+    // base = 2 + (4 | (slot & 3)) << 1
+    try testing.expectEqual(@as(u32, 10), LENGTH_TABLE[8].base); // 2 + (4|0)<<1 = 2+8
     try testing.expectEqual(@as(u5, 1), LENGTH_TABLE[8].extra);
-    try testing.expectEqual(@as(u32, 12), LENGTH_TABLE[9].base);
+    try testing.expectEqual(@as(u32, 12), LENGTH_TABLE[9].base); // 2 + (4|1)<<1 = 2+10
     try testing.expectEqual(@as(u5, 1), LENGTH_TABLE[9].extra);
+    try testing.expectEqual(@as(u32, 14), LENGTH_TABLE[10].base); // 2 + (4|2)<<1 = 2+12
+    try testing.expectEqual(@as(u5, 1), LENGTH_TABLE[10].extra);
+    try testing.expectEqual(@as(u32, 16), LENGTH_TABLE[11].base); // 2 + (4|3)<<1 = 2+14
+    try testing.expectEqual(@as(u5, 1), LENGTH_TABLE[11].extra);
 }
 
-test "LENGTH_TABLE: slot 10-11 have 2 extra bits" {
-    try testing.expectEqual(@as(u32, 14), LENGTH_TABLE[10].base);
-    try testing.expectEqual(@as(u5, 2), LENGTH_TABLE[10].extra);
-    try testing.expectEqual(@as(u32, 18), LENGTH_TABLE[11].base);
-    try testing.expectEqual(@as(u5, 2), LENGTH_TABLE[11].extra);
+test "LENGTH_TABLE: slots 12-15 have 2 extra bits" {
+    // LBits = slot/4 - 1 = 2 for slots 12-15
+    try testing.expectEqual(@as(u32, 18), LENGTH_TABLE[12].base); // 2 + 4<<2
+    try testing.expectEqual(@as(u5, 2), LENGTH_TABLE[12].extra);
+    try testing.expectEqual(@as(u32, 22), LENGTH_TABLE[13].base); // 2 + 5<<2
+    try testing.expectEqual(@as(u5, 2), LENGTH_TABLE[13].extra);
+    try testing.expectEqual(@as(u32, 26), LENGTH_TABLE[14].base); // 2 + 6<<2
+    try testing.expectEqual(@as(u5, 2), LENGTH_TABLE[14].extra);
+    try testing.expectEqual(@as(u32, 30), LENGTH_TABLE[15].base); // 2 + 7<<2
+    try testing.expectEqual(@as(u5, 2), LENGTH_TABLE[15].extra);
 }
 
-test "LENGTH_TABLE: slot 12-13 have 3 extra bits" {
-    try testing.expectEqual(@as(u32, 22), LENGTH_TABLE[12].base);
-    try testing.expectEqual(@as(u5, 3), LENGTH_TABLE[12].extra);
-    try testing.expectEqual(@as(u32, 30), LENGTH_TABLE[13].base);
-    try testing.expectEqual(@as(u5, 3), LENGTH_TABLE[13].extra);
-}
-
-test "LENGTH_TABLE: slot 14-15 have 4 extra bits" {
-    try testing.expectEqual(@as(u32, 38), LENGTH_TABLE[14].base);
-    try testing.expectEqual(@as(u5, 4), LENGTH_TABLE[14].extra);
-    try testing.expectEqual(@as(u32, 54), LENGTH_TABLE[15].base);
-    try testing.expectEqual(@as(u5, 4), LENGTH_TABLE[15].extra);
+test "LENGTH_TABLE: slots 16-19 have 3 extra bits" {
+    // LBits = slot/4 - 1 = 3 for slots 16-19
+    try testing.expectEqual(@as(u32, 34), LENGTH_TABLE[16].base); // 2 + 4<<3
+    try testing.expectEqual(@as(u5, 3), LENGTH_TABLE[16].extra);
+    try testing.expectEqual(@as(u32, 42), LENGTH_TABLE[17].base); // 2 + 5<<3
+    try testing.expectEqual(@as(u5, 3), LENGTH_TABLE[17].extra);
+    try testing.expectEqual(@as(u32, 50), LENGTH_TABLE[18].base); // 2 + 6<<3
+    try testing.expectEqual(@as(u5, 3), LENGTH_TABLE[18].extra);
+    try testing.expectEqual(@as(u32, 58), LENGTH_TABLE[19].base); // 2 + 7<<3
+    try testing.expectEqual(@as(u5, 3), LENGTH_TABLE[19].extra);
 }
 
 test "decodeLengthSlot: slot 0 returns 2" {
@@ -500,7 +580,7 @@ test "decodeLengthSlot: slot 7 returns 9" {
 }
 
 test "decodeLengthSlot: slot 8 with extra bit=1 returns 11" {
-    // Slot 8: base=10, extra=1
+    // Slot 8: base=10, extra=1 (LBits = 8/4 - 1 = 1)
     // Extra bit = 1 -> length = 10 + 1 = 11
     var data = [_]u8{0x80}; // bit 0 = 1
     var br = BitReader.init(&data);
@@ -508,13 +588,13 @@ test "decodeLengthSlot: slot 8 with extra bit=1 returns 11" {
     try testing.expectEqual(@as(u32, 11), len);
 }
 
-test "decodeLengthSlot: slot 10 with extra bits=11 returns 17" {
-    // Slot 10: base=14, extra=2
-    // Extra bits = 11 (=3) -> length = 14 + 3 = 17
-    var data = [_]u8{0xC0}; // bits 11 = 3
+test "decodeLengthSlot: slot 10 with extra bit=1 returns 15" {
+    // Slot 10: base=14, extra=1 (LBits = 10/4 - 1 = 1)
+    // Extra bit = 1 -> length = 14 + 1 = 15
+    var data = [_]u8{0x80}; // bit 0 = 1
     var br = BitReader.init(&data);
     const len = try decodeLengthSlot(&br, 10);
-    try testing.expectEqual(@as(u32, 17), len);
+    try testing.expectEqual(@as(u32, 15), len);
 }
 
 test "decodeLengthSlot: invalid slot returns error" {
@@ -609,266 +689,40 @@ test "readTables: code-length table construction" {
     try testing.expectError(error.EndOfData, readTables(&state));
 }
 
-test "readBlockBitsCount: prefix 0 reads 7 bits" {
-    // Prefix 00, then 7 bits = 1111111 = 127
-    // 00_1111111_0 = 0x3F80 >> ... Let me compute:
-    // bits: 0 0 1 1 1 1 1 1 1 ...
-    // byte[0] = 00111111 = 0x3F, byte[1] = 10000000 = 0x80
-    var data = [_]u8{ 0x3F, 0x80 };
-    var br = BitReader.init(&data);
-    const count = try readBlockBitsCount(&br);
-    try testing.expectEqual(@as(usize, 127), count);
-}
+test "block header: parse flags, checksum, and size correctly" {
+    // Construct a valid block header:
+    // flags = 0xC3: bits 0-2 = 3 (block_bit_size=4), bits 3-4 = 0 (byte_count=1),
+    //               bit 6 = 1 (last_block), bit 7 = 1 (table_present)
+    // checksum = 0x5a ^ 0xC3 ^ 0x10 = 0x5a ^ 0xC3 = 0x99, 0x99 ^ 0x10 = 0x89
+    // size = 0x10 = 16 bytes
+    //
+    // This will fail at readTables (truncated data), but we verify the header parsing
+    // doesn't fail with InvalidData (which would mean checksum mismatch).
+    var data = [_]u8{ 0xC3, 0x89, 0x10 } ++ [_]u8{0x00} ** 20;
+    var state = try Unpack50State.init(testing.allocator, &data, false, 15);
+    defer state.deinit();
 
-test "readBlockBitsCount: prefix 1 reads 11 bits" {
-    // Prefix 01, then 11 bits = all 1s = 2047
-    // bits: 0 1 1 1 1 1 1 1 1 1 1 1 1 ...
-    // byte[0] = 01111111 = 0x7F, byte[1] = 11111000 = 0xF8
-    var data = [_]u8{ 0x7F, 0xFF, 0x00 };
-    var br = BitReader.init(&data);
-    const count = try readBlockBitsCount(&br);
-    try testing.expectEqual(@as(usize, 2047), count);
-}
-
-test "readBlockBitsCount: prefix 2 reads 18 bits" {
-    // Prefix 10, then 18 bits = all zeros = 0
-    // bits: 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
-    // byte[0] = 10000000 = 0x80, rest = 0x00
-    var data = [_]u8{ 0x80, 0x00, 0x00 };
-    var br = BitReader.init(&data);
-    const count = try readBlockBitsCount(&br);
-    try testing.expectEqual(@as(usize, 0), count);
+    // decodeBlock should parse the header successfully but fail on readTables
+    const result = decodeBlock(&state, 4);
+    // Should fail at table reading, not at header parsing
+    try testing.expect(result == error.EndOfData or result == error.InvalidTable);
 }
 
 test "hand-built RAR5 block: 4 literal 'A' bytes" {
-    // We'll build a RAR5 compressed stream by hand that decompresses to "AAAA".
+    // Build a RAR5 compressed stream that decompresses to "AAAA".
     //
-    // Block structure:
-    // 1. table_present = 1 (1 bit)
-    // 2. is_last = 1 (1 bit)
-    // 3. block_bits_count: prefix=00 (2 bits), then 7-bit value (we'll compute)
-    // 4. Huffman tables (20 x 4-bit CL lengths + encoded alphabet)
-    // 5. 4 literal symbols for 'A' (0x41)
+    // RAR5 block header format (byte-aligned):
+    //   byte 0: flags (bit7=table_present, bit6=last_block, bits3-4=byte_count-1, bits0-2=block_bit_size-1)
+    //   byte 1: checksum = 0x5a ^ flags ^ size_byte0 ^ size_byte1 ^ ...
+    //   bytes 2..2+byte_count: block_size (little-endian)
     //
-    // Strategy: Make symbol 0x41 ('A') have the shortest code (1 bit = "0").
-    // All other symbols unused (length 0).
+    // After header comes block data (Huffman tables + compressed symbols).
     //
-    // For the code-length table, we need at least symbols 0 (for unused)
-    // and 1 (for the code length of 'A'). But we also need symbol 18
-    // (long zero run) to efficiently encode all the zeros.
-    //
-    // CL table: Let's give CL symbol 1 length 2 (code "00"),
-    //           CL symbol 18 length 2 (code "01"),
-    //           and CL symbol 0 length 2 (code "10").
-    //           Wait, 3 symbols at length 2 won't work (only 4 codes at 2 bits: 00,01,10,11).
-    //           Let's use: CL sym 0 -> len 2, CL sym 1 -> len 2, CL sym 18 -> len 2, CL sym 17 -> len 2
-    //           That's 4 symbols at length 2 -> codes 00, 01, 10, 11 -> perfect.
-    //
-    // CL symbols are indexed 0-19. We set:
-    //   CL[0] = 2, CL[1] = 2, CL[17] = 2, CL[18] = 2, rest = 0
-    //
-    // Canonical codes at length 2:
-    //   First code = 0. Symbols in order: 0, 1, 17, 18
-    //   sym 0 -> code 00
-    //   sym 1 -> code 01
-    //   sym 17 -> code 10
-    //   sym 18 -> code 11
-    //
-    // Now we need to encode the alphabet (NC + DC + LDC + RC = 306+64+16+44 = 430 symbols):
-    //   Symbol 0x41 (='A', index 65) gets length 1
-    //   All others get length 0
-    //
-    // Encoding plan:
-    //   - Positions 0-64: 65 zeros
-    //     Use CL sym 18 (long zero: 11 + readBits(7)) for bulk
-    //     65 = 11 + 54, so: sym 18, extra = 54 (7 bits: 0110110)
-    //   - Position 65: length 1 -> CL sym 1 (code "01")
-    //   - Positions 66 to 429: 364 zeros
-    //     364 = 138 + 138 + 88
-    //     138 = 11 + 127: sym 18, extra = 127 (7 bits: 1111111)
-    //     88 = 11 + 77: sym 18, extra = 77 (7 bits: 1001101)
-    //     3 repetitions of sym 18
-    //
-    // Let me verify: 65 + 1 + 138 + 138 + 88 = 430. Yes!
-    //
-    // After reading tables, the LD table has symbol 0x41 with code length 1 (code "0").
-    // DD, LDD, RD tables will all be empty/invalid (all zeros), but we only emit literals.
-    //
-    // The 4 literals 'A' are encoded as 4x "0" (1 bit each) = 4 bits.
-    //
-    // Now let's compute the total block data bits (after block header):
-    //   CL lengths: 20 x 4 = 80 bits
-    //   Alphabet encoding:
-    //     sym 18 + 7-bit extra: 2 + 7 = 9 bits (zeros 0-64)
-    //     sym 1: 2 bits (length 1 at pos 65)
-    //     sym 18 + 7-bit extra: 2 + 7 = 9 bits (zeros 66-203)
-    //     sym 18 + 7-bit extra: 2 + 7 = 9 bits (zeros 204-341)
-    //     sym 18 + 7-bit extra: 2 + 7 = 9 bits (zeros 342-429)
-    //   Total alphabet: 9 + 2 + 9 + 9 + 9 = 38 bits
-    //   Literal data: 4 bits
-    //   Total: 80 + 38 + 4 = 122 bits
-    //
-    // Block header:
-    //   table_present = 1 (1 bit)
-    //   is_last = 1 (1 bit)
-    //   block_bits_count prefix = 00 (2 bits), value = 122 (7 bits: 1111010)
-    //   Total header: 1 + 1 + 2 + 7 = 11 bits
-    //
-    // Grand total: 11 + 122 = 133 bits = 16.625 bytes -> 17 bytes needed
-    //
-    // Let's build the bitstream:
-    // Bit 0: 1 (table_present)
-    // Bit 1: 1 (is_last)
-    // Bits 2-3: 00 (block_bits_count prefix)
-    // Bits 4-10: 1111010 = 122 (block_bits_count value)
-    // Bits 11-90: CL lengths (20 x 4 bits each)
-    //   CL[0]=2:  0010
-    //   CL[1]=2:  0010
-    //   CL[2]=0:  0000
-    //   CL[3]=0:  0000
-    //   CL[4]=0:  0000
-    //   CL[5]=0:  0000
-    //   CL[6]=0:  0000
-    //   CL[7]=0:  0000
-    //   CL[8]=0:  0000
-    //   CL[9]=0:  0000
-    //   CL[10]=0: 0000
-    //   CL[11]=0: 0000
-    //   CL[12]=0: 0000
-    //   CL[13]=0: 0000
-    //   CL[14]=0: 0000
-    //   CL[15]=0: 0000
-    //   CL[16]=0: 0000
-    //   CL[17]=2: 0010
-    //   CL[18]=2: 0010
-    //   CL[19]=0: 0000
-    // Bits 91-99: sym18 "11" + extra 0110110 (= 54 -> 11+54=65 zeros)
-    // Bits 100-101: sym1 "01" (length 1 for symbol 65)
-    // Bits 102-110: sym18 "11" + extra 1111111 (=127 -> 11+127=138 zeros)
-    // Bits 111-119: sym18 "11" + extra 1111111 (=127 -> 11+127=138 zeros)
-    // Bits 120-128: sym18 "11" + extra 1001101 (= 77 -> 11+77=88 zeros)
-    // Bits 129-132: 4x "0" (literal 'A')
-    //
-    // Let me lay out all bits:
-    // 0: 1
-    // 1: 1
-    // 2: 0
-    // 3: 0
-    // 4: 1 5: 1 6: 1 7: 1 8: 0 9: 1 10: 0  (122 = 1111010)
-    // 11-14: 0010 (CL[0]=2)
-    // 15-18: 0010 (CL[1]=2)
-    // 19-22: 0000 (CL[2])
-    // 23-26: 0000 (CL[3])
-    // 27-30: 0000 (CL[4])
-    // 31-34: 0000 (CL[5])
-    // 35-38: 0000 (CL[6])
-    // 39-42: 0000 (CL[7])
-    // 43-46: 0000 (CL[8])
-    // 47-50: 0000 (CL[9])
-    // 51-54: 0000 (CL[10])
-    // 55-58: 0000 (CL[11])
-    // 59-62: 0000 (CL[12])
-    // 63-66: 0000 (CL[13])
-    // 67-70: 0000 (CL[14])
-    // 71-74: 0000 (CL[15])
-    // 75-78: 0000 (CL[16])
-    // 79-82: 0010 (CL[17]=2)
-    // 83-86: 0010 (CL[18]=2)
-    // 87-90: 0000 (CL[19])
-    // 91-92: 11 (CL sym 18 code)
-    // 93-99: 0110110 (extra = 54)
-    // 100-101: 01 (CL sym 1 code)
-    // 102-103: 11 (CL sym 18 code)
-    // 104-110: 1111111 (extra = 127)
-    // 111-112: 11 (CL sym 18 code)
-    // 113-119: 1111111 (extra = 127)
-    // 120-121: 11 (CL sym 18 code)
-    // 122-128: 1001101 (extra = 77)
-    // 129-132: 0000 (4x literal 'A' using 1-bit code "0")
-    //
-    // Total: 133 bits -> 17 bytes
-    //
-    // Group into bytes (MSB first):
-    // Byte 0 (bits 0-7):   1 1 0 0 1 1 1 1 = 0xCF
-    // Byte 1 (bits 8-15):  0 1 0 0 0 1 0 0 = 0x44
-    // Byte 2 (bits 16-23): 0 1 0 0 0 0 0 0 = 0x40
-    // ...wait, let me recount. Let me be extremely careful.
-    //
-    // bits[0..7] = 1,1,0,0, 1,1,1,1 -> 0xCF
-    // bits[8..15] = 0,1,0, 0,0,1,0, 0 -> Let me re-check.
-    //
-    // bit 0: 1 (table_present)
-    // bit 1: 1 (is_last)
-    // bit 2: 0 (prefix bit 0)
-    // bit 3: 0 (prefix bit 1)
-    // bit 4: 1 (122 bit 6, MSB)
-    // bit 5: 1 (122 bit 5)
-    // bit 6: 1 (122 bit 4)
-    // bit 7: 1 (122 bit 3)
-    // -> byte 0 = 11001111 = 0xCF
-
-    // bit 8: 0 (122 bit 2)
-    // bit 9: 1 (122 bit 1)
-    // bit 10: 0 (122 bit 0)
-    // bit 11: 0 (CL[0] bit 3)
-    // bit 12: 0 (CL[0] bit 2)
-    // bit 13: 1 (CL[0] bit 1)
-    // bit 14: 0 (CL[0] bit 0)
-    // bit 15: 0 (CL[1] bit 3)
-    // -> byte 1 = 01000100 = 0x44
-
-    // bit 16: 0 (CL[1] bit 2)
-    // bit 17: 1 (CL[1] bit 1)
-    // bit 18: 0 (CL[1] bit 0)
-    // bit 19-22: 0000 (CL[2])
-    // bit 23: 0 (CL[3] bit 3)
-    // -> byte 2 = 01000000 = 0x40
-
-    // bit 24-26: 000 (CL[3] bits 2,1,0)
-    // bit 27-30: 0000 (CL[4])
-    // bit 31: 0 (CL[5] bit 3)
-    // -> byte 3 = 00000000 = 0x00
-
-    // bits 32-39: CL[5] bits 2,1,0 + CL[6] 4 bits + CL[7] bit 3
-    // = 0,0,0, 0,0,0,0, 0
-    // -> byte 4 = 0x00
-
-    // bits 40-47: CL[7] bits 2,1,0 + CL[8] 4 bits + CL[9] bit 3
-    // = 0,0,0, 0,0,0,0, 0
-    // -> byte 5 = 0x00
-
-    // bits 48-55: CL[9] bits 2,1,0 + CL[10] 4 bits + CL[11] bit 3
-    // = 0,0,0, 0,0,0,0, 0
-    // -> byte 6 = 0x00
-
-    // bits 56-63: CL[11] bits 2,1,0 + CL[12] 4 bits + CL[13] bit 3
-    // = 0,0,0, 0,0,0,0, 0
-    // -> byte 7 = 0x00
-
-    // bits 64-71: CL[13] bits 2,1,0 + CL[14] 4 bits + CL[15] bit 3
-    // = 0,0,0, 0,0,0,0, 0
-    // -> byte 8 = 0x00
-
-    // bits 72-79: CL[15] bits 2,1,0 + CL[16] 4 bits + CL[17] bit 3
-    // = 0,0,0, 0,0,0,0, 0
-    // -> byte 9 = 0x00
-
-    // bits 80-87: CL[17] bits 2,1,0 + CL[18] 4 bits + CL[19] bit 3
-    // = 0,1,0, 0,0,1,0, 0
-    // -> byte 10 = 01000100 = 0x44
-
-    // bits 88-95: CL[19] bits 2,1,0 + sym18 code "11" + extra bits 0,1,1
-    // = 0,0,0, 1,1, 0,1,1
-    // -> byte 11 = 00011011 = 0x1B
-
-    // bits 96-103: extra bits 0,1,1,0 + sym1 "01" + sym18 "11"
-    // = 0,1,1,0, 0,1, 1,1
-    // -> Wait, let me recount. bit 93 through 99 is the extra for the first sym18.
-    // bit 91: 1 (sym18 code bit 0) -- Actually let me recount from bit 87.
-
-    // I realize this manual computation is getting error-prone. Let me build
-    // a bitstream builder instead.
-
+    // Strategy: Make symbol 0x41 ('A') have code length 1 (1-bit code "0").
+    // CL table: sym0=2, sym1=2, sym18=2, sym19=2, all others=0.
+    // Canonical codes: sym0="00", sym1="01", sym18="10", sym19="11"
+    // Alphabet: 65 zeros (sym19: 11+54), length 1 (sym1), 364 zeros (3x sym19).
+    // Literals: 4x "0" = 4 bits.
     const stream = buildTestStream();
     const result = try decompress(testing.allocator, &stream.data, 4, 50, 15);
     defer testing.allocator.free(result);
@@ -876,14 +730,30 @@ test "hand-built RAR5 block: 4 literal 'A' bytes" {
     try testing.expectEqualSlices(u8, "AAAA", result);
 }
 
-/// Build the test compressed stream for "AAAA" using a programmatic bit writer.
+/// Build the test compressed stream for "AAAA" using the correct RAR5 block header format.
 fn buildTestStream() struct { data: [32]u8 } {
-    var bits: [256]u1 = [_]u1{0} ** 256;
+    var bits: [512]u1 = [_]u1{0} ** 512;
     var pos: usize = 0;
 
-    // Helper to write bits
-    const writeBits = struct {
-        fn f(b: *[256]u1, p: *usize, value: u32, count: usize) void {
+    // Helper to write a full byte (MSB-first)
+    const writeByte = struct {
+        fn f(b: *[512]u1, p: *usize, value: u8) void {
+            var i: usize = 0;
+            while (i < 8) : (i += 1) {
+                const shift: u3 = @intCast(7 - i);
+                b[p.*] = @intCast((value >> shift) & 1);
+                p.* += 1;
+            }
+        }
+    }.f;
+
+    // First, build the block DATA (tables + compressed symbols) to know its size.
+    // We'll construct this in a separate bit array, then prepend the header.
+    var data_bits: [512]u1 = [_]u1{0} ** 512;
+    var dpos: usize = 0;
+
+    const writeDataBits = struct {
+        fn f(b: *[512]u1, p: *usize, value: u32, count: usize) void {
             var i: usize = 0;
             while (i < count) : (i += 1) {
                 const shift: u5 = @intCast(count - 1 - i);
@@ -893,66 +763,59 @@ fn buildTestStream() struct { data: [32]u8 } {
         }
     }.f;
 
-    // Block header
-    writeBits(&bits, &pos, 1, 1); // table_present = 1
-    writeBits(&bits, &pos, 1, 1); // is_last = 1
-
-    // We'll fill in block_bits_count later. Reserve 2+7=9 bits.
-    const block_bits_pos = pos;
-    writeBits(&bits, &pos, 0, 2); // prefix = 00
-    writeBits(&bits, &pos, 0, 7); // placeholder for count
-
-    const table_start = pos;
-
     // CL lengths: 20 x 4-bit values
-    // CL[0]=2, CL[1]=2, CL[2..16]=0, CL[17]=2, CL[18]=2, CL[19]=0
-    writeBits(&bits, &pos, 2, 4); // CL[0]
-    writeBits(&bits, &pos, 2, 4); // CL[1]
-    for (0..15) |_| {
-        writeBits(&bits, &pos, 0, 4); // CL[2..16]
+    // CL[0]=2, CL[1]=2, CL[2..17]=0, CL[18]=2, CL[19]=2
+    writeDataBits(&data_bits, &dpos, 2, 4); // CL[0]
+    writeDataBits(&data_bits, &dpos, 2, 4); // CL[1]
+    for (0..16) |_| {
+        writeDataBits(&data_bits, &dpos, 0, 4); // CL[2..17]
     }
-    writeBits(&bits, &pos, 2, 4); // CL[17]
-    writeBits(&bits, &pos, 2, 4); // CL[18]
-    writeBits(&bits, &pos, 0, 4); // CL[19]
+    writeDataBits(&data_bits, &dpos, 2, 4); // CL[18]
+    writeDataBits(&data_bits, &dpos, 2, 4); // CL[19]
 
-    // CL codes: sym0=00, sym1=01, sym17=10, sym18=11
+    // CL codes: sym0="00", sym1="01", sym18="10", sym19="11"
 
-    // Encode alphabet code lengths:
-    // Positions 0-64: 65 zeros using sym18 (11 + readBits(7))
-    writeBits(&bits, &pos, 3, 2); // sym18 = "11"
-    writeBits(&bits, &pos, 54, 7); // 11 + 54 = 65
+    // Encode alphabet: 65 zeros, length 1, 364 zeros
+    writeDataBits(&data_bits, &dpos, 3, 2); // sym19 = "11"
+    writeDataBits(&data_bits, &dpos, 54, 7); // 11 + 54 = 65 zeros
 
-    // Position 65: length 1
-    writeBits(&bits, &pos, 1, 2); // sym1 = "01"
+    writeDataBits(&data_bits, &dpos, 1, 2); // sym1 = "01" (length 1 for 'A')
 
-    // Positions 66-429: 364 zeros = 138 + 138 + 88
-    writeBits(&bits, &pos, 3, 2); // sym18
-    writeBits(&bits, &pos, 127, 7); // 11 + 127 = 138
+    writeDataBits(&data_bits, &dpos, 3, 2); // sym19
+    writeDataBits(&data_bits, &dpos, 127, 7); // 138 zeros
 
-    writeBits(&bits, &pos, 3, 2); // sym18
-    writeBits(&bits, &pos, 127, 7); // 11 + 127 = 138
+    writeDataBits(&data_bits, &dpos, 3, 2); // sym19
+    writeDataBits(&data_bits, &dpos, 127, 7); // 138 zeros
 
-    writeBits(&bits, &pos, 3, 2); // sym18
-    writeBits(&bits, &pos, 77, 7); // 11 + 77 = 88
+    writeDataBits(&data_bits, &dpos, 3, 2); // sym19
+    writeDataBits(&data_bits, &dpos, 77, 7); // 88 zeros (65+1+138+138+88=430)
 
-    // 4 literal 'A' symbols (code "0", 1 bit each)
-    writeBits(&bits, &pos, 0, 1);
-    writeBits(&bits, &pos, 0, 1);
-    writeBits(&bits, &pos, 0, 1);
-    writeBits(&bits, &pos, 0, 1);
+    // 4 literal 'A' symbols (code "0")
+    writeDataBits(&data_bits, &dpos, 0, 1);
+    writeDataBits(&data_bits, &dpos, 0, 1);
+    writeDataBits(&data_bits, &dpos, 0, 1);
+    writeDataBits(&data_bits, &dpos, 0, 1);
 
-    // Calculate block_bits_count (bits of table + data, excluding block header)
-    const block_bits: u32 = @intCast(pos - table_start);
+    // Block data size in bytes + valid bits in last byte
+    const data_bytes: u32 = @intCast((dpos + 7) / 8);
+    const last_byte_bits: u8 = @intCast(if (dpos % 8 == 0) 8 else dpos % 8);
 
-    // Go back and fill in block_bits_count
-    // prefix is already 00, just fill in the 7-bit value
-    {
-        const val_start = block_bits_pos + 2;
-        var i: usize = 0;
-        while (i < 7) : (i += 1) {
-            const shift: u5 = @intCast(6 - i);
-            bits[val_start + i] = @intCast((block_bits >> shift) & 1);
-        }
+    // Build block header
+    // flags: bit7=table_present(1), bit6=last_block(1), bits3-4=byte_count-1(0 for 1 byte),
+    //        bits0-2=block_bit_size-1
+    const block_bit_size: u8 = last_byte_bits;
+    const flags: u8 = 0x80 | 0x40 | (block_bit_size - 1);
+    const size_byte: u8 = @intCast(data_bytes);
+    const checksum: u8 = 0x5a ^ flags ^ size_byte;
+
+    writeByte(&bits, &pos, flags);
+    writeByte(&bits, &pos, checksum);
+    writeByte(&bits, &pos, size_byte);
+
+    // Copy block data bits
+    for (0..dpos) |i| {
+        bits[pos] = data_bits[i];
+        pos += 1;
     }
 
     // Convert bits to bytes
@@ -989,16 +852,18 @@ test "decompression with repeated match (symbol 257)" {
     // This is too complex to hand-build in a test. We verify the mechanism works
     // at the unit level via individual function tests above.
     //
-    // Instead, let's verify that the LENGTH_TABLE continuity is correct:
-    // Each consecutive slot's base should be prev_base + 2^prev_extra.
-    var prev_end: u32 = 0;
-    for (LENGTH_TABLE, 0..) |entry, i| {
-        if (i == 0) {
-            try testing.expectEqual(@as(u32, 2), entry.base);
-        } else {
-            try testing.expectEqual(prev_end, entry.base);
-        }
-        prev_end = entry.base + (@as(u32, 1) << entry.extra);
+    // Instead, let's verify the LENGTH_TABLE matches unRAR's SlotToLength.
+    // Verify slots 0-7 are direct: base = 2 + slot, extra = 0
+    for (0..8) |slot| {
+        try testing.expectEqual(@as(u32, @intCast(slot + 2)), LENGTH_TABLE[slot].base);
+        try testing.expectEqual(@as(u5, 0), LENGTH_TABLE[slot].extra);
+    }
+    // Verify slots 8+ use groups of 4: LBits = slot/4 - 1
+    for (8..RC) |slot| {
+        const expected_lbits: u5 = @intCast(slot / 4 - 1);
+        const expected_base: u32 = 2 + (@as(u32, 4 | @as(u32, @intCast(slot & 3))) << expected_lbits);
+        try testing.expectEqual(expected_base, LENGTH_TABLE[slot].base);
+        try testing.expectEqual(expected_lbits, LENGTH_TABLE[slot].extra);
     }
 }
 
@@ -1062,5 +927,5 @@ test "decompress returns error on truncated data" {
     const data = [_]u8{ 0xFF, 0xFF };
     // This should fail during table reading (truncated)
     const result = decompress(testing.allocator, &data, 4, 50, 15);
-    try testing.expect(result == error.EndOfData or result == error.InvalidTable or result == error.InvalidCode or result == error.InvalidData);
+    try testing.expect(result == error.EndOfData or result == error.InvalidTable or result == error.InvalidData);
 }

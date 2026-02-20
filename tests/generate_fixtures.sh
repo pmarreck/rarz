@@ -8,14 +8,20 @@ mkdir -p "$FIXTURES"
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT
 
-# Generate a deterministic fake file tree
-gen-fake-tree --seed 0xDEADBEEF --path "$tmpdir/tree" --max-files 10 --max-size 10K --max-depth 3
+# Create deterministic test data (no external tool dependency)
+mkdir -p "$tmpdir/tree/subdir"
 
-# Also create some specific test files
 echo "Hello, rarz!" > "$tmpdir/tree/hello.txt"
 printf '\x00\x01\x02\x03\x04\x05\x06\x07' > "$tmpdir/tree/binary.bin"
-mkdir -p "$tmpdir/tree/subdir"
 echo "nested file" > "$tmpdir/tree/subdir/nested.txt"
+
+# Create a larger text file for compression testing (repeating content compresses well)
+for i in $(seq 1 200); do
+	echo "Line $i: The quick brown fox jumps over the lazy dog. ABCDEFGHIJKLMNOP $(printf '%04d' $i)"
+done > "$tmpdir/tree/medium.txt"
+
+# Create a binary-ish file with some entropy
+dd if=/dev/urandom bs=1024 count=8 of="$tmpdir/tree/random.bin" 2>/dev/null
 
 # Save project root for later
 project_root="$(pwd)"
@@ -26,15 +32,29 @@ cd "$tmpdir/tree"
 # RAR5 store (recursive to pick up all subdirs)
 rar a -m0 -r "$project_root/$FIXTURES/rar5_store.rar" . >/dev/null 2>&1
 
-# RAR5 compressed (default method, recursive)
-rar a -r "$project_root/$FIXTURES/rar5_compressed.rar" . >/dev/null 2>&1
+# RAR5 compressed at each level
+for level in 1 2 3 4 5; do
+	rar a -m${level} -r "$project_root/$FIXTURES/rar5_m${level}.rar" . >/dev/null 2>&1
+done
 
-# Single file archive
+# Default compression (for backwards compat with existing test names)
+cp "$project_root/$FIXTURES/rar5_m3.rar" "$project_root/$FIXTURES/rar5_compressed.rar"
+
+# Single file archive (store)
 rar a -m0 "$project_root/$FIXTURES/single_file.rar" hello.txt >/dev/null 2>&1
 
 # Archive with directories
 mkdir -p empty_dir
 rar a -m0 -r "$project_root/$FIXTURES/with_dirs.rar" empty_dir subdir >/dev/null 2>&1
+
+# Single file compressed (for simple decompression test)
+rar a -m3 "$project_root/$FIXTURES/single_compressed.rar" hello.txt >/dev/null 2>&1
+
+# Large file for multi-block decompression testing (~1.6MB text)
+for i in $(seq 1 20000); do
+	echo "Block test line $i: $(printf '%080d' $i) padding data to ensure multi-block"
+done > "$tmpdir/tree/large.txt"
+rar a -m3 "$project_root/$FIXTURES/large_compressed.rar" "$tmpdir/tree/large.txt" >/dev/null 2>&1
 
 # Archive created by rarz itself (for round-trip testing)
 cd "$project_root"

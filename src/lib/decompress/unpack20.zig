@@ -514,7 +514,6 @@ pub const DecompressError = error{
     EndOfData,
     InvalidData,
     InvalidTable,
-    InvalidCode,
 };
 
 /// Decompress RAR 2.x (v20/v26) packed data.
@@ -549,7 +548,6 @@ pub fn decompress(
                 error.EndOfData => error.EndOfData,
                 error.InvalidData => error.InvalidData,
                 error.InvalidTable => error.InvalidTable,
-                error.InvalidCode => error.InvalidCode,
                 error.OutOfMemory => error.OutOfMemory,
             };
         }

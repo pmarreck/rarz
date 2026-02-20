@@ -2,16 +2,16 @@ const std = @import("std");
 const BitReader = @import("bitreader.zig").BitReader;
 
 pub const MAX_CODE_LENGTH: u5 = 15;
-pub const QUICK_BITS: u5 = 10;
-pub const QUICK_TABLE_SIZE: usize = 1 << QUICK_BITS; // 1024
+pub const MAX_QUICK_BITS: u5 = 9; // matches unRAR's MAX_QUICK_DECODE_BITS
+pub const QUICK_TABLE_SIZE: usize = 1 << MAX_QUICK_BITS; // 512
 
 pub const DecodeTable = struct {
-    /// Quick-path: table[peek_bits(QUICK_BITS)] -> symbol + length
+    /// Quick-path: table[peek_bits(quick_bits)] -> symbol + length
     /// If length == 0, need full decode path
     quick_table: [QUICK_TABLE_SIZE]QuickEntry = [_]QuickEntry{.{}} ** QUICK_TABLE_SIZE,
 
     /// First canonical code of each bit length (1-indexed, [0] unused).
-    /// decode_len[n] = first code of length n.
+    /// decode_len[n] = left-aligned upper limit for codes of length <= n.
     /// decode_len[MAX_CODE_LENGTH + 1] is a sentinel used for bounds checking.
     decode_len: [MAX_CODE_LENGTH + 2]u32 = [_]u32{0} ** (MAX_CODE_LENGTH + 2),
 
@@ -25,6 +25,10 @@ pub const DecodeTable = struct {
     /// Number of symbols in the alphabet.
     max_num: u16 = 0,
 
+    /// Number of bits used for quick decode (matches unRAR's QuickBits).
+    /// 9 for large alphabets (NC=306, NC20=298, NC30=299), 6 for smaller ones.
+    quick_bits: u5 = MAX_QUICK_BITS,
+
     /// Was this table successfully built?
     valid: bool = false,
 
@@ -34,7 +38,12 @@ pub const DecodeTable = struct {
     };
 };
 
-/// Build canonical Huffman decode tables from code-length array.
+/// Build Huffman decode tables from code-length array using range-based boundaries.
+/// This matches unRAR's MakeDecodeTables approach: instead of computing canonical codes
+/// and matching them exactly, it builds left-aligned 16-bit range boundaries. This
+/// correctly handles over-committed Huffman tables (Kraft sum > 1.0) that appear in
+/// real RAR archives.
+///
 /// code_lengths[i] = number of bits for symbol i (0 means not present).
 /// Allocates decode_num from the provided allocator.
 pub fn makeDecodeTables(
@@ -52,19 +61,25 @@ pub fn makeDecodeTables(
         }
     }
 
-    // Step 2: Compute starting canonical code for each length.
-    // The canonical Huffman assignment: code[L] = (code[L-1] + count[L-1]) << 1
-    // Also build decode_pos as cumulative symbol positions.
-    var code: u32 = 0;
+    // Step 2: Build range boundaries (left-aligned to 16-bit space) and positions.
+    //
+    // decode_len[L] = upper boundary for all codes of length <= L, left-aligned to 16 bits.
+    // Formula: decode_len[L] = sum_{k=1}^{L} len_count[k] << (16 - k)
+    //
+    // This is equivalent to unRAR's: M = 2*(M + LenCount[I]); DecodeLen[I] = M << (15-I)
+    // For well-formed trees, decode_len[max_used] = 0x10000 (exactly fills the code space).
+    // For over-committed trees (Kraft > 1.0), it may exceed 0x10000, which is fine in u32.
+    table.decode_len[0] = 0;
+    table.decode_pos[0] = 0;
     var total_symbols: u32 = 0;
+
     for (1..MAX_CODE_LENGTH + 1) |len| {
-        code = (code + len_count[len - 1]) << 1;
-        table.decode_len[len] = code;
+        table.decode_len[len] = table.decode_len[len - 1] +
+            (len_count[len] << @intCast(16 - len));
         table.decode_pos[len] = total_symbols;
         total_symbols += len_count[len];
     }
-    // Sentinel: one past the last valid code at max length
-    table.decode_len[MAX_CODE_LENGTH + 1] = code + len_count[MAX_CODE_LENGTH];
+    table.decode_len[MAX_CODE_LENGTH + 1] = 0x10000; // Sentinel
     table.decode_pos[MAX_CODE_LENGTH + 1] = total_symbols;
 
     if (total_symbols == 0) {
@@ -72,38 +87,58 @@ pub fn makeDecodeTables(
         return table;
     }
 
-    // Step 3: Allocate and fill decode_num (symbols sorted by canonical code order).
-    // Within each code length, symbols appear in order of their symbol number.
+    // Step 3: Allocate and fill decode_num (symbols sorted by code length, then symbol order).
     table.decode_num = try allocator.alloc(u16, total_symbols);
-    var pos_tracker = [_]u32{0} ** (MAX_CODE_LENGTH + 2);
-    for (1..MAX_CODE_LENGTH + 1) |len| {
-        pos_tracker[len] = table.decode_pos[len];
+    var tmp_pos: [MAX_CODE_LENGTH + 2]u32 = undefined;
+    for (0..MAX_CODE_LENGTH + 2) |i| {
+        tmp_pos[i] = table.decode_pos[i];
     }
     for (code_lengths, 0..) |cl, i| {
         if (cl > 0 and cl <= MAX_CODE_LENGTH) {
-            table.decode_num[pos_tracker[cl]] = @intCast(i);
-            pos_tracker[cl] += 1;
+            const pos = tmp_pos[cl];
+            if (pos < total_symbols) {
+                table.decode_num[pos] = @intCast(i);
+            }
+            tmp_pos[cl] += 1;
         }
     }
 
-    // Step 4: Build quick-path lookup table for codes <= QUICK_BITS long.
-    // For each possible QUICK_BITS-wide value, find the shortest code that matches.
-    for (0..QUICK_TABLE_SIZE) |quick_val| {
-        for (1..QUICK_BITS + 1) |len| {
-            const shift: u5 = @intCast(QUICK_BITS - len);
-            const test_code: u32 = @intCast(quick_val >> shift);
-            const first_code = table.decode_len[len];
-            const count = len_count[len];
-            if (count > 0 and test_code >= first_code and test_code < first_code + count) {
-                const sym_idx = table.decode_pos[len] + (test_code - first_code);
-                if (sym_idx < total_symbols) {
-                    table.quick_table[quick_val] = .{
-                        .symbol = table.decode_num[sym_idx],
-                        .length = @intCast(len),
-                    };
-                    break;
-                }
-            }
+    // Set quick_bits based on alphabet size (matches unRAR):
+    // NC (306), NC20 (298), NC30 (299) -> MAX_QUICK_BITS (9)
+    // All others -> MAX_QUICK_BITS - 3 (6)
+    const size = code_lengths.len;
+    table.quick_bits = if (size == 306 or size == 298 or size == 299)
+        MAX_QUICK_BITS
+    else if (MAX_QUICK_BITS > 3)
+        MAX_QUICK_BITS - 3
+    else
+        0;
+
+    // Step 4: Build quick-path lookup table.
+    // For each possible quick_bits-wide value, left-align to 16 bits and find
+    // which length bucket it falls into using the range boundaries.
+    // Uses monotonic CurBitLength optimization matching unRAR.
+    const quick_data_size: usize = @as(usize, 1) << table.quick_bits;
+    var cur_bit_length: usize = 1;
+    for (0..quick_data_size) |quick_val| {
+        const bit_field: u32 = @as(u32, @intCast(quick_val)) << @intCast(16 - table.quick_bits);
+
+        // Find the bit length (monotonically increasing since bit_field increases)
+        while (cur_bit_length < MAX_CODE_LENGTH + 1 and bit_field >= table.decode_len[cur_bit_length]) {
+            cur_bit_length += 1;
+        }
+
+        table.quick_table[quick_val].length = @intCast(cur_bit_length);
+
+        // Calculate symbol position
+        const prev_boundary = if (cur_bit_length > 0) table.decode_len[cur_bit_length - 1] else 0;
+        const dist = (bit_field -| prev_boundary) >> @intCast(16 - cur_bit_length);
+        const pos = table.decode_pos[cur_bit_length] + dist;
+
+        if (cur_bit_length < MAX_CODE_LENGTH + 1 and pos < size) {
+            table.quick_table[quick_val].symbol = table.decode_num[pos];
+        } else {
+            table.quick_table[quick_val].symbol = 0;
         }
     }
 
@@ -112,55 +147,66 @@ pub fn makeDecodeTables(
 }
 
 /// Decode one symbol from the bitstream using the given table.
-/// Uses a quick-path lookup for short codes (up to QUICK_BITS),
-/// falling back to a bit-by-bit full-path decode for longer codes.
+/// Uses range-comparison decoding matching unRAR's DecodeNumber approach:
+/// peek 16 bits, left-align to 16-bit field, compare against decode_len boundaries
+/// to find the code length, then compute the symbol index.
 pub fn decodeNumber(br: *BitReader, table: *const DecodeTable) !u16 {
     if (!table.valid) return error.InvalidTable;
 
     const bits_available = br.remainingBits();
     if (bits_available == 0) return error.EndOfData;
 
-    // Quick path: peek QUICK_BITS and look up in quick table
-    const peek_count: u5 = if (bits_available >= QUICK_BITS) QUICK_BITS else @intCast(bits_available);
+    // Peek up to 16 bits and left-align to 16-bit field for range comparison
+    const peek_count: u5 = if (bits_available >= 16) 16 else @intCast(bits_available);
     const peeked = try br.peekBits(peek_count);
-
-    // Pad to QUICK_BITS width if we could not peek the full amount
-    const quick_val: u32 = if (peek_count < QUICK_BITS)
-        peeked << @intCast(QUICK_BITS - peek_count)
+    const bit_field: u32 = if (peek_count < 16)
+        peeked << @intCast(16 - peek_count)
     else
         peeked;
 
-    const quick = table.quick_table[@intCast(quick_val)];
-    if (quick.length > 0 and quick.length <= peek_count) {
-        br.skipBits(quick.length);
-        return quick.symbol;
-    }
-
-    // Full path: read bits one at a time from the start of the current code.
-    // Save position so we read from the beginning of this symbol's code.
-    const saved_pos = br.bit_pos;
-    var accumulated_code: u32 = 0;
-
-    for (1..MAX_CODE_LENGTH + 1) |len| {
-        if (br.remainingBits() == 0) break;
-        const bit = try br.readBits(1);
-        accumulated_code = (accumulated_code << 1) | bit;
-
-        const first_code = table.decode_len[len];
-        // Number of symbols with this code length
-        const num_symbols_at_len = table.decode_pos[len + 1] - table.decode_pos[len];
-
-        if (num_symbols_at_len > 0 and accumulated_code >= first_code and
-            accumulated_code < first_code + num_symbols_at_len)
-        {
-            const sym_idx = table.decode_pos[len] + (accumulated_code - first_code);
-            return table.decode_num[sym_idx];
+    // Quick table check: if the value falls within the quick_bits boundary
+    // (matching unRAR: BitField < DecodeLen[QuickBits])
+    const qb = table.quick_bits;
+    if (bit_field < table.decode_len[qb]) {
+        const quick_idx: u32 = bit_field >> @intCast(16 - qb);
+        const quick = table.quick_table[@intCast(quick_idx)];
+        if (quick.length > 0 and quick.length <= peek_count) {
+            br.skipBits(quick.length);
+            return quick.symbol;
         }
     }
 
-    // No valid code found -- restore position and report error
-    br.bit_pos = saved_pos;
-    return error.InvalidCode;
+    // Slow path: find the correct code length by scanning range boundaries.
+    // Matches unRAR: scan from QuickBits+1 to 14, default to 15.
+    var bits: u5 = MAX_CODE_LENGTH;
+    {
+        var len: usize = @as(usize, qb) + 1;
+        while (len < MAX_CODE_LENGTH) : (len += 1) {
+            if (bit_field < table.decode_len[len]) {
+                bits = @intCast(len);
+                break;
+            }
+        }
+    }
+
+    // Skip the consumed bits
+    if (bits <= peek_count) {
+        br.skipBits(bits);
+    } else {
+        br.skipBits(peek_count);
+    }
+
+    // Calculate symbol position in decode_num using range arithmetic
+    const prev_boundary = if (bits > 0) table.decode_len[bits - 1] else 0;
+    var n: u32 = table.decode_pos[bits] +
+        ((bit_field -| prev_boundary) >> @intCast(16 - bits));
+
+    // Overflow protection (matches unRAR's N >= MaxNum check)
+    if (n >= table.max_num or n >= table.decode_num.len) {
+        n = 0;
+    }
+
+    return table.decode_num[@intCast(n)];
 }
 
 /// Free the decode table's allocated memory.
@@ -202,9 +248,11 @@ test "build table from [1, 2, 2] gives codes A=0, B=10, C=11" {
     try testing.expectEqual(@as(u16, 1), table.decode_num[1]); // len=2: symbol 1
     try testing.expectEqual(@as(u16, 2), table.decode_num[2]); // len=2: symbol 2
 
-    // Verify first codes: length 1 -> code 0, length 2 -> code 2 (= (0+1)<<1 = 2)
-    try testing.expectEqual(@as(u32, 0), table.decode_len[1]);
-    try testing.expectEqual(@as(u32, 2), table.decode_len[2]);
+    // Verify range boundaries (left-aligned to 16 bits):
+    // length 1: 1 code -> boundary = 1 << 15 = 0x8000
+    // length 2: 2 codes -> boundary = 0x8000 + 2 << 14 = 0x10000
+    try testing.expectEqual(@as(u32, 0x8000), table.decode_len[1]);
+    try testing.expectEqual(@as(u32, 0x10000), table.decode_len[2]);
 }
 
 test "build table from [2, 2, 2, 2] gives codes 00, 01, 10, 11" {
@@ -215,8 +263,8 @@ test "build table from [2, 2, 2, 2] gives codes 00, 01, 10, 11" {
     try testing.expect(table.valid);
     try testing.expectEqual(@as(usize, 4), table.decode_num.len);
 
-    // All codes are length 2. First code of length 2 = (0+0)<<1 = 0
-    try testing.expectEqual(@as(u32, 0), table.decode_len[2]);
+    // All codes are length 2. Range boundary = 4 << 14 = 0x10000
+    try testing.expectEqual(@as(u32, 0x10000), table.decode_len[2]);
 
     // Symbols in order: 0, 1, 2, 3
     try testing.expectEqual(@as(u16, 0), table.decode_num[0]);
@@ -440,26 +488,14 @@ test "15-bit maximum code length" {
     try testing.expectEqual(@as(u16, 14), table.decode_num[pos15]);
     try testing.expectEqual(@as(u16, 15), table.decode_num[pos15 + 1]);
 
-    // Now encode symbol 14 and symbol 15 and decode them.
-    // The first code at length 15:
-    // We need to compute it. Let's trace through:
-    //   len 1: code=0, count=1(sym 0)
-    //   len 2: code=(0+1)<<1=2, count=1(sym 1)
-    //   len 3: code=(2+1)<<1=6, count=1(sym 2)
-    //   len 4: code=(6+1)<<1=14
-    //   len 5: code=(14+1)<<1=30
-    //   len 6: code=(30+1)<<1=62
-    //   len 7: code=(62+1)<<1=126
-    //   len 8: code=(126+1)<<1=254
-    //   len 9: code=(254+1)<<1=510
-    //   len 10: code=(510+1)<<1=1022
-    //   len 11: code=(1022+1)<<1=2046
-    //   len 12: code=(2046+1)<<1=4094
-    //   len 13: code=(4094+1)<<1=8190
-    //   len 14: code=(8190+1)<<1=16382
-    //   len 15: code=(16382+1)<<1=32766
-    // sym 14 = 32766 (15 bits), sym 15 = 32767 (15 bits)
-    try testing.expectEqual(@as(u32, 32766), table.decode_len[15]);
+    // Range boundaries (left-aligned to 16 bits):
+    // Each length has 1 symbol (except 15 which has 2).
+    // decode_len[L] = sum_{k=1}^{L} count[k] << (16-k)
+    //   L=1: 1<<15 = 32768
+    //   L=2: 32768 + 1<<14 = 49152
+    //   ... geometric series converging to 65536
+    //   L=15: 65536 (the tree is complete)
+    try testing.expectEqual(@as(u32, 65536), table.decode_len[15]);
 
     // 32766 in 15 bits = 0b111111111111110
     // 32767 in 15 bits = 0b111111111111111
@@ -476,33 +512,37 @@ test "15-bit maximum code length" {
 test "quick table correctly handles all entries for 2-bit codes" {
     // With codes [2,2,2,2]: first_code[2] = 0
     // Code 00 = sym 0, 01 = sym 1, 10 = sym 2, 11 = sym 3
-    // Quick table should map:
-    //   0b0000000000 (00 << 8) -> sym 0, len 2
-    //   0b0100000000 (01 << 8) -> sym 1, len 2
-    //   etc.
+    // For 4-symbol alphabet, quick_bits = MAX_QUICK_BITS - 3 = 6, so 64 entries.
+    // Quick table indices use 6-bit values: entry = code_prefix << (6 - code_len)
+    //   00xxxx (0-15)  -> sym 0, len 2
+    //   01xxxx (16-31) -> sym 1, len 2
+    //   10xxxx (32-47) -> sym 2, len 2
+    //   11xxxx (48-63) -> sym 3, len 2
     const code_lengths = [_]u8{ 2, 2, 2, 2 };
     var table = try makeDecodeTables(&code_lengths, testing.allocator);
     defer freeDecodeTable(&table, testing.allocator);
 
-    // Check a sampling of quick table entries
-    // Entry 0b0000000000 (0) -> sym 0, len 2
+    // Verify quick_bits is 6 for small alphabet
+    try testing.expectEqual(@as(u5, 6), table.quick_bits);
+
+    // Entry 0 (00_0000) -> sym 0, len 2
     try testing.expectEqual(@as(u16, 0), table.quick_table[0].symbol);
     try testing.expectEqual(@as(u5, 2), table.quick_table[0].length);
 
-    // Entry 0b0100000000 (256) -> sym 1, len 2
-    try testing.expectEqual(@as(u16, 1), table.quick_table[256].symbol);
-    try testing.expectEqual(@as(u5, 2), table.quick_table[256].length);
+    // Entry 16 (01_0000) -> sym 1, len 2
+    try testing.expectEqual(@as(u16, 1), table.quick_table[16].symbol);
+    try testing.expectEqual(@as(u5, 2), table.quick_table[16].length);
 
-    // Entry 0b1000000000 (512) -> sym 2, len 2
-    try testing.expectEqual(@as(u16, 2), table.quick_table[512].symbol);
-    try testing.expectEqual(@as(u5, 2), table.quick_table[512].length);
+    // Entry 32 (10_0000) -> sym 2, len 2
+    try testing.expectEqual(@as(u16, 2), table.quick_table[32].symbol);
+    try testing.expectEqual(@as(u5, 2), table.quick_table[32].length);
 
-    // Entry 0b1100000000 (768) -> sym 3, len 2
-    try testing.expectEqual(@as(u16, 3), table.quick_table[768].symbol);
-    try testing.expectEqual(@as(u5, 2), table.quick_table[768].length);
+    // Entry 48 (11_0000) -> sym 3, len 2
+    try testing.expectEqual(@as(u16, 3), table.quick_table[48].symbol);
+    try testing.expectEqual(@as(u5, 2), table.quick_table[48].length);
 
     // Entries between should map to the same symbol (suffix bits vary)
-    // E.g. 0b0000000001 (1) should also map to sym 0, len 2
+    // E.g. entry 1 (00_0001) should also map to sym 0, len 2
     try testing.expectEqual(@as(u16, 0), table.quick_table[1].symbol);
     try testing.expectEqual(@as(u5, 2), table.quick_table[1].length);
 }

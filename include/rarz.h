@@ -24,6 +24,13 @@ uint32_t rarz_abi_version(void);
  */
 int32_t rarz_detect_format(const uint8_t *data, size_t len);
 
+/**
+ * Detect RAR format family with SFX prefix scanning.
+ * Scans up to max_sfx_offset bytes for a RAR signature.
+ * Returns: 0=unknown, 14=RAR1.4, 15=RAR1.5-4.x, 50=RAR5+
+ */
+int32_t rarz_detect_format_sfx(const uint8_t *data, size_t len, size_t max_sfx_offset);
+
 /* ========================================================================== */
 /* Archive handle management                                                  */
 /* ========================================================================== */

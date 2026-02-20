@@ -935,4 +935,5 @@ comptime {
 	_ = policy;
 	_ = writer;
 	_ = @import("decompress/bitreader.zig");
+	_ = @import("decompress/lz.zig");
 }

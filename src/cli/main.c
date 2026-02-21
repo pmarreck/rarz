@@ -23,7 +23,6 @@ typedef enum {
 	CMD_HELP,
 	CMD_TEST,
 	CMD_LIST,
-	CMD_LIST_VERBOSE,
 	CMD_EXTRACT,
 	CMD_ADD,
 } Command;
@@ -32,7 +31,6 @@ static Command parse_command(const char *arg) {
 	if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) return CMD_HELP;
 	if (strcmp(arg, "t") == 0 || strcmp(arg, "test") == 0) return CMD_TEST;
 	if (strcmp(arg, "l") == 0 || strcmp(arg, "list") == 0) return CMD_LIST;
-	if (strcmp(arg, "v") == 0 || strcmp(arg, "list-verbose") == 0) return CMD_LIST_VERBOSE;
 	if (strcmp(arg, "x") == 0 || strcmp(arg, "extract") == 0) return CMD_EXTRACT;
 	if (strcmp(arg, "a") == 0 || strcmp(arg, "add") == 0) return CMD_ADD;
 	return CMD_UNKNOWN;
@@ -43,12 +41,11 @@ static Command parse_command(const char *arg) {
 /* ========================================================================== */
 
 static void print_usage(void) {
-	printf("rarz - clean-room RAR archive toolkit\n");
-	printf("ABI version: %u\n\n", rarz_abi_version());
+	printf("rarz - clean-room RAR archive toolkit (2026 Peter Marreck)\n");
+	printf("RAR format by Alexander L. Roshal\n\n");
 	printf("Usage:\n");
 	printf("  rarz t|test <archive>            Test archive integrity\n");
 	printf("  rarz l|list <archive>            List archive contents\n");
-	printf("  rarz v|list-verbose <archive>    Verbose list with details\n");
 	printf("  rarz x|extract <archive> [dest]  Extract with full paths\n");
 	printf("  rarz a|add [-m0..-m5] <archive> <files...>\n");
 	printf("                                   Add files to archive\n");
@@ -221,59 +218,6 @@ static int cmd_test(const char *path) {
 /* ========================================================================== */
 
 static int cmd_list(const char *path) {
-	size_t len = 0;
-	uint8_t *data = read_file(path, &len);
-	if (!data) return 1;
-
-	rarz_archive *archive = rarz_open(data, len);
-	if (!archive) {
-		fprintf(stderr, "error: failed to open archive '%s'\n", path);
-		free(data);
-		return 1;
-	}
-
-	uint32_t count = rarz_file_count(archive);
-
-	printf(" %8s  %-6s  %s\n", "Size", "Method", "Name");
-	printf(" %8s  %-6s  %s\n", "--------", "------", "----");
-
-	uint64_t total_size = 0;
-
-	for (uint32_t i = 0; i < count; i++) {
-		rarz_file_entry entry;
-		if (rarz_file_info(archive, i, &entry) != 0) continue;
-
-		/* Null-terminate the name for printing */
-		char name_buf[4096];
-		uint32_t nlen = entry.name_len < sizeof(name_buf) - 1
-		                ? entry.name_len : (uint32_t)(sizeof(name_buf) - 1);
-		memcpy(name_buf, entry.name, nlen);
-		name_buf[nlen] = '\0';
-
-		printf(" %8llu  %-6s  %s%s\n",
-		       (unsigned long long)entry.unpacked_size,
-		       method_name(entry.method),
-		       name_buf,
-		       entry.is_directory ? "/" : "");
-
-		total_size += entry.unpacked_size;
-	}
-
-	printf(" %8s  %-6s  %s\n", "--------", "", "----");
-	printf(" %8llu  %-6s  %u file%s\n",
-	       (unsigned long long)total_size, "",
-	       count, count == 1 ? "" : "s");
-
-	rarz_close(archive);
-	free(data);
-	return 0;
-}
-
-/* ========================================================================== */
-/* cmd_list_verbose                                                           */
-/* ========================================================================== */
-
-static int cmd_list_verbose(const char *path) {
 	size_t len = 0;
 	uint8_t *data = read_file(path, &len);
 	if (!data) return 1;
@@ -689,13 +633,6 @@ int main(int argc, char **argv) {
 			return 1;
 		}
 		return cmd_list(argv[2]);
-
-	case CMD_LIST_VERBOSE:
-		if (argc < 3) {
-			fprintf(stderr, "error: 'list-verbose' requires an archive path\n");
-			return 1;
-		}
-		return cmd_list_verbose(argv[2]);
 
 	case CMD_EXTRACT:
 		if (argc < 3) {

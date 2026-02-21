@@ -59,10 +59,6 @@ rarz t archive.rar
 rarz extract archive.rar
 rarz x archive.rar
 
-# Verbose listing
-rarz verbose archive.rar
-rarz v archive.rar
-
 # Create archive (default -m3 compression)
 rarz add output.rar file1.txt file2.txt
 rarz a output.rar file1.txt file2.txt

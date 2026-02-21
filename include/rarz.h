@@ -109,7 +109,7 @@ int64_t rarz_extract_to_buffer(const rarz_archive *archive, uint32_t index,
                                uint8_t *out_buf, size_t out_len);
 
 /* ========================================================================== */
-/* Archive creation (store method only)                                       */
+/* Archive creation                                                           */
 /* ========================================================================== */
 
 /** File entry for archive creation (input). */
@@ -136,6 +136,17 @@ int64_t rarz_calculate_archive_size(const rarz_create_file_entry *entries,
 int64_t rarz_create_archive(const rarz_create_file_entry *entries,
                             uint32_t count,
                             uint8_t *out_buf, size_t out_len);
+
+/**
+ * Create a compressed RAR5 archive from file entries.
+ * method: 0=store, 1-5=compression levels (1=fastest, 5=best).
+ * Returns bytes written on success, -1 on error, -2 if buffer too small,
+ *         -3 on compression error.
+ */
+int64_t rarz_create_archive_compressed(const rarz_create_file_entry *entries,
+                                       uint32_t count,
+                                       uint8_t *out_buf, size_t out_len,
+                                       uint8_t method);
 
 #ifdef __cplusplus
 }

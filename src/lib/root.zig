@@ -407,6 +407,46 @@ export fn rarz_create_archive(
 	return @intCast(result);
 }
 
+export fn rarz_create_archive_compressed(
+	entries_ptr: ?[*]const RarzCreateFileEntry,
+	count: u32,
+	out_buf: ?[*]u8,
+	out_len: usize,
+	method: u8,
+) i64 {
+	const entries = if (entries_ptr) |p| p[0..count] else return -1;
+	const buf = out_buf orelse return -1;
+	if (method > 5) return -1;
+	const compression_method: u3 = @intCast(method);
+
+	var writer_entries_buf: [64]writer.FileEntry = undefined;
+	const heap_alloc = std.heap.page_allocator;
+	const writer_entries: []writer.FileEntry = if (count <= 64)
+		writer_entries_buf[0..count]
+	else
+		heap_alloc.alloc(writer.FileEntry, count) catch return -1;
+	defer if (count > 64) heap_alloc.free(writer_entries);
+
+	for (entries, 0..) |e, i| {
+		writer_entries[i] = .{
+			.name = if (e.name) |n| n[0..e.name_len] else "",
+			.data = if (e.data) |d| d[0..@as(usize, @intCast(e.data_len))] else "",
+			.mtime = e.mtime,
+			.is_directory = e.is_directory != 0,
+		};
+	}
+
+	const result = writer.write_archive_compressed(heap_alloc, writer_entries, buf[0..out_len], compression_method) catch |err| {
+		return switch (err) {
+			error.BufferTooSmall => @as(i64, -2),
+			error.NameTooLong, error.TooManyFiles => @as(i64, -1),
+			else => @as(i64, -3), // compression error
+		};
+	};
+
+	return @intCast(result);
+}
+
 // ============================================================================
 // Internal helpers
 // ============================================================================
@@ -970,4 +1010,9 @@ comptime {
 	_ = @import("decompress/unpack20.zig");
 	_ = @import("decompress/unpack15.zig");
 	_ = @import("decompress/dispatch.zig");
+	_ = @import("compress/bitwriter.zig");
+	_ = @import("compress/huffman_encoder.zig");
+	_ = @import("compress/slot_tables.zig");
+	_ = @import("compress/match_finder.zig");
+	_ = @import("compress/pack50.zig");
 }

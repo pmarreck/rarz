@@ -1,6 +1,6 @@
-//! RAR5 store-only archive writer.
+//! RAR5 archive writer.
 //!
-//! Produces valid RAR5 archives with store method (method=0, no compression).
+//! Produces valid RAR5 archives with store (method=0) or compressed (method=1-5) modes.
 //! Archives contain: signature, main block, file blocks with data, end block.
 
 const std = @import("std");
@@ -9,6 +9,7 @@ const detect = @import("detect.zig");
 const rar5_headers = @import("rar5_headers.zig");
 const policy = @import("policy.zig");
 const reader_mod = @import("reader.zig");
+const pack50 = @import("compress/pack50.zig");
 
 pub const encode_vint = reader_mod.encode_vint;
 pub const vint_size = reader_mod.vint_size;
@@ -305,6 +306,147 @@ pub fn write_archive(entries: []const FileEntry, output: []u8) WriteError!usize 
 	return pos;
 }
 
+/// Encode compression_info for a RAR5 file block.
+/// Format: (algo_version & 0x3F) | (solid << 6) | (method << 7) | (dict_bits << 10)
+/// dict_bits: offset from 17, so actual window = 2^(dict_bits + 17).
+///   0 = 128KB, 3 = 1MB, 6 = 8MB, 10 = 128MB
+fn encode_compression_info(method: u3, dict_bits: u4) u64 {
+	const algo_version: u64 = 0; // standard RAR5 algorithm
+	return (algo_version & 0x3F) | (@as(u64, method) << 7) | (@as(u64, dict_bits) << 10);
+}
+
+/// Write a compressed file block (header + compressed data). Returns new position.
+/// Uses a two-pass approach: compress first, then write header with known sizes.
+fn write_file_block_compressed(
+	allocator: std.mem.Allocator,
+	out: []u8,
+	pos: usize,
+	entry: FileEntry,
+	method: u3,
+) !usize {
+	// Compress the data
+	const compressed_data = try pack50.compressBlock(allocator, entry.data, method, true);
+	defer allocator.free(compressed_data);
+
+	const data_crc = integrity.crc32(entry.data);
+
+	// File flags: FHFL_UTIME | FHFL_CRC32
+	var file_flags: u64 = 0;
+	if (entry.is_directory) file_flags |= 0x01;
+	file_flags |= 0x02; // FHFL_UTIME
+	if (!entry.is_directory) file_flags |= 0x04; // FHFL_CRC32
+
+	const attributes: u64 = if (entry.is_directory) 0x10 else 0x20;
+	const dict_bits: u4 = 3; // 2^(3+17) = 1MB dictionary
+
+	// Build file body
+	var body: [4096]u8 = undefined;
+	var bpos: usize = 0;
+	bpos += encode_vint(file_flags, body[bpos..]);
+	bpos += encode_vint(entry.data.len, body[bpos..]); // unpacked_size
+	bpos += encode_vint(attributes, body[bpos..]);
+	// mtime (u32 LE)
+	std.mem.writeInt(u32, body[bpos..][0..4], entry.mtime, .little);
+	bpos += 4;
+	// data_crc32
+	if (!entry.is_directory) {
+		std.mem.writeInt(u32, body[bpos..][0..4], data_crc, .little);
+		bpos += 4;
+	}
+	// compression_info
+	bpos += encode_vint(encode_compression_info(method, dict_bits), body[bpos..]);
+	// host_os = 0
+	bpos += encode_vint(0, body[bpos..]);
+	// name
+	bpos += encode_vint(entry.name.len, body[bpos..]);
+	@memcpy(body[bpos..][0..entry.name.len], entry.name);
+	bpos += entry.name.len;
+
+	const data_size: u64 = compressed_data.len;
+	const header_flags: u64 = if (data_size > 0) 0x02 else 0;
+
+	// Build contents
+	var contents: [4096]u8 = undefined;
+	var cpos: usize = 0;
+	cpos += encode_vint(2, contents[cpos..]); // type = file
+	cpos += encode_vint(header_flags, contents[cpos..]);
+	if (data_size > 0) {
+		cpos += encode_vint(data_size, contents[cpos..]);
+	}
+	@memcpy(contents[cpos..][0..bpos], body[0..bpos]);
+	cpos += bpos;
+
+	// header_size + contents
+	var tmp: [8192]u8 = undefined;
+	var tpos: usize = 0;
+	tpos += encode_vint(cpos, tmp[tpos..]);
+	@memcpy(tmp[tpos..][0..cpos], contents[0..cpos]);
+	tpos += cpos;
+
+	const crc = integrity.crc32(tmp[0..tpos]);
+
+	// Write CRC32
+	std.mem.writeInt(u32, out[pos..][0..4], crc, .little);
+	@memcpy(out[pos + 4 ..][0..tpos], tmp[0..tpos]);
+	var new_pos = pos + 4 + tpos;
+
+	// Write compressed data
+	if (data_size > 0) {
+		@memcpy(out[new_pos..][0..compressed_data.len], compressed_data);
+		new_pos += compressed_data.len;
+	}
+
+	return new_pos;
+}
+
+/// Write a complete RAR5 archive with compression to the output buffer.
+/// method: 0=store, 1-5=compression levels.
+/// For method 0, delegates to write_archive.
+/// Returns the number of bytes written.
+pub fn write_archive_compressed(
+	allocator: std.mem.Allocator,
+	entries: []const FileEntry,
+	output: []u8,
+	method: u3,
+) !usize {
+	if (method == 0) {
+		return write_archive(entries, output) catch |err| switch (err) {
+			error.BufferTooSmall => return error.BufferTooSmall,
+			error.NameTooLong => return error.NameTooLong,
+			error.TooManyFiles => return error.TooManyFiles,
+		};
+	}
+
+	// Validate entries
+	for (entries) |entry| {
+		if (entry.name.len > 4096) return error.NameTooLong;
+	}
+	if (entries.len > 65535) return error.TooManyFiles;
+
+	var pos: usize = 0;
+
+	// Signature
+	pos = write_signature(output, pos);
+
+	// Main block
+	pos = write_main_block(output, pos);
+
+	// File blocks (compressed)
+	for (entries) |entry| {
+		if (entry.is_directory or entry.data.len == 0) {
+			// Directories and empty files: store mode
+			pos = write_file_block(output, pos, entry);
+		} else {
+			pos = try write_file_block_compressed(allocator, output, pos, entry, method);
+		}
+	}
+
+	// End block
+	pos = write_end_block(output, pos);
+
+	return pos;
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -592,4 +734,132 @@ test "write_archive and extract round-trip through FFI" {
 		},
 		else => return error.EndOfData,
 	}
+}
+
+test "write_archive_compressed: method 0 delegates to store" {
+	const file_data = "hello world";
+	const entries = [_]FileEntry{.{
+		.name = "test.txt",
+		.data = file_data,
+		.mtime = 0,
+		.is_directory = false,
+	}};
+
+	var buf: [4096]u8 = undefined;
+	const archive_len = try write_archive_compressed(testing.allocator, &entries, &buf, 0);
+
+	// Should produce identical output to write_archive
+	var buf2: [4096]u8 = undefined;
+	const store_len = try write_archive(&entries, &buf2);
+	try testing.expectEqual(store_len, archive_len);
+	try testing.expectEqualSlices(u8, buf2[0..store_len], buf[0..archive_len]);
+}
+
+test "write_archive_compressed: method 3 produces valid archive" {
+	const file_data = "Hello World! Hello World! Hello World!";
+	const entries = [_]FileEntry{.{
+		.name = "test.txt",
+		.data = file_data,
+		.mtime = 0,
+		.is_directory = false,
+	}};
+
+	var buf: [8192]u8 = undefined;
+	const archive_len = try write_archive_compressed(testing.allocator, &entries, &buf, 3);
+
+	// Should be a valid RAR5 archive
+	const format = detect.detect_format(buf[0..archive_len], 0);
+	try testing.expectEqual(detect.RarFamily.rar50, format.family.?);
+
+	// Parse blocks
+	const block_data = buf[format.signature_offset + format.signature_len .. archive_len];
+	var iter = rar5_headers.walk_blocks(block_data);
+
+	// Main block
+	const b1 = (try iter.next()) orelse return error.EndOfData;
+	switch (b1) {
+		.main => {},
+		else => return error.EndOfData,
+	}
+
+	// File block
+	const b2 = (try iter.next()) orelse return error.EndOfData;
+	switch (b2) {
+		.file => |f| {
+			try testing.expectEqualSlices(u8, "test.txt", f.name);
+			try testing.expectEqual(@as(u64, file_data.len), f.unpacked_size);
+			try testing.expect(f.compression.method > 0); // compressed, not store
+		},
+		else => return error.EndOfData,
+	}
+
+	// End block
+	const b3 = (try iter.next()) orelse return error.EndOfData;
+	switch (b3) {
+		.end_archive => {},
+		else => return error.EndOfData,
+	}
+}
+
+test "write_archive_compressed: compress-then-extract round-trip" {
+	const file_data = "The quick brown fox jumps over the lazy dog. The quick brown fox!";
+	const entries = [_]FileEntry{.{
+		.name = "fox.txt",
+		.data = file_data,
+		.mtime = 0x5C000000,
+		.is_directory = false,
+	}};
+
+	var buf: [8192]u8 = undefined;
+	const archive_len = try write_archive_compressed(testing.allocator, &entries, &buf, 3);
+
+	// Parse and extract via the decompression path
+	const format = detect.detect_format(buf[0..archive_len], 0);
+	const block_data = buf[format.signature_offset + format.signature_len .. archive_len];
+	var iter = rar5_headers.walk_blocks(block_data);
+
+	// Skip main
+	_ = try iter.next();
+
+	const block = (try iter.next()) orelse return error.EndOfData;
+	switch (block) {
+		.file => |f| {
+			try testing.expectEqualSlices(u8, "fox.txt", f.name);
+			try testing.expectEqual(@as(u64, file_data.len), f.unpacked_size);
+
+			// Extract compressed data
+			const total_header = 4 + f.header.crc_data_len;
+			const payload_start = f.header.header_start + total_header;
+			const ds = f.header.data_size orelse return error.EndOfData;
+			const packed_data = block_data[payload_start .. payload_start + @as(usize, @intCast(ds))];
+
+			// Decompress
+			const dispatch = @import("decompress/dispatch.zig");
+			const decompressed = try dispatch.decompressRar5(
+				testing.allocator,
+				packed_data,
+				f.unpacked_size,
+				f.compression,
+			);
+			defer testing.allocator.free(decompressed);
+
+			try testing.expectEqualSlices(u8, file_data, decompressed);
+		},
+		else => return error.EndOfData,
+	}
+}
+
+test "encode_compression_info: store mode" {
+	const info = encode_compression_info(0, 0);
+	try testing.expectEqual(@as(u64, 0), info); // algo_version=0, method=0, dict=0
+}
+
+test "encode_compression_info: method 3 with dict_bits=3 (1MB)" {
+	const info = encode_compression_info(3, 3);
+	// Round-trip through the parser
+	const parsed = rar5_headers.parse_compression_info(info);
+	try testing.expectEqual(@as(u6, 0), parsed.algo_version);
+	try testing.expectEqual(@as(u3, 3), parsed.method);
+	try testing.expectEqual(@as(u4, 3), parsed.dict_bits);
+	try testing.expect(!parsed.solid);
 }

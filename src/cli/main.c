@@ -50,7 +50,9 @@ static void print_usage(void) {
 	printf("  rarz l|list <archive>            List archive contents\n");
 	printf("  rarz v|list-verbose <archive>    Verbose list with details\n");
 	printf("  rarz x|extract <archive> [dest]  Extract with full paths\n");
-	printf("  rarz a|add <archive> <files...>  Add files to archive\n");
+	printf("  rarz a|add [-m0..-m5] <archive> <files...>\n");
+	printf("                                   Add files to archive\n");
+	printf("                                   -m0=store, -m1..-m5=compress (default -m3)\n");
 	printf("  rarz --help                      Show this help\n");
 }
 
@@ -462,12 +464,33 @@ static int cmd_extract(const char *archive_path, const char *dest_dir) {
 }
 
 /* ========================================================================== */
-/* cmd_add — create store-only RAR5 archive                                   */
+/* cmd_add — create RAR5 archive with optional compression                    */
 /* ========================================================================== */
 
 static int cmd_add(int argc, char **argv) {
-	const char *archive_path = argv[2];
-	int file_count = argc - 3;
+	/* Parse optional -mN flag before archive path */
+	uint8_t method = 3; /* default compression level */
+	int arg_start = 2;  /* index of archive path in argv */
+
+	if (argc > 2 && argv[2][0] == '-' && argv[2][1] == 'm') {
+		char level_ch = argv[2][2];
+		if (level_ch >= '0' && level_ch <= '5' && argv[2][3] == '\0') {
+			method = (uint8_t)(level_ch - '0');
+			arg_start = 3;
+		} else {
+			fprintf(stderr, "error: invalid compression level '%s' (use -m0 through -m5)\n",
+			        argv[2]);
+			return 1;
+		}
+	}
+
+	if (argc <= arg_start) {
+		fprintf(stderr, "error: 'add' requires an archive path\n");
+		return 1;
+	}
+
+	const char *archive_path = argv[arg_start];
+	int file_count = argc - arg_start - 1;
 	int max_files = 64;
 
 	if (file_count > max_files) {
@@ -486,7 +509,7 @@ static int cmd_add(int argc, char **argv) {
 	memset(file_buffers, 0, sizeof(file_buffers));
 
 	for (int i = 0; i < file_count; i++) {
-		const char *path = argv[3 + i];
+		const char *path = argv[arg_start + 1 + i];
 		struct stat st;
 
 		if (stat(path, &st) != 0) {
@@ -521,50 +544,102 @@ static int cmd_add(int argc, char **argv) {
 		}
 	}
 
-	/* Calculate needed size */
-	int64_t needed = rarz_calculate_archive_size(entries, (uint32_t)file_count);
-	if (needed <= 0) {
-		fprintf(stderr, "error: cannot calculate archive size\n");
-		goto cleanup_add;
-	}
+	/* For store mode, use the simpler path with exact size calculation */
+	if (method == 0) {
+		int64_t needed = rarz_calculate_archive_size(entries, (uint32_t)file_count);
+		if (needed <= 0) {
+			fprintf(stderr, "error: cannot calculate archive size\n");
+			goto cleanup_add;
+		}
 
-	/* Allocate and create archive */
-	uint8_t *archive_buf = (uint8_t *)malloc((size_t)needed);
-	if (!archive_buf) {
-		fprintf(stderr, "error: cannot allocate %lld bytes\n", (long long)needed);
-		goto cleanup_add;
-	}
+		uint8_t *archive_buf = (uint8_t *)malloc((size_t)needed);
+		if (!archive_buf) {
+			fprintf(stderr, "error: cannot allocate %lld bytes\n", (long long)needed);
+			goto cleanup_add;
+		}
 
-	int64_t written = rarz_create_archive(entries, (uint32_t)file_count,
-	                                       archive_buf, (size_t)needed);
-	if (written <= 0) {
-		fprintf(stderr, "error: archive creation failed (code %lld)\n",
-		        (long long)written);
+		int64_t written = rarz_create_archive(entries, (uint32_t)file_count,
+		                                       archive_buf, (size_t)needed);
+		if (written <= 0) {
+			fprintf(stderr, "error: archive creation failed (code %lld)\n",
+			        (long long)written);
+			free(archive_buf);
+			goto cleanup_add;
+		}
+
+		FILE *out = fopen(archive_path, "wb");
+		if (!out) {
+			fprintf(stderr, "error: cannot create '%s': %s\n",
+			        archive_path, strerror(errno));
+			free(archive_buf);
+			goto cleanup_add;
+		}
+
+		size_t nwritten = fwrite(archive_buf, 1, (size_t)written, out);
+		fclose(out);
 		free(archive_buf);
-		goto cleanup_add;
-	}
 
-	/* Write to disk */
-	FILE *out = fopen(archive_path, "wb");
-	if (!out) {
-		fprintf(stderr, "error: cannot create '%s': %s\n",
-		        archive_path, strerror(errno));
+		if (nwritten != (size_t)written) {
+			fprintf(stderr, "error: short write to '%s'\n", archive_path);
+			goto cleanup_add;
+		}
+
+		printf("Created %s (%lld bytes, %d file%s, store)\n",
+		       archive_path, (long long)written,
+		       file_count, file_count == 1 ? "" : "s");
+	} else {
+		/* Compressed mode: allocate generous buffer (input size + overhead) */
+		uint64_t total_input = 0;
+		for (int i = 0; i < file_count; i++) {
+			total_input += entries[i].data_len;
+		}
+		/* Compressed output can be larger than input for incompressible data,
+		 * plus we need space for headers. Use 2x input + 64KB per file. */
+		size_t buf_size = (size_t)(total_input * 2 + (uint64_t)file_count * 65536 + 4096);
+
+		uint8_t *archive_buf = (uint8_t *)malloc(buf_size);
+		if (!archive_buf) {
+			fprintf(stderr, "error: cannot allocate %zu bytes\n", buf_size);
+			goto cleanup_add;
+		}
+
+		int64_t written = rarz_create_archive_compressed(
+			entries, (uint32_t)file_count,
+			archive_buf, buf_size, method);
+
+		if (written == -3) {
+			fprintf(stderr, "error: compression failed\n");
+			free(archive_buf);
+			goto cleanup_add;
+		}
+		if (written <= 0) {
+			fprintf(stderr, "error: archive creation failed (code %lld)\n",
+			        (long long)written);
+			free(archive_buf);
+			goto cleanup_add;
+		}
+
+		FILE *out = fopen(archive_path, "wb");
+		if (!out) {
+			fprintf(stderr, "error: cannot create '%s': %s\n",
+			        archive_path, strerror(errno));
+			free(archive_buf);
+			goto cleanup_add;
+		}
+
+		size_t nwritten = fwrite(archive_buf, 1, (size_t)written, out);
+		fclose(out);
 		free(archive_buf);
-		goto cleanup_add;
+
+		if (nwritten != (size_t)written) {
+			fprintf(stderr, "error: short write to '%s'\n", archive_path);
+			goto cleanup_add;
+		}
+
+		printf("Created %s (%lld bytes, %d file%s, -m%d)\n",
+		       archive_path, (long long)written,
+		       file_count, file_count == 1 ? "" : "s", method);
 	}
-
-	size_t nwritten = fwrite(archive_buf, 1, (size_t)written, out);
-	fclose(out);
-	free(archive_buf);
-
-	if (nwritten != (size_t)written) {
-		fprintf(stderr, "error: short write to '%s'\n", archive_path);
-		goto cleanup_add;
-	}
-
-	printf("Created %s (%lld bytes, %d file%s)\n",
-	       archive_path, (long long)written,
-	       file_count, file_count == 1 ? "" : "s");
 
 	/* Cleanup file buffers */
 	for (int i = 0; i < file_count; i++) {
@@ -629,12 +704,16 @@ int main(int argc, char **argv) {
 		}
 		return cmd_extract(argv[2], argc >= 4 ? argv[3] : NULL);
 
-	case CMD_ADD:
-		if (argc < 4) {
+	case CMD_ADD: {
+		/* Minimum: rarz add archive file (4 args), or rarz add -mN archive file (5 args) */
+		int min_args = 4;
+		if (argc > 2 && argv[2][0] == '-' && argv[2][1] == 'm') min_args = 5;
+		if (argc < min_args) {
 			fprintf(stderr, "error: 'add' requires an archive path and at least one file\n");
 			return 1;
 		}
 		return cmd_add(argc, argv);
+	}
 
 	case CMD_UNKNOWN:
 	default:

@@ -40,22 +40,64 @@ pub const Window = struct {
     }
 
     /// Copy `length` bytes from `distance` bytes back in the window.
-    /// Uses byte-by-byte copy to handle overlap (distance < length) correctly.
-    /// If distance > total_written (invalid reference), zero-fills.
+    /// Optimized with bulk operations for common cases:
+    /// - distance == 0 or invalid: @memset(0)
+    /// - distance == 1 (RLE): @memset with repeated byte
+    /// - distance >= length (non-overlapping): @memcpy
+    /// - overlapping or wrapping: byte-by-byte fallback
     pub fn copyMatch(self: *Window, distance: usize, length: usize) void {
+        if (length == 0) return;
+
         if (distance == 0 or distance > self.total_written) {
             // Invalid distance: zero-fill for corruption hardening
-            for (0..length) |_| {
-                self.putByte(0);
-            }
+            self.bulkZeroFill(length);
             return;
         }
 
-        var src_pos = self.write_pos -% distance; // wrapping subtract
+        const dst_phys = self.write_pos & self.mask;
+        const src_phys = (self.write_pos -% distance) & self.mask;
+
+        // Check if both src and dst regions fit without wrapping around the circular buffer
+        const dst_no_wrap = dst_phys + length <= self.buffer.len;
+        const src_no_wrap = src_phys + length <= self.buffer.len;
+
+        if (distance == 1 and dst_no_wrap) {
+            // RLE: fill with the single repeated byte
+            const fill_byte = self.buffer[src_phys];
+            @memset(self.buffer[dst_phys..][0..length], fill_byte);
+            self.write_pos += length;
+            self.total_written += length;
+            return;
+        }
+
+        if (distance >= length and dst_no_wrap and src_no_wrap) {
+            // Non-overlapping: bulk copy
+            @memcpy(self.buffer[dst_phys..][0..length], self.buffer[src_phys..][0..length]);
+            self.write_pos += length;
+            self.total_written += length;
+            return;
+        }
+
+        // Fallback: byte-by-byte for overlapping or wrapping cases
+        var src_pos = self.write_pos -% distance;
         for (0..length) |_| {
             const byte = self.buffer[src_pos & self.mask];
             self.putByte(byte);
             src_pos +%= 1;
+        }
+    }
+
+    /// Bulk zero-fill: optimized for the invalid-distance case.
+    fn bulkZeroFill(self: *Window, length: usize) void {
+        const dst_phys = self.write_pos & self.mask;
+        if (dst_phys + length <= self.buffer.len) {
+            @memset(self.buffer[dst_phys..][0..length], 0);
+            self.write_pos += length;
+            self.total_written += length;
+        } else {
+            for (0..length) |_| {
+                self.putByte(0);
+            }
         }
     }
 

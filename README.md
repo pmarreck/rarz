@@ -9,9 +9,11 @@ Written in Zig with a C FFI and drop-in C CLI.
 
 ## Status
 
-**Phase 1 complete** — structural parsing, store-method extraction/creation, and full validation for RAR 1.4, RAR 1.5-4.x, and RAR5+ archives.
+**Decompression** — extracts RAR5 archives at all compression levels (m0-m5), plus legacy RAR 1.5-4.x store-method extraction. Verified byte-perfect against unrar 7.20.
 
-**Phase 2 in progress** — decompression engine for compressed archives.
+**Compression** — creates RAR5 archives with LZ77 + Huffman compression at levels m0 (store) through m5 (best). Output is extractable by both rarz and unrar.
+
+**Parsing & validation** — full structural parsing and multi-depth validation for RAR 1.4, RAR 1.5-4.x, and RAR5+ archives.
 
 ## Architecture
 
@@ -25,7 +27,7 @@ Any CLI / consumer ──> C FFI boundary ──> Zig core (pure logic, no I/O)
 
 ## Building
 
-### With Zig (0.14+)
+### With Zig (0.15+)
 
 ```sh
 zig build              # build library + CLI
@@ -61,9 +63,14 @@ rarz x archive.rar
 rarz verbose archive.rar
 rarz v archive.rar
 
-# Create store-only archive
+# Create archive (default -m3 compression)
 rarz add output.rar file1.txt file2.txt
 rarz a output.rar file1.txt file2.txt
+
+# Create archive with specific compression level
+rarz a -m0 output.rar file1.txt    # store (no compression)
+rarz a -m1 output.rar file1.txt    # fastest
+rarz a -m5 output.rar file1.txt    # best compression
 ```
 
 ### C API
@@ -87,11 +94,15 @@ for (uint32_t i = 0; i < count; i++) {
 rarz_validation_result r = rarz_validate(data, len);
 // r.depth: 0=signature, 1=structural, 2=full
 
-// Extract
+// Extract (handles both stored and compressed files)
 uint8_t buf[4096];
 int64_t written = rarz_extract_to_buffer(ar, 0, buf, sizeof(buf));
 
 rarz_close(ar);
+
+// Create compressed archive
+rarz_create_file_entry files[] = { /* ... */ };
+int64_t size = rarz_create_archive_compressed(files, count, out, out_len, 3); // -m3
 ```
 
 ### Zig Package
@@ -110,8 +121,8 @@ Add to your `build.zig.zon` dependencies:
 | Family | Signature | Status |
 |--------|-----------|--------|
 | RAR 1.4 | `52 45 7E 5E` | Detection only |
-| RAR 1.5-4.x | `52 61 72 21 1A 07 00` | Parse + validate + store extract |
-| RAR5+ | `52 61 72 21 1A 07 01 00` | Parse + validate + store extract + create |
+| RAR 1.5-4.x | `52 61 72 21 1A 07 00` | Parse + validate + extract (store) |
+| RAR5+ | `52 61 72 21 1A 07 01 00` | Parse + validate + extract (m0-m5) + create (m0-m5) |
 
 ## Validation Depth
 

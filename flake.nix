@@ -53,8 +53,9 @@
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [
             zig
-            rar
             unrar
+          ] ++ pkgs.lib.optionals (builtins.elem system [ "x86_64-linux" "x86_64-darwin" "aarch64-darwin" ]) [
+            rar
           ];
         };
       }

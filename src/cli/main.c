@@ -41,8 +41,8 @@ static Command parse_command(const char *arg) {
 /* ========================================================================== */
 
 static void print_usage(void) {
-	printf("rarz - clean-room RAR archive toolkit (2026 Peter Marreck)\n");
-	printf("RAR format by Alexander Roshal\n\n");
+	printf("rarz - clean-room reimplementation RAR archive toolkit and CLI (Peter Marreck, 2026-02-21)\n");
+	printf("RAR format and original/primary implementation by Alexander Roshal\n\n");
 	printf("Usage:\n");
 	printf("  rarz t|test <archive>            Test archive integrity\n");
 	printf("  rarz l|list <archive>            List archive contents\n");

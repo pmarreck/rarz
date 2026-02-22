@@ -24,6 +24,11 @@ echo "=== Interop Gate A: official -> rarz ==="
 for f in "$FIXTURES"/*.rar; do
 	name=$(basename "$f")
 
+	# Skip multi-volume parts (not standalone archives)
+	if echo "$name" | grep -qE '\.part[0-9]+\.rar$'; then
+		continue
+	fi
+
 	# rarz t should succeed on all official archives
 	if ! "$RARZ" t "$f" >/dev/null 2>&1; then
 		fail "rarz t failed on $name"

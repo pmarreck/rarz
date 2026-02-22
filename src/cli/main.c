@@ -146,6 +146,229 @@ static int ensure_parent_dir(const char *filepath) {
 }
 
 /* ========================================================================== */
+/* Volume discovery                                                           */
+/* ========================================================================== */
+
+#define MAX_VOLUMES 1024
+
+typedef struct {
+	char **paths;
+	int count;
+} volume_set;
+
+/**
+ * Find the base name and detect the naming pattern for multi-volume archives.
+ * Supports two patterns:
+ *   RAR5 new style: archive.partNN.rar, archive.partNNN.rar, etc.
+ *   RAR4 old style: archive.rar, archive.r00, archive.r01, ...
+ *
+ * Returns a volume_set with paths array (caller must free each path + the array).
+ * If not a multi-volume archive, returns count=1 with the original path.
+ */
+static volume_set discover_volumes(const char *path) {
+	volume_set result = { NULL, 0 };
+
+	/* Check for RAR5 new-style naming: .partN.rar or .partNN.rar or .partNNN.rar */
+	const char *dot_rar = strstr(path, ".rar");
+	if (dot_rar && dot_rar[4] == '\0') {
+		/* Look backwards from .rar for .partNNN */
+		const char *scan = dot_rar;
+		while (scan > path && scan[-1] >= '0' && scan[-1] <= '9') scan--;
+		if (scan > path + 5 && strncmp(scan - 5, ".part", 5) == 0) {
+			/* Found .partNNN.rar pattern */
+			int num_digits = (int)(dot_rar - scan);
+			if (num_digits >= 1 && num_digits <= 4) {
+				/* Extract the base: everything before .partNNN.rar */
+				size_t base_len = (size_t)(scan - 5 - path);
+				char base[4096];
+				if (base_len >= sizeof(base)) goto single;
+				memcpy(base, path, base_len);
+				base[base_len] = '\0';
+
+				/* Scan for all volumes */
+				result.paths = (char **)calloc(MAX_VOLUMES, sizeof(char *));
+				if (!result.paths) goto single;
+
+				for (int i = 1; i <= MAX_VOLUMES; i++) {
+					char vol_path[4096];
+					snprintf(vol_path, sizeof(vol_path), "%s.part%0*d.rar",
+					         base, num_digits, i);
+
+					struct stat st;
+					if (stat(vol_path, &st) != 0) break;
+
+					result.paths[result.count] = strdup(vol_path);
+					if (!result.paths[result.count]) break;
+					result.count++;
+				}
+
+				if (result.count > 1) return result;
+
+				/* Only found 1 or none — clean up and fall through */
+				for (int i = 0; i < result.count; i++) free(result.paths[i]);
+				free(result.paths);
+				result.paths = NULL;
+				result.count = 0;
+			}
+		}
+	}
+
+	/* Check for RAR4 old-style: .rar + .r00, .r01, ... */
+	{
+		size_t plen = strlen(path);
+		if (plen > 4 && strcmp(path + plen - 4, ".rar") == 0) {
+			char base[4096];
+			size_t base_len = plen - 4;
+			if (base_len < sizeof(base)) {
+				memcpy(base, path, base_len);
+				base[base_len] = '\0';
+
+				char r00_path[4096];
+				snprintf(r00_path, sizeof(r00_path), "%s.r00", base);
+
+				struct stat st;
+				if (stat(r00_path, &st) == 0) {
+					/* RAR4 multi-volume detected */
+					result.paths = (char **)calloc(MAX_VOLUMES, sizeof(char *));
+					if (!result.paths) goto single;
+
+					/* First volume is the .rar file itself */
+					result.paths[0] = strdup(path);
+					if (!result.paths[0]) { free(result.paths); goto single; }
+					result.count = 1;
+
+					for (int i = 0; i < MAX_VOLUMES - 1; i++) {
+						char vol_path[4096];
+						snprintf(vol_path, sizeof(vol_path), "%s.r%02d", base, i);
+						if (stat(vol_path, &st) != 0) break;
+						result.paths[result.count] = strdup(vol_path);
+						if (!result.paths[result.count]) break;
+						result.count++;
+					}
+
+					if (result.count > 1) return result;
+
+					for (int i = 0; i < result.count; i++) free(result.paths[i]);
+					free(result.paths);
+					result.paths = NULL;
+					result.count = 0;
+				}
+			}
+		}
+	}
+
+single:
+	/* Single volume — just return the original path */
+	result.paths = (char **)malloc(sizeof(char *));
+	if (!result.paths) { result.count = 0; return result; }
+	result.paths[0] = strdup(path);
+	if (!result.paths[0]) { free(result.paths); result.paths = NULL; result.count = 0; return result; }
+	result.count = 1;
+	return result;
+}
+
+static void free_volume_set(volume_set *vs) {
+	if (vs->paths) {
+		for (int i = 0; i < vs->count; i++) free(vs->paths[i]);
+		free(vs->paths);
+		vs->paths = NULL;
+		vs->count = 0;
+	}
+}
+
+/**
+ * Open an archive, automatically detecting and loading multiple volumes.
+ * Returns the archive handle and sets *volume_bufs, *volume_lens, *vol_count
+ * for the caller to free later. Caller must free each buffer in volume_bufs.
+ */
+static rarz_archive *open_with_volumes(const char *path,
+                                        uint8_t ***volume_bufs_out,
+                                        size_t **volume_lens_out,
+                                        int *vol_count_out) {
+	*volume_bufs_out = NULL;
+	*volume_lens_out = NULL;
+	*vol_count_out = 0;
+
+	volume_set vs = discover_volumes(path);
+	if (vs.count == 0) {
+		free_volume_set(&vs);
+		return NULL;
+	}
+
+	if (vs.count == 1) {
+		/* Single volume — use existing rarz_open */
+		size_t len = 0;
+		uint8_t *data = read_file(vs.paths[0], &len);
+		free_volume_set(&vs);
+		if (!data) return NULL;
+
+		rarz_archive *archive = rarz_open(data, len);
+		if (!archive) {
+			free(data);
+			return NULL;
+		}
+
+		/* Store the buffer for cleanup */
+		*volume_bufs_out = (uint8_t **)malloc(sizeof(uint8_t *));
+		*volume_lens_out = (size_t *)malloc(sizeof(size_t));
+		if (!*volume_bufs_out || !*volume_lens_out) {
+			rarz_close(archive);
+			free(data);
+			free(*volume_bufs_out);
+			free(*volume_lens_out);
+			*volume_bufs_out = NULL;
+			*volume_lens_out = NULL;
+			return NULL;
+		}
+		(*volume_bufs_out)[0] = data;
+		(*volume_lens_out)[0] = len;
+		*vol_count_out = 1;
+		return archive;
+	}
+
+	/* Multi-volume: read all volumes into memory */
+	uint8_t **bufs = (uint8_t **)calloc((size_t)vs.count, sizeof(uint8_t *));
+	size_t *lens = (size_t *)calloc((size_t)vs.count, sizeof(size_t));
+	if (!bufs || !lens) {
+		free(bufs);
+		free(lens);
+		free_volume_set(&vs);
+		return NULL;
+	}
+
+	for (int i = 0; i < vs.count; i++) {
+		bufs[i] = read_file(vs.paths[i], &lens[i]);
+		if (!bufs[i]) {
+			for (int j = 0; j < i; j++) free(bufs[j]);
+			free(bufs);
+			free(lens);
+			free_volume_set(&vs);
+			return NULL;
+		}
+	}
+
+	int num_vols = vs.count;
+	printf("Opening %d volumes...\n", num_vols);
+
+	/* Build const pointer array for rarz_open_volumes */
+	const uint8_t **const_bufs = (const uint8_t **)bufs;
+	rarz_archive *archive = rarz_open_volumes(const_bufs, lens, (uint32_t)num_vols);
+	free_volume_set(&vs);
+
+	if (!archive) {
+		for (int i = 0; i < num_vols; i++) free(bufs[i]);
+		free(bufs);
+		free(lens);
+		return NULL;
+	}
+
+	*volume_bufs_out = bufs;
+	*volume_lens_out = lens;
+	*vol_count_out = num_vols;
+	return archive;
+}
+
+/* ========================================================================== */
 /* Format helpers                                                             */
 /* ========================================================================== */
 
@@ -192,25 +415,45 @@ static const char *host_os_name(uint8_t os) {
 /* ========================================================================== */
 
 static int cmd_test(const char *path) {
-	size_t len = 0;
-	uint8_t *data = read_file(path, &len);
-	if (!data) return 1;
+	volume_set vs = discover_volumes(path);
+	if (vs.count == 0) {
+		fprintf(stderr, "error: cannot discover volumes for '%s'\n", path);
+		return 1;
+	}
 
-	printf("Testing archive: %s\n", path);
+	int all_valid = 1;
+	for (int i = 0; i < vs.count; i++) {
+		size_t len = 0;
+		uint8_t *data = read_file(vs.paths[i], &len);
+		if (!data) { all_valid = 0; continue; }
 
-	rarz_validation_result result = rarz_validate(data, len);
+		if (i == 0) {
+			printf("Testing archive: %s", path);
+			if (vs.count > 1) printf(" (%d volumes)", vs.count);
+			printf("\n");
+		}
 
-	printf("Validation: %s\n", result.is_valid ? "VALID" : "INVALID");
-	printf("Depth: %s\n", depth_name(result.depth));
-	printf("Format: %s\n", format_name(result.family));
-	printf("Blocks: %u, Files: %u\n", result.block_count, result.file_count);
-	if (result.has_encrypted)
-		printf("Encrypted: yes\n");
-	if (result.error_msg)
-		printf("Error: %s\n", result.error_msg);
+		rarz_validation_result result = rarz_validate(data, len);
 
-	free(data);
-	return result.is_valid ? 0 : 1;
+		if (!result.is_valid) {
+			printf("Volume %d (%s): INVALID\n", i + 1, vs.paths[i]);
+			if (result.error_msg)
+				printf("  Error: %s\n", result.error_msg);
+			all_valid = 0;
+		}
+
+		if (i == 0) {
+			printf("Format: %s\n", format_name(result.family));
+			printf("Depth: %s\n", depth_name(result.depth));
+			if (result.has_encrypted) printf("Encrypted: yes\n");
+		}
+
+		free(data);
+	}
+
+	printf("Validation: %s\n", all_valid ? "VALID" : "INVALID");
+	free_volume_set(&vs);
+	return all_valid ? 0 : 1;
 }
 
 /* ========================================================================== */
@@ -218,14 +461,13 @@ static int cmd_test(const char *path) {
 /* ========================================================================== */
 
 static int cmd_list(const char *path) {
-	size_t len = 0;
-	uint8_t *data = read_file(path, &len);
-	if (!data) return 1;
+	uint8_t **vol_bufs = NULL;
+	size_t *vol_lens = NULL;
+	int vol_count = 0;
 
-	rarz_archive *archive = rarz_open(data, len);
+	rarz_archive *archive = open_with_volumes(path, &vol_bufs, &vol_lens, &vol_count);
 	if (!archive) {
 		fprintf(stderr, "error: failed to open archive '%s'\n", path);
-		free(data);
 		return 1;
 	}
 
@@ -290,7 +532,9 @@ static int cmd_list(const char *path) {
 	       count, count == 1 ? "" : "s");
 
 	rarz_close(archive);
-	free(data);
+	for (int i = 0; i < vol_count; i++) free(vol_bufs[i]);
+	free(vol_bufs);
+	free(vol_lens);
 	return 0;
 }
 
@@ -299,14 +543,13 @@ static int cmd_list(const char *path) {
 /* ========================================================================== */
 
 static int cmd_extract(const char *archive_path, const char *dest_dir) {
-	size_t len = 0;
-	uint8_t *data = read_file(archive_path, &len);
-	if (!data) return 1;
+	uint8_t **vol_bufs = NULL;
+	size_t *vol_lens = NULL;
+	int vol_count = 0;
 
-	rarz_archive *archive = rarz_open(data, len);
+	rarz_archive *archive = open_with_volumes(archive_path, &vol_bufs, &vol_lens, &vol_count);
 	if (!archive) {
 		fprintf(stderr, "error: failed to open archive '%s'\n", archive_path);
-		free(data);
 		return 1;
 	}
 
@@ -403,7 +646,9 @@ static int cmd_extract(const char *archive_path, const char *dest_dir) {
 	printf("\n");
 
 	rarz_close(archive);
-	free(data);
+	for (int i = 0; i < vol_count; i++) free(vol_bufs[i]);
+	free(vol_bufs);
+	free(vol_lens);
 	return errors > 0 ? 1 : 0;
 }
 

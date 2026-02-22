@@ -25,6 +25,34 @@ pub const writer = @import("writer.zig");
 const dispatch = @import("decompress/dispatch.zig");
 
 // ============================================================================
+// Multi-volume types
+// ============================================================================
+
+const VolumeData = struct {
+	data: []const u8,
+	block_data_offset: usize,
+};
+
+const PackedChunk = struct {
+	volume_index: u32,
+	offset: usize, // absolute offset within the volume's data buffer
+	length: usize,
+};
+
+const UnifiedFile = struct {
+	name: []const u8,
+	unpacked_size: u64,
+	compression: rar5_headers.CompressionInfo,
+	data_crc32: ?u32,
+	mtime: ?u32,
+	is_directory: bool,
+	host_os: u64,
+	has_crc32: bool,
+	total_packed_size: u64,
+	packed_chunks: []PackedChunk,
+};
+
+// ============================================================================
 // Archive Handle (opaque to C callers)
 // ============================================================================
 
@@ -34,6 +62,9 @@ const ArchiveHandle = struct {
 	block_data_offset: usize, // offset from data start to first block (after signature)
 	rar4_files: ?[]rar4_headers.FileHeader,
 	rar5_files: ?[]rar5_headers.FileBlock,
+	// Multi-volume fields
+	volumes: ?[]VolumeData,
+	unified_files: ?[]UnifiedFile,
 	arena: std.heap.ArenaAllocator,
 
 	fn deinit(self: *ArchiveHandle) void {
@@ -42,6 +73,7 @@ const ArchiveHandle = struct {
 	}
 
 	fn fileCount(self: *const ArchiveHandle) u32 {
+		if (self.unified_files) |files| return @intCast(files.len);
 		if (self.rar4_files) |files| return @intCast(files.len);
 		if (self.rar5_files) |files| return @intCast(files.len);
 		return 0;
@@ -96,6 +128,8 @@ export fn rarz_open(data_ptr: ?[*]const u8, len: usize) ?*ArchiveHandle {
 		.block_data_offset = block_offset,
 		.rar4_files = null,
 		.rar5_files = null,
+		.volumes = null,
+		.unified_files = null,
 		.arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
 	};
 
@@ -157,11 +191,34 @@ const RarzFileEntry = extern struct {
 	is_directory: u8,
 	is_encrypted: u8,
 	host_os: u8,
+	split_before: u8,
+	split_after: u8,
 };
 
 export fn rarz_file_info(archive: ?*const ArchiveHandle, index: u32, out: ?*RarzFileEntry) i32 {
 	const a = archive orelse return -1;
 	const entry = out orelse return -1;
+
+	// Multi-volume unified files take priority
+	if (a.unified_files) |files| {
+		if (index >= files.len) return -1;
+		const uf = files[index];
+		entry.* = .{
+			.name = uf.name.ptr,
+			.name_len = @intCast(uf.name.len),
+			.unpacked_size = uf.unpacked_size,
+			.packed_size = uf.total_packed_size,
+			.crc32 = uf.data_crc32 orelse 0,
+			.mtime = uf.mtime orelse 0,
+			.method = uf.compression.method,
+			.is_directory = @intFromBool(uf.is_directory),
+			.is_encrypted = 0,
+			.host_os = @intCast(uf.host_os & 0xFF),
+			.split_before = 0,
+			.split_after = 0,
+		};
+		return 0;
+	}
 
 	if (a.rar5_files) |files| {
 		if (index >= files.len) return -1;
@@ -177,6 +234,8 @@ export fn rarz_file_info(archive: ?*const ArchiveHandle, index: u32, out: ?*Rarz
 			.is_directory = @intFromBool(f.is_directory),
 			.is_encrypted = 0, // TODO: detect from crypt blocks
 			.host_os = @intCast(f.host_os & 0xFF),
+			.split_before = @intFromBool(f.header.flags.split_before),
+			.split_after = @intFromBool(f.header.flags.split_after),
 		};
 		return 0;
 	}
@@ -196,6 +255,8 @@ export fn rarz_file_info(archive: ?*const ArchiveHandle, index: u32, out: ?*Rarz
 			.is_directory = @intFromBool((f.attributes & 0x10) != 0),
 			.is_encrypted = @intFromBool(fflags.password),
 			.host_os = f.host_os,
+			.split_before = @intFromBool(fflags.split_before),
+			.split_after = @intFromBool(fflags.split_after),
 		};
 		return 0;
 	}
@@ -269,6 +330,78 @@ export fn rarz_extract_to_buffer(
 ) i64 {
 	const a = archive orelse return -1;
 	const buf = out_buf orelse return -1;
+
+	// Multi-volume unified extraction path
+	if (a.unified_files) |files| {
+		if (index >= files.len) return -1;
+		const uf = files[index];
+		const volumes = a.volumes orelse return -1;
+
+		if (uf.is_directory) {
+			return 0; // directories have no data
+		}
+
+		if (uf.packed_chunks.len == 0) return -1;
+
+		if (uf.packed_chunks.len == 1) {
+			// Single chunk — use direct path (same as single-volume)
+			const chunk = uf.packed_chunks[0];
+			const vol = volumes[chunk.volume_index];
+			const packed_data = vol.data[chunk.offset..][0..chunk.length];
+
+			if (uf.compression.method == 0) {
+				if (packed_data.len > out_len) return -2;
+				@memcpy(buf[0..packed_data.len], packed_data);
+				return @intCast(packed_data.len);
+			}
+
+			if (uf.unpacked_size > out_len) return -2;
+			const decompressed = dispatch.decompressRar5(
+				std.heap.page_allocator,
+				packed_data,
+				uf.unpacked_size,
+				uf.compression,
+			) catch return -3;
+			defer std.heap.page_allocator.free(decompressed);
+			@memcpy(buf[0..decompressed.len], decompressed);
+			return @intCast(decompressed.len);
+		}
+
+		// Multiple chunks — concatenate all packed data, then decompress
+		var total_packed: usize = 0;
+		for (uf.packed_chunks) |chunk| {
+			total_packed += chunk.length;
+		}
+
+		const combined = std.heap.page_allocator.alloc(u8, total_packed) catch return -1;
+		defer std.heap.page_allocator.free(combined);
+
+		var write_pos: usize = 0;
+		for (uf.packed_chunks) |chunk| {
+			const vol = volumes[chunk.volume_index];
+			const src = vol.data[chunk.offset..][0..chunk.length];
+			@memcpy(combined[write_pos..][0..chunk.length], src);
+			write_pos += chunk.length;
+		}
+
+		if (uf.compression.method == 0) {
+			// Store: the combined data IS the file
+			if (combined.len > out_len) return -2;
+			@memcpy(buf[0..combined.len], combined);
+			return @intCast(combined.len);
+		}
+
+		if (uf.unpacked_size > out_len) return -2;
+		const decompressed = dispatch.decompressRar5(
+			std.heap.page_allocator,
+			combined,
+			uf.unpacked_size,
+			uf.compression,
+		) catch return -3;
+		defer std.heap.page_allocator.free(decompressed);
+		@memcpy(buf[0..decompressed.len], decompressed);
+		return @intCast(decompressed.len);
+	}
 
 	if (a.rar5_files) |files| {
 		if (index >= files.len) return -1;
@@ -483,6 +616,182 @@ fn collectRar4Files(alloc: std.mem.Allocator, block_data: []const u8) ![]rar4_he
 	}
 
 	return files.toOwnedSlice(alloc);
+}
+
+/// Collect files from multiple RAR5 volumes into a unified file list.
+/// Split files (same name across volumes with split_before/split_after) are merged
+/// into a single UnifiedFile with multiple packed chunks.
+fn collectRar5FilesUnified(alloc: std.mem.Allocator, volumes: []const VolumeData) ![]UnifiedFile {
+	// First pass: collect all file blocks from all volumes with their volume index
+	const FileWithVolume = struct {
+		fb: rar5_headers.FileBlock,
+		volume_index: u32,
+		packed_data_offset: usize, // absolute offset of packed data in volume
+	};
+
+	var all_file_blocks: std.ArrayList(FileWithVolume) = .empty;
+	defer all_file_blocks.deinit(alloc);
+
+	for (volumes, 0..) |vol, vi| {
+		const block_data = vol.data[vol.block_data_offset..];
+		var iter = rar5_headers.walk_blocks(block_data);
+		while (true) {
+			const block = iter.next() catch break;
+			if (block == null) break;
+			switch (block.?) {
+				.file => |fb| {
+					// Compute the absolute offset of packed data in this volume
+					const header_end = vol.block_data_offset + fb.header.header_start + 4 + fb.header.crc_data_len;
+					try all_file_blocks.append(alloc, .{
+						.fb = fb,
+						.volume_index = @intCast(vi),
+						.packed_data_offset = header_end,
+					});
+				},
+				else => {},
+			}
+		}
+	}
+
+	// Second pass: merge file blocks by name
+	// Files appear in volume order. A file with split_after in volume N
+	// continues with split_before in volume N+1.
+	var unified: std.ArrayList(UnifiedFile) = .empty;
+	errdefer unified.deinit(alloc);
+
+	var i: usize = 0;
+	while (i < all_file_blocks.items.len) {
+		const first = all_file_blocks.items[i];
+
+		// If this block has split_before, it's a continuation — skip it
+		// (it should have been consumed by the previous file's merge loop)
+		if (first.fb.header.flags.split_before) {
+			i += 1;
+			continue;
+		}
+
+		// Collect packed chunks for this file
+		var chunks: std.ArrayList(PackedChunk) = .empty;
+		errdefer chunks.deinit(alloc);
+
+		const data_size = first.fb.header.data_size orelse 0;
+		try chunks.append(alloc, .{
+			.volume_index = first.volume_index,
+			.offset = first.packed_data_offset,
+			.length = @intCast(data_size),
+		});
+
+		var total_packed: u64 = data_size;
+
+		// If this file continues to next volume(s), find continuations
+		if (first.fb.header.flags.split_after) {
+			var j: usize = i + 1;
+			while (j < all_file_blocks.items.len) {
+				const cont = all_file_blocks.items[j];
+				if (!cont.fb.header.flags.split_before) break;
+
+				// Verify name matches
+				if (!std.mem.eql(u8, first.fb.name, cont.fb.name)) break;
+
+				const cont_data_size = cont.fb.header.data_size orelse 0;
+				try chunks.append(alloc, .{
+					.volume_index = cont.volume_index,
+					.offset = cont.packed_data_offset,
+					.length = @intCast(cont_data_size),
+				});
+				total_packed += cont_data_size;
+
+				j += 1;
+				if (!cont.fb.header.flags.split_after) break;
+			}
+		}
+
+		try unified.append(alloc, .{
+			.name = first.fb.name,
+			.unpacked_size = first.fb.unpacked_size,
+			.compression = first.fb.compression,
+			.data_crc32 = first.fb.data_crc32,
+			.mtime = first.fb.mtime,
+			.is_directory = first.fb.is_directory,
+			.host_os = first.fb.host_os,
+			.has_crc32 = first.fb.has_crc32,
+			.total_packed_size = total_packed,
+			.packed_chunks = try chunks.toOwnedSlice(alloc),
+		});
+
+		i += 1;
+	}
+
+	return unified.toOwnedSlice(alloc);
+}
+
+// ============================================================================
+// Multi-volume FFI export
+// ============================================================================
+
+export fn rarz_open_volumes(
+	volumes_ptr: ?[*]const [*]const u8,
+	lengths_ptr: ?[*]const usize,
+	volume_count: u32,
+) ?*ArchiveHandle {
+	const vols = if (volumes_ptr) |v| v[0..volume_count] else return null;
+	const lens = if (lengths_ptr) |l| l[0..volume_count] else return null;
+	if (volume_count == 0) return null;
+
+	const handle = std.heap.page_allocator.create(ArchiveHandle) catch return null;
+	handle.* = .{
+		.data = vols[0][0..lens[0]], // primary volume data for format detection
+		.family = .rar50,
+		.block_data_offset = 0,
+		.rar4_files = null,
+		.rar5_files = null,
+		.volumes = null,
+		.unified_files = null,
+		.arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+	};
+
+	const alloc = handle.arena.allocator();
+
+	// Detect format from first volume
+	const first_slice = vols[0][0..lens[0]];
+	const format = detect.detect_format(first_slice, 0);
+	const family = format.family orelse {
+		handle.deinit();
+		return null;
+	};
+	handle.family = family;
+
+	if (family != .rar50) {
+		// For now, only RAR5 multi-volume is supported
+		handle.deinit();
+		return null;
+	}
+
+	// Build VolumeData array
+	const vol_data = alloc.alloc(VolumeData, volume_count) catch {
+		handle.deinit();
+		return null;
+	};
+
+	for (0..volume_count) |vi| {
+		const slice = vols[vi][0..lens[vi]];
+		const vol_format = detect.detect_format(slice, 0);
+		const vol_offset = (vol_format.signature_offset) + (vol_format.signature_len);
+		vol_data[vi] = .{
+			.data = slice,
+			.block_data_offset = vol_offset,
+		};
+	}
+
+	handle.volumes = vol_data;
+
+	// Build unified file list
+	handle.unified_files = collectRar5FilesUnified(alloc, vol_data) catch {
+		handle.deinit();
+		return null;
+	};
+
+	return handle;
 }
 
 // ============================================================================
@@ -990,6 +1299,342 @@ test "rarz_open and rarz_close 100 times (arena allocator stress)" {
 		try testing.expectEqual(@as(u32, 1), rarz_file_count(handle));
 		rarz_close(handle);
 	}
+}
+
+// ============================================================================
+// Multi-volume tests
+// ============================================================================
+
+/// Build a RAR5 volume: signature + main block (with volume flag) + optional file block + end block.
+/// If split_before/split_after flags are set on the file, the header flags reflect that.
+fn build_rar5_volume(
+	buf: []u8,
+	volume_number: ?u64,
+	file_name: ?[]const u8,
+	file_data: ?[]const u8,
+	split_before: bool,
+	split_after: bool,
+	has_next_volume: bool,
+	unpacked_size_override: ?u64,
+) usize {
+	var pos: usize = 0;
+
+	// RAR5 signature
+	@memcpy(buf[pos..][0..detect.RAR50_SIG.len], &detect.RAR50_SIG);
+	pos += detect.RAR50_SIG.len;
+
+	// Main block: type=1, flags=0, body = archive_flags vint
+	var main_body: [32]u8 = undefined;
+	var mbpos: usize = 0;
+	// archive_flags: 0x01 = volume, 0x02 = volume_number present
+	var archive_flags: u64 = 0x01; // VOLUME
+	if (volume_number != null) archive_flags |= 0x02; // VOLNUMBER
+	mbpos += encode_vint(archive_flags, main_body[mbpos..]);
+	if (volume_number) |vn| {
+		mbpos += encode_vint(vn, main_body[mbpos..]);
+	}
+	pos += build_rar5_block(buf[pos..], 1, 0, null, null, main_body[0..mbpos]);
+
+	// File block (if present)
+	if (file_name) |fname| {
+		const fdata = file_data orelse "";
+		var file_body: [256]u8 = undefined;
+		var fbpos: usize = 0;
+		fbpos += encode_vint(0x0004, file_body[fbpos..]); // file_flags: has_crc32
+		const unp_size = unpacked_size_override orelse fdata.len;
+		fbpos += encode_vint(unp_size, file_body[fbpos..]); // unpacked_size
+		fbpos += encode_vint(0x20, file_body[fbpos..]); // attributes
+		// data_crc32 (only meaningful on last chunk, but we always write it)
+		const file_crc = integrity.crc32(fdata);
+		std.mem.writeInt(u32, file_body[fbpos..][0..4], file_crc, .little);
+		fbpos += 4;
+		fbpos += encode_vint(0, file_body[fbpos..]); // compression_info: store
+		fbpos += encode_vint(0, file_body[fbpos..]); // host_os: Windows
+		fbpos += encode_vint(fname.len, file_body[fbpos..]); // name_length
+		@memcpy(file_body[fbpos..][0..fname.len], fname);
+		fbpos += fname.len;
+
+		// Header flags: HFL_DATA (0x02) + split_before (0x08) + split_after (0x10)
+		var hflags: u64 = 0x02; // HFL_DATA
+		if (split_before) hflags |= 0x08;
+		if (split_after) hflags |= 0x10;
+
+		pos += build_rar5_block(buf[pos..], 2, hflags, null, fdata.len, file_body[0..fbpos]);
+
+		// Append file data payload
+		@memcpy(buf[pos..][0..fdata.len], fdata);
+		pos += fdata.len;
+	}
+
+	// End block: type=5, flags=0, body = end_flags vint
+	var end_body: [16]u8 = undefined;
+	var end_flags: u64 = 0;
+	if (has_next_volume) end_flags |= 0x01;
+	const end_body_len = encode_vint(end_flags, &end_body);
+	pos += build_rar5_block(buf[pos..], 5, 0, null, null, end_body[0..end_body_len]);
+
+	return pos;
+}
+
+test "rarz_open_volumes with 2-volume store split file" {
+	// Build two synthetic volumes:
+	// Volume 1: file "big.txt" with split_after, first 6 bytes
+	// Volume 2: file "big.txt" with split_before, last 5 bytes
+	const full_data = "hello world"; // 11 bytes total
+	const chunk1 = full_data[0..6]; // "hello "
+	const chunk2 = full_data[6..]; // "world"
+
+	var vol1_buf: [2048]u8 = undefined;
+	const vol1_len = build_rar5_volume(
+		&vol1_buf,
+		0,
+		"big.txt",
+		chunk1,
+		false,
+		true,
+		true,
+		full_data.len,
+	);
+
+	var vol2_buf: [2048]u8 = undefined;
+	const vol2_len = build_rar5_volume(
+		&vol2_buf,
+		1,
+		"big.txt",
+		chunk2,
+		true,
+		false,
+		false,
+		full_data.len,
+	);
+
+	const volumes = [_][*]const u8{ &vol1_buf, &vol2_buf };
+	const lengths = [_]usize{ vol1_len, vol2_len };
+
+	const handle = rarz_open_volumes(&volumes, &lengths, 2);
+	try testing.expect(handle != null);
+	defer rarz_close(handle);
+
+	// Should have exactly 1 unified file
+	try testing.expectEqual(@as(u32, 1), rarz_file_count(handle));
+
+	// Verify file info
+	var entry: RarzFileEntry = undefined;
+	try testing.expectEqual(@as(i32, 0), rarz_file_info(handle, 0, &entry));
+	try testing.expectEqual(@as(u32, 7), entry.name_len);
+	try testing.expectEqualSlices(u8, "big.txt", entry.name.?[0..entry.name_len]);
+	try testing.expectEqual(@as(u64, full_data.len), entry.unpacked_size);
+
+	// Extract and verify the concatenated data
+	var out: [256]u8 = undefined;
+	const extracted = rarz_extract_to_buffer(handle, 0, &out, out.len);
+	try testing.expectEqual(@as(i64, @intCast(full_data.len)), extracted);
+	try testing.expectEqualSlices(u8, full_data, out[0..@intCast(extracted)]);
+}
+
+test "rarz_open_volumes with 3-volume split file" {
+	const full_data = "ABCDEFGHIJKLMNO"; // 15 bytes
+	const chunk1 = full_data[0..5]; // "ABCDE"
+	const chunk2 = full_data[5..10]; // "FGHIJ"
+	const chunk3 = full_data[10..]; // "KLMNO"
+
+	var vol1_buf: [2048]u8 = undefined;
+	const vol1_len = build_rar5_volume(&vol1_buf, 0, "split.dat", chunk1, false, true, true, full_data.len);
+
+	var vol2_buf: [2048]u8 = undefined;
+	const vol2_len = build_rar5_volume(&vol2_buf, 1, "split.dat", chunk2, true, true, true, full_data.len);
+
+	var vol3_buf: [2048]u8 = undefined;
+	const vol3_len = build_rar5_volume(&vol3_buf, 2, "split.dat", chunk3, true, false, false, full_data.len);
+
+	const volumes = [_][*]const u8{ &vol1_buf, &vol2_buf, &vol3_buf };
+	const lengths = [_]usize{ vol1_len, vol2_len, vol3_len };
+
+	const handle = rarz_open_volumes(&volumes, &lengths, 3);
+	try testing.expect(handle != null);
+	defer rarz_close(handle);
+
+	try testing.expectEqual(@as(u32, 1), rarz_file_count(handle));
+
+	var out: [256]u8 = undefined;
+	const extracted = rarz_extract_to_buffer(handle, 0, &out, out.len);
+	try testing.expectEqual(@as(i64, @intCast(full_data.len)), extracted);
+	try testing.expectEqualSlices(u8, full_data, out[0..@intCast(extracted)]);
+}
+
+test "rarz_open_volumes with mix of complete and split files" {
+	// Volume 1: complete file "small.txt" + start of split "big.txt"
+	// Volume 2: end of split "big.txt" + complete file "other.txt"
+	const small_data = "tiny";
+	const big_data = "this is a bigger file content";
+	const big_chunk1 = big_data[0..15];
+	const big_chunk2 = big_data[15..];
+	const other_data = "other stuff";
+
+	// We need to build volumes with multiple file blocks each.
+	// The build_rar5_volume helper only supports one file, so let's build manually.
+	var vol1_buf: [4096]u8 = undefined;
+	var v1pos: usize = 0;
+
+	// Signature
+	@memcpy(vol1_buf[v1pos..][0..detect.RAR50_SIG.len], &detect.RAR50_SIG);
+	v1pos += detect.RAR50_SIG.len;
+
+	// Main block (volume)
+	var main_body: [32]u8 = undefined;
+	var mbpos: usize = 0;
+	mbpos += encode_vint(0x03, main_body[mbpos..]); // VOLUME + VOLNUMBER
+	mbpos += encode_vint(0, main_body[mbpos..]); // volume_number = 0
+	v1pos += build_rar5_block(vol1_buf[v1pos..], 1, 0, null, null, main_body[0..mbpos]);
+
+	// File: small.txt (complete, no split)
+	{
+		var fb: [256]u8 = undefined;
+		var fbp: usize = 0;
+		fbp += encode_vint(0x0004, fb[fbp..]); // has_crc32
+		fbp += encode_vint(small_data.len, fb[fbp..]);
+		fbp += encode_vint(0x20, fb[fbp..]);
+		std.mem.writeInt(u32, fb[fbp..][0..4], integrity.crc32(small_data), .little);
+		fbp += 4;
+		fbp += encode_vint(0, fb[fbp..]);
+		fbp += encode_vint(0, fb[fbp..]);
+		fbp += encode_vint(9, fb[fbp..]); // "small.txt" = 9 chars
+		@memcpy(fb[fbp..][0..9], "small.txt");
+		fbp += 9;
+		v1pos += build_rar5_block(vol1_buf[v1pos..], 2, 0x02, null, small_data.len, fb[0..fbp]);
+		@memcpy(vol1_buf[v1pos..][0..small_data.len], small_data);
+		v1pos += small_data.len;
+	}
+
+	// File: big.txt chunk1 (split_after)
+	{
+		var fb: [256]u8 = undefined;
+		var fbp: usize = 0;
+		fbp += encode_vint(0x0004, fb[fbp..]); // has_crc32
+		fbp += encode_vint(big_data.len, fb[fbp..]);
+		fbp += encode_vint(0x20, fb[fbp..]);
+		std.mem.writeInt(u32, fb[fbp..][0..4], integrity.crc32(big_data), .little);
+		fbp += 4;
+		fbp += encode_vint(0, fb[fbp..]);
+		fbp += encode_vint(0, fb[fbp..]);
+		fbp += encode_vint(7, fb[fbp..]);
+		@memcpy(fb[fbp..][0..7], "big.txt");
+		fbp += 7;
+		v1pos += build_rar5_block(vol1_buf[v1pos..], 2, 0x02 | 0x10, null, big_chunk1.len, fb[0..fbp]); // HFL_DATA | split_after
+		@memcpy(vol1_buf[v1pos..][0..big_chunk1.len], big_chunk1);
+		v1pos += big_chunk1.len;
+	}
+
+	// End block (next_volume)
+	{
+		var eb: [16]u8 = undefined;
+		const ebl = encode_vint(1, &eb); // next_volume flag
+		v1pos += build_rar5_block(vol1_buf[v1pos..], 5, 0, null, null, eb[0..ebl]);
+	}
+
+	// Build volume 2
+	var vol2_buf: [4096]u8 = undefined;
+	var v2pos: usize = 0;
+
+	@memcpy(vol2_buf[v2pos..][0..detect.RAR50_SIG.len], &detect.RAR50_SIG);
+	v2pos += detect.RAR50_SIG.len;
+
+	// Main block (volume)
+	mbpos = 0;
+	mbpos += encode_vint(0x03, main_body[mbpos..]);
+	mbpos += encode_vint(1, main_body[mbpos..]); // volume_number = 1
+	v2pos += build_rar5_block(vol2_buf[v2pos..], 1, 0, null, null, main_body[0..mbpos]);
+
+	// File: big.txt chunk2 (split_before)
+	{
+		var fb: [256]u8 = undefined;
+		var fbp: usize = 0;
+		fbp += encode_vint(0x0004, fb[fbp..]); // has_crc32
+		fbp += encode_vint(big_data.len, fb[fbp..]);
+		fbp += encode_vint(0x20, fb[fbp..]);
+		std.mem.writeInt(u32, fb[fbp..][0..4], integrity.crc32(big_data), .little);
+		fbp += 4;
+		fbp += encode_vint(0, fb[fbp..]);
+		fbp += encode_vint(0, fb[fbp..]);
+		fbp += encode_vint(7, fb[fbp..]);
+		@memcpy(fb[fbp..][0..7], "big.txt");
+		fbp += 7;
+		v2pos += build_rar5_block(vol2_buf[v2pos..], 2, 0x02 | 0x08, null, big_chunk2.len, fb[0..fbp]); // HFL_DATA | split_before
+		@memcpy(vol2_buf[v2pos..][0..big_chunk2.len], big_chunk2);
+		v2pos += big_chunk2.len;
+	}
+
+	// File: other.txt (complete)
+	{
+		var fb: [256]u8 = undefined;
+		var fbp: usize = 0;
+		fbp += encode_vint(0x0004, fb[fbp..]);
+		fbp += encode_vint(other_data.len, fb[fbp..]);
+		fbp += encode_vint(0x20, fb[fbp..]);
+		std.mem.writeInt(u32, fb[fbp..][0..4], integrity.crc32(other_data), .little);
+		fbp += 4;
+		fbp += encode_vint(0, fb[fbp..]);
+		fbp += encode_vint(0, fb[fbp..]);
+		fbp += encode_vint(9, fb[fbp..]);
+		@memcpy(fb[fbp..][0..9], "other.txt");
+		fbp += 9;
+		v2pos += build_rar5_block(vol2_buf[v2pos..], 2, 0x02, null, other_data.len, fb[0..fbp]);
+		@memcpy(vol2_buf[v2pos..][0..other_data.len], other_data);
+		v2pos += other_data.len;
+	}
+
+	// End block (no next volume)
+	{
+		var eb: [16]u8 = undefined;
+		const ebl = encode_vint(0, &eb);
+		v2pos += build_rar5_block(vol2_buf[v2pos..], 5, 0, null, null, eb[0..ebl]);
+	}
+
+	const volumes_arr = [_][*]const u8{ &vol1_buf, &vol2_buf };
+	const lengths_arr = [_]usize{ v1pos, v2pos };
+
+	const handle = rarz_open_volumes(&volumes_arr, &lengths_arr, 2);
+	try testing.expect(handle != null);
+	defer rarz_close(handle);
+
+	// Should have 3 unified files: small.txt, big.txt, other.txt
+	try testing.expectEqual(@as(u32, 3), rarz_file_count(handle));
+
+	// Extract small.txt
+	var out: [256]u8 = undefined;
+	var extracted = rarz_extract_to_buffer(handle, 0, &out, out.len);
+	try testing.expectEqual(@as(i64, @intCast(small_data.len)), extracted);
+	try testing.expectEqualSlices(u8, small_data, out[0..@intCast(extracted)]);
+
+	// Extract big.txt (split across volumes)
+	extracted = rarz_extract_to_buffer(handle, 1, &out, out.len);
+	try testing.expectEqual(@as(i64, @intCast(big_data.len)), extracted);
+	try testing.expectEqualSlices(u8, big_data, out[0..@intCast(extracted)]);
+
+	// Extract other.txt
+	extracted = rarz_extract_to_buffer(handle, 2, &out, out.len);
+	try testing.expectEqual(@as(i64, @intCast(other_data.len)), extracted);
+	try testing.expectEqualSlices(u8, other_data, out[0..@intCast(extracted)]);
+}
+
+test "rarz_file_info reports split flags on single-volume archive" {
+	var buf: [1024]u8 = undefined;
+	const file_data = "hello world";
+	const archive_len = build_rar5_with_file(&buf, "test.txt", file_data);
+
+	const handle = rarz_open(&buf, archive_len);
+	try testing.expect(handle != null);
+	defer rarz_close(handle);
+
+	var entry: RarzFileEntry = undefined;
+	try testing.expectEqual(@as(i32, 0), rarz_file_info(handle, 0, &entry));
+	// Non-split file should have split flags = 0
+	try testing.expectEqual(@as(u8, 0), entry.split_before);
+	try testing.expectEqual(@as(u8, 0), entry.split_after);
+}
+
+test "rarz_open_volumes returns null for empty input" {
+	try testing.expect(rarz_open_volumes(null, null, 0) == null);
 }
 
 comptime {

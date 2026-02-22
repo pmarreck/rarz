@@ -279,7 +279,7 @@ fn validate_rar5_structural(data: []const u8, sig_offset: usize, sig_len: u8) Va
 			};
 		}
 
-		// Check for encrypted content
+		// Check for encrypted content and end of archive
 		switch (block) {
 			.crypt => has_encrypted = true,
 			.file => |f| {
@@ -289,6 +289,7 @@ fn validate_rar5_structural(data: []const u8, sig_offset: usize, sig_len: u8) Va
 			.service => {
 				// services are also counted in block_count but not file_count
 			},
+			.end_archive => break, // stop after END block (volumes may have trailing padding)
 			else => {},
 		}
 	}
@@ -343,6 +344,9 @@ fn validate_rar5_payload(data: []const u8, sig_offset: usize, sig_len: u8) Valid
 
 		switch (block) {
 			.file => |f| {
+				// Skip split files — payload CRC covers the full file, not chunks
+				if (f.header.flags.split_before or f.header.flags.split_after) continue;
+
 				// Only verify store-method files
 				if (f.compression.method == 0) {
 					if (f.header.data_size) |ds| {
@@ -390,6 +394,7 @@ fn validate_rar5_payload(data: []const u8, sig_offset: usize, sig_len: u8) Valid
 					}
 				}
 			},
+			.end_archive => break, // stop after END block (volumes may have trailing padding)
 			else => {},
 		}
 	}

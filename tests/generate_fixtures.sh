@@ -56,6 +56,15 @@ for i in $(seq 1 20000); do
 done > "$tmpdir/tree/large.txt"
 rar a -m3 "$project_root/$FIXTURES/large_compressed.rar" "$tmpdir/tree/large.txt" >/dev/null 2>&1
 
+# Multi-volume RAR5 store (500KB per volume → ~4 volumes for tree data)
+rar a -v500k -m0 -r "$project_root/$FIXTURES/rar5_vol_store.rar" . >/dev/null 2>&1
+
+# Multi-volume RAR5 compressed (50KB per volume → 2+ volumes for compressed tree)
+rar a -v50k -m3 -r "$project_root/$FIXTURES/rar5_vol_m3.rar" . >/dev/null 2>&1
+
+# Multi-volume with a single large file spanning 3+ volumes (500KB per volume)
+rar a -v500k -m0 "$project_root/$FIXTURES/rar5_vol_large.rar" "$tmpdir/tree/large.txt" >/dev/null 2>&1
+
 # Archive created by rarz itself (for round-trip testing)
 cd "$project_root"
 nix develop -c zig build >/dev/null 2>&1

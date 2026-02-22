@@ -45,6 +45,15 @@ typedef struct rarz_archive rarz_archive;
  */
 rarz_archive *rarz_open(const uint8_t *data, size_t len);
 
+/**
+ * Open multi-volume archive from memory buffers. Returns NULL on failure.
+ * All volume data pointers must remain valid for the lifetime of the handle.
+ * Volumes must be in order (part1, part2, ...).
+ */
+rarz_archive *rarz_open_volumes(const uint8_t **volumes,
+                                const size_t *lengths,
+                                uint32_t volume_count);
+
 /** Close archive and free handle. */
 void rarz_close(rarz_archive *archive);
 
@@ -69,6 +78,8 @@ typedef struct {
 	uint8_t is_directory;
 	uint8_t is_encrypted;
 	uint8_t host_os;
+	uint8_t split_before;   /* 1 if file continues from previous volume */
+	uint8_t split_after;    /* 1 if file continues to next volume */
 } rarz_file_entry;
 
 /**

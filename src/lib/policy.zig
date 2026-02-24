@@ -1170,3 +1170,130 @@ test "validate returns invalid at full depth for compressed payload CRC mismatch
 
 	try testing.expect(result.error_message != null);
 }
+
+// --- Test: corrupted archives must return clean errors, never abort/crash ---
+
+test "validate handles truncated RAR5 (signature only, no blocks)" {
+	// Just the 8-byte signature with nothing after it
+	const data = detect_mod.RAR50_SIG;
+	const result = validate(&data);
+	try testing.expect(!result.is_valid);
+}
+
+test "validate handles RAR5 signature followed by garbage" {
+	var data: [64]u8 = undefined;
+	@memcpy(data[0..8], &detect_mod.RAR50_SIG);
+	// Fill rest with garbage that looks like invalid vint/header data
+	@memset(data[8..], 0xFF);
+	const result = validate(&data);
+	// Must return without crashing — valid or invalid doesn't matter, no abort
+	_ = result;
+}
+
+test "validate handles RAR5 signature followed by zeros" {
+	var data: [64]u8 = undefined;
+	@memcpy(data[0..8], &detect_mod.RAR50_SIG);
+	@memset(data[8..], 0x00);
+	const result = validate(&data);
+	_ = result;
+}
+
+test "validate handles RAR4 signature followed by garbage" {
+	var data: [64]u8 = undefined;
+	@memcpy(data[0..7], &detect_mod.RAR15_SIG);
+	@memset(data[7..], 0xFF);
+	const result = validate(&data);
+	_ = result;
+}
+
+test "validate handles RAR5 with header claiming enormous data_size" {
+	// Build a valid RAR5 archive then corrupt the header to claim huge sizes
+	const writer = @import("writer.zig");
+	const file_data = "hello";
+	const entries = [_]writer.FileEntry{.{
+		.name = "test.txt",
+		.data = file_data,
+		.mtime = 0,
+		.is_directory = false,
+	}};
+
+	var buf: [4096]u8 = undefined;
+	const archive_len = try writer.write_archive(&entries, &buf);
+
+	// Corrupt bytes in the middle of the archive (header area)
+	// to create nonsensical vint values
+	var corrupted = buf;
+	for (12..@min(archive_len, 24)) |i| {
+		corrupted[i] = 0xFF;
+	}
+	const result = validate(corrupted[0..archive_len]);
+	_ = result; // must not crash
+}
+
+test "validate handles every single-byte corruption of a valid RAR5 archive" {
+	// Build a valid archive, then try corrupting every single byte position
+	// and verify validate() never crashes (returns is_valid true or false)
+	const writer = @import("writer.zig");
+	const file_data = "The quick brown fox";
+	const entries = [_]writer.FileEntry{.{
+		.name = "test.txt",
+		.data = file_data,
+		.mtime = 0x5C000000,
+		.is_directory = false,
+	}};
+
+	var original: [4096]u8 = undefined;
+	const archive_len = try writer.write_archive(&entries, &original);
+
+	// Corrupt each byte position one at a time
+	for (0..archive_len) |i| {
+		var corrupted = original;
+		corrupted[i] ^= 0xFF;
+		const result = validate(corrupted[0..archive_len]);
+		// Must not crash. Either valid or invalid is fine.
+		_ = result;
+	}
+}
+
+test "validate handles every single-byte corruption of a compressed RAR5 archive" {
+	const writer = @import("writer.zig");
+	const alloc = testing.allocator;
+	const file_data = "The quick brown fox jumps over the lazy dog. The quick brown fox!";
+	const entries = [_]writer.FileEntry{.{
+		.name = "test.txt",
+		.data = file_data,
+		.mtime = 0x5C000000,
+		.is_directory = false,
+	}};
+
+	var original: [16384]u8 = undefined;
+	const archive_len = try writer.write_archive_compressed(alloc, &entries, &original, 3);
+
+	// Corrupt each byte position one at a time
+	for (0..archive_len) |i| {
+		var corrupted = original;
+		corrupted[i] ^= 0xFF;
+		const result = validate(corrupted[0..archive_len]);
+		_ = result; // must not crash
+	}
+}
+
+test "validate handles truncation at every position of a valid RAR5 archive" {
+	const writer = @import("writer.zig");
+	const file_data = "hello world";
+	const entries = [_]writer.FileEntry{.{
+		.name = "test.txt",
+		.data = file_data,
+		.mtime = 0,
+		.is_directory = false,
+	}};
+
+	var buf: [4096]u8 = undefined;
+	const archive_len = try writer.write_archive(&entries, &buf);
+
+	// Try every truncation point from 1 byte to full length
+	for (1..archive_len) |len| {
+		const result = validate(buf[0..len]);
+		_ = result; // must not crash
+	}
+}

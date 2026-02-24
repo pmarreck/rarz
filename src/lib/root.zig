@@ -1901,6 +1901,53 @@ test "rarz_file_info sets error on null handle" {
 	try testing.expect(rarz_last_error() != null);
 }
 
+// ============================================================================
+// Corruption robustness tests (must never crash/abort)
+// ============================================================================
+
+test "rarz_validate handles every single-byte corruption without crashing" {
+	var buf: [1024]u8 = undefined;
+	const file_data = "hello world";
+	const archive_len = build_rar5_with_file(&buf, "test.txt", file_data);
+
+	for (0..archive_len) |i| {
+		var corrupted = buf;
+		corrupted[i] ^= 0xFF;
+		const result = rarz_validate(&corrupted, archive_len);
+		_ = result; // must not abort
+	}
+}
+
+test "rarz_validate handles truncation at every position without crashing" {
+	var buf: [1024]u8 = undefined;
+	const file_data = "hello world";
+	const archive_len = build_rar5_with_file(&buf, "test.txt", file_data);
+
+	for (1..archive_len) |len| {
+		const result = rarz_validate(&buf, len);
+		_ = result; // must not abort
+	}
+}
+
+test "rarz_validate handles RAR5 signature followed by garbage" {
+	var data: [64]u8 = undefined;
+	@memcpy(data[0..8], &detect.RAR50_SIG);
+	@memset(data[8..], 0xFF);
+	const result = rarz_validate(&data, data.len);
+	_ = result;
+}
+
+test "rarz_validate handles single-byte input" {
+	const data = [_]u8{0x52}; // just 'R'
+	const result = rarz_validate(&data, 1);
+	try testing.expectEqual(@as(i32, 0), result.is_valid);
+}
+
+test "rarz_validate handles zero-length input" {
+	const result = rarz_validate(null, 0);
+	try testing.expectEqual(@as(i32, 0), result.is_valid);
+}
+
 comptime {
 	_ = detect;
 	_ = integrity;

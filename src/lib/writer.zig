@@ -327,19 +327,14 @@ fn encode_compression_info(method: u3, dict_bits: u4) u64 {
 	return (algo_version & 0x3F) | (@as(u64, method) << 7) | (@as(u64, dict_bits) << 10);
 }
 
-/// Write a compressed file block (header + compressed data). Returns new position.
-/// Uses a two-pass approach: compress first, then write header with known sizes.
-fn write_file_block_compressed(
-	allocator: std.mem.Allocator,
+/// Write a compressed file block using pre-compressed data. Returns new position.
+fn write_file_block_precompressed(
 	out: []u8,
 	pos: usize,
 	entry: FileEntry,
+	compressed_data: []const u8,
 	method: u3,
-) !usize {
-	// Compress the data
-	const compressed_data = try pack50.compressBlock(allocator, entry.data, method, true);
-	defer allocator.free(compressed_data);
-
+) usize {
 	const data_crc = integrity.crc32(entry.data);
 
 	// File flags: FHFL_UTIME | FHFL_CRC32
@@ -416,10 +411,30 @@ fn write_file_block_compressed(
 	return new_pos;
 }
 
+/// Result of a parallel compression worker thread.
+const CompressResult = struct {
+	data: ?[]u8 = null,
+	failed: bool = false,
+};
+
+/// Worker function for parallel compression. Each thread compresses one file
+/// using page_allocator (thread-safe, no shared state).
+fn compressWorker(file_data: []const u8, method: u3, result: *CompressResult) void {
+	const alloc = std.heap.page_allocator;
+	result.data = pack50.compressBlock(alloc, file_data, method, true) catch {
+		result.failed = true;
+		return;
+	};
+}
+
 /// Write a complete RAR5 archive with compression to the output buffer.
 /// method: 0=store, 1-5=compression levels.
 /// For method 0, delegates to write_archive.
 /// Returns the number of bytes written.
+///
+/// Files are compressed in parallel using OS threads. Each file gets its own
+/// thread, and results are assembled sequentially. For a single compressible
+/// file, compression happens inline (no thread overhead).
 pub fn write_archive_compressed(
 	allocator: std.mem.Allocator,
 	entries: []const FileEntry,
@@ -440,6 +455,87 @@ pub fn write_archive_compressed(
 	}
 	if (entries.len > 65535) return error.TooManyFiles;
 
+	// Count compressible entries (non-directory, non-empty)
+	var compressible_count: usize = 0;
+	for (entries) |entry| {
+		if (!entry.is_directory and entry.data.len > 0) compressible_count += 1;
+	}
+
+	// Allocate per-entry compression results and thread handles
+	const results = try allocator.alloc(CompressResult, entries.len);
+	defer allocator.free(results);
+	@memset(results, CompressResult{});
+
+	// Compress all files in parallel (if 2+ compressible entries)
+	if (compressible_count >= 2) {
+		const threads = try allocator.alloc(?std.Thread, entries.len);
+		defer allocator.free(threads);
+
+		// Spawn compression threads
+		for (entries, 0..) |entry, i| {
+			if (!entry.is_directory and entry.data.len > 0) {
+				threads[i] = std.Thread.spawn(.{}, compressWorker, .{
+					entry.data,
+					method,
+					&results[i],
+				}) catch blk: {
+					// Thread spawn failed — fall back to inline compression
+					results[i].data = pack50.compressBlock(
+						std.heap.page_allocator,
+						entry.data,
+						method,
+						true,
+					) catch {
+						results[i].failed = true;
+						break :blk null;
+					};
+					break :blk null;
+				};
+			} else {
+				threads[i] = null;
+			}
+		}
+
+		// Join all threads
+		for (threads) |t| {
+			if (t) |thread| thread.join();
+		}
+	} else {
+		// Single file or no compressible files: compress inline (no thread overhead)
+		for (entries, 0..) |entry, i| {
+			if (!entry.is_directory and entry.data.len > 0) {
+				results[i].data = pack50.compressBlock(
+					allocator,
+					entry.data,
+					method,
+					true,
+				) catch {
+					results[i].failed = true;
+					continue;
+				};
+			}
+		}
+	}
+
+	// Check for compression failures
+	defer {
+		// Free all compressed data
+		for (results, 0..) |r, i| {
+			if (r.data) |d| {
+				if (compressible_count >= 2) {
+					std.heap.page_allocator.free(d);
+				} else {
+					_ = i;
+					allocator.free(d);
+				}
+			}
+		}
+	}
+	for (results) |r| {
+		if (r.failed) return error.CompressionFailed;
+	}
+
+	// Write archive sequentially using pre-compressed data
 	var pos: usize = 0;
 
 	// Signature
@@ -448,13 +544,18 @@ pub fn write_archive_compressed(
 	// Main block
 	pos = write_main_block(output, pos);
 
-	// File blocks (compressed)
-	for (entries) |entry| {
+	// File blocks
+	for (entries, 0..) |entry, i| {
 		if (entry.is_directory or entry.data.len == 0) {
-			// Directories and empty files: store mode
 			pos = write_file_block(output, pos, entry);
 		} else {
-			pos = try write_file_block_compressed(allocator, output, pos, entry, method);
+			pos = write_file_block_precompressed(
+				output,
+				pos,
+				entry,
+				results[i].data.?,
+				method,
+			);
 		}
 	}
 

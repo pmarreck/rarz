@@ -3,8 +3,10 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <time.h>
 #ifndef _WIN32
 #include <libgen.h>
+#include <dirent.h>
 #endif
 #include "rarz.h"
 
@@ -149,6 +151,221 @@ static int ensure_parent_dir(const char *filepath) {
 
 	return mkdirs(tmp);
 }
+
+/* ========================================================================== */
+/* DOS timestamp conversion                                                   */
+/* ========================================================================== */
+
+/**
+ * Convert Unix time_t to DOS timestamp format.
+ * DOS format: bits 25-31=year-1980, 21-24=month, 16-20=day, 11-15=hour, 5-10=min, 0-4=sec/2
+ */
+static uint32_t unix_to_dos_time(time_t t) {
+	struct tm *tm = localtime(&t);
+	if (!tm) return 0;
+	uint32_t dos = 0;
+	dos |= (uint32_t)((tm->tm_year + 1900 - 1980) & 0x7F) << 25;
+	dos |= (uint32_t)((tm->tm_mon + 1) & 0x0F) << 21;
+	dos |= (uint32_t)(tm->tm_mday & 0x1F) << 16;
+	dos |= (uint32_t)(tm->tm_hour & 0x1F) << 11;
+	dos |= (uint32_t)(tm->tm_min & 0x3F) << 5;
+	dos |= (uint32_t)((tm->tm_sec / 2) & 0x1F);
+	return dos;
+}
+
+/* ========================================================================== */
+/* Dynamic entry list for archive creation                                    */
+/* ========================================================================== */
+
+typedef struct {
+	rarz_create_file_entry *entries;
+	uint8_t **buffers;  /* file data buffers (caller must free) */
+	char **names;       /* allocated name strings (caller must free) */
+	int count;
+	int capacity;
+} entry_list;
+
+static int entry_list_init(entry_list *list, int initial_cap) {
+	list->entries = (rarz_create_file_entry *)calloc((size_t)initial_cap, sizeof(rarz_create_file_entry));
+	list->buffers = (uint8_t **)calloc((size_t)initial_cap, sizeof(uint8_t *));
+	list->names = (char **)calloc((size_t)initial_cap, sizeof(char *));
+	if (!list->entries || !list->buffers || !list->names) {
+		free(list->entries); free(list->buffers); free(list->names);
+		memset(list, 0, sizeof(*list));
+		return -1;
+	}
+	list->count = 0;
+	list->capacity = initial_cap;
+	return 0;
+}
+
+static int entry_list_grow(entry_list *list) {
+	int new_cap = list->capacity * 2;
+	rarz_create_file_entry *ne = (rarz_create_file_entry *)realloc(list->entries,
+	                              (size_t)new_cap * sizeof(rarz_create_file_entry));
+	uint8_t **nb = (uint8_t **)realloc(list->buffers, (size_t)new_cap * sizeof(uint8_t *));
+	char **nn = (char **)realloc(list->names, (size_t)new_cap * sizeof(char *));
+	if (!ne || !nb || !nn) {
+		/* If only some reallocs succeeded, they're still valid at old size */
+		if (ne) list->entries = ne;
+		if (nb) list->buffers = nb;
+		if (nn) list->names = nn;
+		return -1;
+	}
+	list->entries = ne;
+	list->buffers = nb;
+	list->names = nn;
+	/* Zero out new slots */
+	memset(list->buffers + list->capacity, 0, (size_t)(new_cap - list->capacity) * sizeof(uint8_t *));
+	memset(list->names + list->capacity, 0, (size_t)(new_cap - list->capacity) * sizeof(char *));
+	list->capacity = new_cap;
+	return 0;
+}
+
+static void entry_list_free(entry_list *list) {
+	for (int i = 0; i < list->count; i++) {
+		free(list->buffers[i]);
+		free(list->names[i]);
+	}
+	free(list->entries);
+	free(list->buffers);
+	free(list->names);
+	memset(list, 0, sizeof(*list));
+}
+
+/**
+ * Add a file entry to the list.
+ * Takes ownership of fdata (will be freed by entry_list_free).
+ * archive_name is copied (strdup'd).
+ */
+static int entry_list_add_file(entry_list *list, const char *archive_name,
+                                uint8_t *fdata, size_t fsize, struct stat *st) {
+	if (list->count >= list->capacity) {
+		if (entry_list_grow(list) != 0) return -1;
+	}
+
+	char *name_copy = strdup(archive_name);
+	if (!name_copy) return -1;
+
+	int idx = list->count;
+	list->names[idx] = name_copy;
+	list->buffers[idx] = fdata;
+	list->entries[idx].name = name_copy;
+	list->entries[idx].name_len = (uint32_t)strlen(name_copy);
+	list->entries[idx].data = fdata;
+	list->entries[idx].data_len = fsize;
+	list->entries[idx].mtime = unix_to_dos_time(st->st_mtime);
+	list->entries[idx].is_directory = 0;
+#ifndef _WIN32
+	list->entries[idx].host_os = 3; /* Unix */
+	list->entries[idx].attributes = (uint32_t)st->st_mode;
+#else
+	list->entries[idx].host_os = 0; /* Windows */
+	list->entries[idx].attributes = 0x20; /* FILE_ATTRIBUTE_ARCHIVE */
+#endif
+	list->count++;
+	return 0;
+}
+
+/**
+ * Add a directory entry to the list.
+ * archive_name should include trailing '/'.
+ */
+static int entry_list_add_dir(entry_list *list, const char *archive_name, struct stat *st) {
+	if (list->count >= list->capacity) {
+		if (entry_list_grow(list) != 0) return -1;
+	}
+
+	char *name_copy = strdup(archive_name);
+	if (!name_copy) return -1;
+
+	int idx = list->count;
+	list->names[idx] = name_copy;
+	list->buffers[idx] = NULL;
+	list->entries[idx].name = name_copy;
+	list->entries[idx].name_len = (uint32_t)strlen(name_copy);
+	list->entries[idx].data = NULL;
+	list->entries[idx].data_len = 0;
+	list->entries[idx].mtime = unix_to_dos_time(st->st_mtime);
+	list->entries[idx].is_directory = 1;
+#ifndef _WIN32
+	list->entries[idx].host_os = 3; /* Unix */
+	list->entries[idx].attributes = (uint32_t)st->st_mode;
+#else
+	list->entries[idx].host_os = 0; /* Windows */
+	list->entries[idx].attributes = 0x10; /* FILE_ATTRIBUTE_DIRECTORY */
+#endif
+	list->count++;
+	return 0;
+}
+
+/* ========================================================================== */
+/* Recursive directory walking                                                */
+/* ========================================================================== */
+
+#ifndef _WIN32
+/**
+ * Recursively walk a directory, adding all files and subdirectories to the list.
+ * fs_path: filesystem path to the directory (no trailing slash)
+ * archive_prefix: path prefix in the archive (e.g., "mydir/sub/")
+ * Returns 0 on success, -1 on error.
+ */
+static int walk_directory(entry_list *list, const char *fs_path, const char *archive_prefix) {
+	DIR *dir = opendir(fs_path);
+	if (!dir) {
+		fprintf(stderr, "warning: cannot open directory '%s': %s\n", fs_path, strerror(errno));
+		return -1;
+	}
+
+	struct dirent *ent;
+	while ((ent = readdir(dir)) != NULL) {
+		/* Skip . and .. */
+		if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+			continue;
+
+		/* Build full filesystem path */
+		char child_path[4096];
+		snprintf(child_path, sizeof(child_path), "%s/%s", fs_path, ent->d_name);
+
+		/* Build archive path */
+		char child_archive[4096];
+		snprintf(child_archive, sizeof(child_archive), "%s%s", archive_prefix, ent->d_name);
+
+		struct stat st;
+		if (lstat(child_path, &st) != 0) {
+			fprintf(stderr, "warning: cannot stat '%s': %s\n", child_path, strerror(errno));
+			continue;
+		}
+
+		if (S_ISLNK(st.st_mode)) {
+			fprintf(stderr, "warning: skipping symlink '%s'\n", child_path);
+			continue;
+		}
+
+		if (S_ISDIR(st.st_mode)) {
+			/* Add directory entry with trailing slash */
+			char dir_archive[4096];
+			snprintf(dir_archive, sizeof(dir_archive), "%s/", child_archive);
+			entry_list_add_dir(list, dir_archive, &st);
+			/* Recurse into subdirectory */
+			walk_directory(list, child_path, dir_archive);
+		} else if (S_ISREG(st.st_mode)) {
+			/* Read file and add to list */
+			size_t fsize = 0;
+			uint8_t *fdata = read_file(child_path, &fsize);
+			if (!fdata) continue;
+			if (entry_list_add_file(list, child_archive, fdata, fsize, &st) != 0) {
+				free(fdata);
+				fprintf(stderr, "warning: cannot add '%s': out of memory\n", child_path);
+			}
+		}
+		/* Skip other file types (devices, sockets, etc.) */
+	}
+
+	closedir(dir);
+	return 0;
+}
+#endif
 
 /* ========================================================================== */
 /* Volume discovery                                                           */
@@ -386,15 +603,6 @@ static const char *format_name(int32_t family) {
 	}
 }
 
-static const char *depth_name(int32_t depth) {
-	switch (depth) {
-	case 0: return "signature";
-	case 1: return "structural";
-	case 2: return "full";
-	default: return "unknown";
-	}
-}
-
 static const char *method_name(uint8_t method) {
 	switch (method) {
 	case 0: return "Store";
@@ -449,8 +657,10 @@ static int cmd_test(const char *path) {
 
 		if (i == 0) {
 			printf("Format: %s\n", format_name(result.family));
-			printf("Depth: %s\n", depth_name(result.depth));
-			if (result.has_encrypted) printf("Encrypted: yes\n");
+			if (result.has_encrypted) {
+				printf("Encrypted: yes\n");
+				printf("Note: encrypted content not verified (use --password for full check)\n");
+			}
 		}
 
 		free(data);
@@ -493,7 +703,9 @@ static int cmd_list(const char *path) {
 
 	rarz_archive *archive = open_with_volumes(path, &vol_bufs, &vol_lens, &vol_count);
 	if (!archive) {
-		fprintf(stderr, "error: failed to open archive '%s'\n", path);
+		const char *err = rarz_last_error();
+		fprintf(stderr, "error: failed to open archive '%s'%s%s\n", path,
+		        err ? ": " : "", err ? err : "");
 		return 1;
 	}
 
@@ -575,7 +787,9 @@ static int cmd_extract(const char *archive_path, const char *dest_dir) {
 
 	rarz_archive *archive = open_with_volumes(archive_path, &vol_bufs, &vol_lens, &vol_count);
 	if (!archive) {
-		fprintf(stderr, "error: failed to open archive '%s'\n", archive_path);
+		const char *err = rarz_last_error();
+		fprintf(stderr, "error: failed to open archive '%s'%s%s\n", archive_path,
+		        err ? ": " : "", err ? err : "");
 		return 1;
 	}
 
@@ -635,8 +849,10 @@ static int cmd_extract(const char *archive_path, const char *dest_dir) {
 		int64_t extracted = rarz_extract_to_buffer(archive, i, file_buf,
 		                                           (size_t)entry.unpacked_size);
 		if (extracted < 0) {
-			fprintf(stderr, "error: extraction failed for '%s' (code %lld)\n",
-			        name_buf, (long long)extracted);
+			const char *exerr = rarz_last_error();
+			fprintf(stderr, "error: extraction failed for '%s' (code %lld)%s%s\n",
+			        name_buf, (long long)extracted,
+			        exerr ? ": " : "", exerr ? exerr : "");
 			free(file_buf);
 			errors++;
 			continue;
@@ -705,81 +921,124 @@ static int cmd_add(int argc, char **argv) {
 	}
 
 	const char *archive_path = argv[arg_start];
-	int file_count = argc - arg_start - 1;
-	int max_files = 64;
+	int input_count = argc - arg_start - 1;
 
-	if (file_count > max_files) {
-		fprintf(stderr, "error: too many files (max %d)\n", max_files);
-		return 1;
-	}
-
-	if (file_count == 0) {
+	if (input_count == 0) {
 		fprintf(stderr, "error: no files specified\n");
 		return 1;
 	}
 
-	/* Read all input files */
-	rarz_create_file_entry entries[64];
-	uint8_t *file_buffers[64];
-	memset(file_buffers, 0, sizeof(file_buffers));
+	/* Build entry list from arguments (may expand via directory recursion) */
+	entry_list list;
+	if (entry_list_init(&list, 128) != 0) {
+		fprintf(stderr, "error: out of memory\n");
+		return 1;
+	}
 
-	for (int i = 0; i < file_count; i++) {
+	for (int i = 0; i < input_count; i++) {
 		const char *path = argv[arg_start + 1 + i];
 		struct stat st;
 
-		if (stat(path, &st) != 0) {
+		if (lstat(path, &st) != 0) {
 			fprintf(stderr, "error: cannot stat '%s': %s\n", path, strerror(errno));
-			goto cleanup_add;
+			entry_list_free(&list);
+			return 1;
 		}
 
-		/* Get just the filename (strip directory) */
-		const char *name = strrchr(path, '/');
-		name = name ? name + 1 : path;
+#ifndef _WIN32
+		if (S_ISLNK(st.st_mode)) {
+			fprintf(stderr, "warning: skipping symlink '%s'\n", path);
+			continue;
+		}
+#endif
 
 		if (S_ISDIR(st.st_mode)) {
-			entries[i].name = name;
-			entries[i].name_len = (uint32_t)strlen(name);
-			entries[i].data = NULL;
-			entries[i].data_len = 0;
-			entries[i].mtime = 0;
-			entries[i].is_directory = 1;
-			file_buffers[i] = NULL;
-		} else {
+#ifndef _WIN32
+			/* Strip trailing slash if present */
+			char clean_path[4096];
+			size_t plen = strlen(path);
+			if (plen > 0 && plen < sizeof(clean_path)) {
+				memcpy(clean_path, path, plen + 1);
+				while (plen > 1 && clean_path[plen - 1] == '/')
+					clean_path[--plen] = '\0';
+			} else {
+				snprintf(clean_path, sizeof(clean_path), "%s", path);
+			}
+
+			/* Get the basename of the directory */
+			const char *dir_base = strrchr(clean_path, '/');
+			dir_base = dir_base ? dir_base + 1 : clean_path;
+
+			/* Add the directory entry itself */
+			char dir_archive[4096];
+			snprintf(dir_archive, sizeof(dir_archive), "%s/", dir_base);
+			entry_list_add_dir(&list, dir_archive, &st);
+
+			/* Recursively walk */
+			walk_directory(&list, clean_path, dir_archive);
+#else
+			fprintf(stderr, "error: directory archiving not supported on Windows yet\n");
+			entry_list_free(&list);
+			return 1;
+#endif
+		} else if (S_ISREG(st.st_mode)) {
+			/* Individual file: use basename only */
+			const char *name = strrchr(path, '/');
+			name = name ? name + 1 : path;
+
 			size_t fsize = 0;
 			uint8_t *fdata = read_file(path, &fsize);
-			if (!fdata) goto cleanup_add;
-
-			file_buffers[i] = fdata;
-			entries[i].name = name;
-			entries[i].name_len = (uint32_t)strlen(name);
-			entries[i].data = fdata;
-			entries[i].data_len = fsize;
-			entries[i].mtime = 0;
-			entries[i].is_directory = 0;
+			if (!fdata) {
+				entry_list_free(&list);
+				return 1;
+			}
+			if (entry_list_add_file(&list, name, fdata, fsize, &st) != 0) {
+				free(fdata);
+				fprintf(stderr, "error: out of memory\n");
+				entry_list_free(&list);
+				return 1;
+			}
+		} else {
+			fprintf(stderr, "warning: skipping '%s' (not a regular file or directory)\n", path);
 		}
 	}
 
+	if (list.count == 0) {
+		fprintf(stderr, "error: no files to archive\n");
+		entry_list_free(&list);
+		return 1;
+	}
+
+	int result = 0;
+
 	/* For store mode, use the simpler path with exact size calculation */
 	if (method == 0) {
-		int64_t needed = rarz_calculate_archive_size(entries, (uint32_t)file_count);
+		int64_t needed = rarz_calculate_archive_size(list.entries, (uint32_t)list.count);
 		if (needed <= 0) {
-			fprintf(stderr, "error: cannot calculate archive size\n");
-			goto cleanup_add;
+			const char *cerr = rarz_last_error();
+			fprintf(stderr, "error: cannot calculate archive size%s%s\n",
+			        cerr ? ": " : "", cerr ? cerr : "");
+			entry_list_free(&list);
+			return 1;
 		}
 
 		uint8_t *archive_buf = (uint8_t *)malloc((size_t)needed);
 		if (!archive_buf) {
 			fprintf(stderr, "error: cannot allocate %lld bytes\n", (long long)needed);
-			goto cleanup_add;
+			entry_list_free(&list);
+			return 1;
 		}
 
-		int64_t written = rarz_create_archive(entries, (uint32_t)file_count,
+		int64_t written = rarz_create_archive(list.entries, (uint32_t)list.count,
 		                                       archive_buf, (size_t)needed);
 		if (written <= 0) {
-			fprintf(stderr, "error: archive creation failed (code %lld)\n",
-			        (long long)written);
+			const char *aerr = rarz_last_error();
+			fprintf(stderr, "error: archive creation failed (code %lld)%s%s\n",
+			        (long long)written,
+			        aerr ? ": " : "", aerr ? aerr : "");
 			free(archive_buf);
-			goto cleanup_add;
+			entry_list_free(&list);
+			return 1;
 		}
 
 		FILE *out = fopen(archive_path, "wb");
@@ -787,7 +1046,8 @@ static int cmd_add(int argc, char **argv) {
 			fprintf(stderr, "error: cannot create '%s': %s\n",
 			        archive_path, strerror(errno));
 			free(archive_buf);
-			goto cleanup_add;
+			entry_list_free(&list);
+			return 1;
 		}
 
 		size_t nwritten = fwrite(archive_buf, 1, (size_t)written, out);
@@ -796,42 +1056,42 @@ static int cmd_add(int argc, char **argv) {
 
 		if (nwritten != (size_t)written) {
 			fprintf(stderr, "error: short write to '%s'\n", archive_path);
-			goto cleanup_add;
+			entry_list_free(&list);
+			return 1;
 		}
 
 		printf("Created %s (%lld bytes, %d file%s, store)\n",
 		       archive_path, (long long)written,
-		       file_count, file_count == 1 ? "" : "s");
+		       list.count, list.count == 1 ? "" : "s");
 	} else {
 		/* Compressed mode: allocate generous buffer (input size + overhead) */
 		uint64_t total_input = 0;
-		for (int i = 0; i < file_count; i++) {
-			total_input += entries[i].data_len;
+		for (int i = 0; i < list.count; i++) {
+			total_input += list.entries[i].data_len;
 		}
 		/* Compressed output can be larger than input for incompressible data,
 		 * plus we need space for headers. Use 2x input + 64KB per file. */
-		size_t buf_size = (size_t)(total_input * 2 + (uint64_t)file_count * 65536 + 4096);
+		size_t buf_size = (size_t)(total_input * 2 + (uint64_t)list.count * 65536 + 4096);
 
 		uint8_t *archive_buf = (uint8_t *)malloc(buf_size);
 		if (!archive_buf) {
 			fprintf(stderr, "error: cannot allocate %zu bytes\n", buf_size);
-			goto cleanup_add;
+			entry_list_free(&list);
+			return 1;
 		}
 
 		int64_t written = rarz_create_archive_compressed(
-			entries, (uint32_t)file_count,
+			list.entries, (uint32_t)list.count,
 			archive_buf, buf_size, method);
 
-		if (written == -3) {
-			fprintf(stderr, "error: compression failed\n");
-			free(archive_buf);
-			goto cleanup_add;
-		}
 		if (written <= 0) {
-			fprintf(stderr, "error: archive creation failed (code %lld)\n",
-			        (long long)written);
+			const char *cerr2 = rarz_last_error();
+			fprintf(stderr, "error: archive creation failed (code %lld)%s%s\n",
+			        (long long)written,
+			        cerr2 ? ": " : "", cerr2 ? cerr2 : "");
 			free(archive_buf);
-			goto cleanup_add;
+			entry_list_free(&list);
+			return 1;
 		}
 
 		FILE *out = fopen(archive_path, "wb");
@@ -839,7 +1099,8 @@ static int cmd_add(int argc, char **argv) {
 			fprintf(stderr, "error: cannot create '%s': %s\n",
 			        archive_path, strerror(errno));
 			free(archive_buf);
-			goto cleanup_add;
+			entry_list_free(&list);
+			return 1;
 		}
 
 		size_t nwritten = fwrite(archive_buf, 1, (size_t)written, out);
@@ -848,25 +1109,17 @@ static int cmd_add(int argc, char **argv) {
 
 		if (nwritten != (size_t)written) {
 			fprintf(stderr, "error: short write to '%s'\n", archive_path);
-			goto cleanup_add;
+			entry_list_free(&list);
+			return 1;
 		}
 
 		printf("Created %s (%lld bytes, %d file%s, -m%d)\n",
 		       archive_path, (long long)written,
-		       file_count, file_count == 1 ? "" : "s", method);
+		       list.count, list.count == 1 ? "" : "s", method);
 	}
 
-	/* Cleanup file buffers */
-	for (int i = 0; i < file_count; i++) {
-		free(file_buffers[i]);
-	}
-	return 0;
-
-cleanup_add:
-	for (int i = 0; i < file_count; i++) {
-		free(file_buffers[i]);
-	}
-	return 1;
+	entry_list_free(&list);
+	return result;
 }
 
 /* ========================================================================== */

@@ -23,6 +23,8 @@ pub const FileEntry = struct {
 	data: []const u8, // file content
 	mtime: u32, // Unix timestamp (DOS format)
 	is_directory: bool,
+	host_os: u8 = 0, // 0=Windows, 3=Unix
+	attributes: u32 = 0, // OS-specific (0 = use defaults: 0x10 dir / 0x20 file)
 };
 
 pub const WriteError = error{
@@ -106,8 +108,13 @@ fn write_file_block(out: []u8, pos: usize, entry: FileEntry) usize {
 	file_flags |= 0x02; // FHFL_UTIME
 	if (!entry.is_directory) file_flags |= 0x04; // FHFL_CRC32
 
-	// Attributes: 0x10 for directories, 0x20 for files
-	const attributes: u64 = if (entry.is_directory) 0x10 else 0x20;
+	// Attributes: use caller-provided if non-zero, otherwise defaults
+	const attributes: u64 = if (entry.attributes != 0)
+		entry.attributes
+	else if (entry.is_directory)
+		0x10
+	else
+		0x20;
 
 	// Build the file-specific body
 	var body: [4096]u8 = undefined;
@@ -125,8 +132,8 @@ fn write_file_block(out: []u8, pos: usize, entry: FileEntry) usize {
 	}
 	// compression_info = 0 (store)
 	bpos += encode_vint(0, body[bpos..]);
-	// host_os = 0 (Windows)
-	bpos += encode_vint(0, body[bpos..]);
+	// host_os
+	bpos += encode_vint(entry.host_os, body[bpos..]);
 	// name_length
 	bpos += encode_vint(entry.name.len, body[bpos..]);
 	// name
@@ -186,7 +193,12 @@ fn file_block_size(entry: FileEntry) usize {
 	file_flags |= 0x02; // FHFL_UTIME
 	if (!entry.is_directory) file_flags |= 0x04; // FHFL_CRC32
 
-	const attributes: u64 = if (entry.is_directory) 0x10 else 0x20;
+	const attributes: u64 = if (entry.attributes != 0)
+		entry.attributes
+	else if (entry.is_directory)
+		0x10
+	else
+		0x20;
 
 	// Body size calculation
 	var body_size: usize = 0;
@@ -196,7 +208,7 @@ fn file_block_size(entry: FileEntry) usize {
 	body_size += 4; // mtime (u32)
 	if (!entry.is_directory) body_size += 4; // data_crc32 (u32)
 	body_size += vint_size(0); // compression_info
-	body_size += vint_size(0); // host_os
+	body_size += vint_size(entry.host_os); // host_os
 	body_size += vint_size(entry.name.len); // name_length
 	body_size += entry.name.len; // name
 
@@ -336,7 +348,12 @@ fn write_file_block_compressed(
 	file_flags |= 0x02; // FHFL_UTIME
 	if (!entry.is_directory) file_flags |= 0x04; // FHFL_CRC32
 
-	const attributes: u64 = if (entry.is_directory) 0x10 else 0x20;
+	const attributes: u64 = if (entry.attributes != 0)
+		entry.attributes
+	else if (entry.is_directory)
+		0x10
+	else
+		0x20;
 	const dict_bits: u4 = 3; // 2^(3+17) = 1MB dictionary
 
 	// Build file body
@@ -355,8 +372,8 @@ fn write_file_block_compressed(
 	}
 	// compression_info
 	bpos += encode_vint(encode_compression_info(method, dict_bits), body[bpos..]);
-	// host_os = 0
-	bpos += encode_vint(0, body[bpos..]);
+	// host_os
+	bpos += encode_vint(entry.host_os, body[bpos..]);
 	// name
 	bpos += encode_vint(entry.name.len, body[bpos..]);
 	@memcpy(body[bpos..][0..entry.name.len], entry.name);
@@ -638,7 +655,6 @@ test "write_archive CRC32 validates via policy" {
 
 	const result = policy.validate(buf[0..archive_len]);
 	try testing.expect(result.is_valid);
-	try testing.expectEqual(policy.ValidationDepth.full, result.depth);
 	try testing.expectEqual(@as(u32, 1), result.file_count);
 }
 

@@ -15,6 +15,20 @@ extern "C" {
 uint32_t rarz_abi_version(void);
 
 /* ========================================================================== */
+/* Error reporting                                                            */
+/* ========================================================================== */
+
+/**
+ * Get the last error message (thread-local).
+ * Returns NULL if no error, or a static string describing the last error.
+ * The returned pointer is valid until the next FFI call on the same thread.
+ */
+const char *rarz_last_error(void);
+
+/** Clear the last error message (thread-local). */
+void rarz_clear_error(void);
+
+/* ========================================================================== */
 /* Format detection                                                           */
 /* ========================================================================== */
 
@@ -95,7 +109,6 @@ int32_t rarz_file_info(const rarz_archive *archive, uint32_t index,
 
 typedef struct {
 	int32_t is_valid;       /* 1=valid, 0=invalid */
-	int32_t depth;          /* 0=signature, 1=structural, 2=full */
 	int32_t family;         /* 0/14/15/50 */
 	int32_t has_encrypted;  /* 1 if encrypted content found */
 	uint32_t block_count;
@@ -131,6 +144,9 @@ typedef struct {
 	uint64_t data_len;
 	uint32_t mtime;         /* DOS timestamp */
 	uint8_t is_directory;
+	uint8_t host_os;        /* 0=Windows, 3=Unix */
+	uint8_t _pad[2];        /* alignment padding */
+	uint32_t attributes;    /* OS-specific (Unix: st_mode, Windows: file attrs) */
 } rarz_create_file_entry;
 
 /**

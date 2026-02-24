@@ -7,3 +7,4 @@ zig-cache/
 .zig-cache/
 result
 .DS_Store
+inbox/

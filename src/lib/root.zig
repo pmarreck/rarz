@@ -81,6 +81,28 @@ const ArchiveHandle = struct {
 };
 
 // ============================================================================
+// Thread-local last-error for FFI diagnostics
+// ============================================================================
+
+threadlocal var last_error_msg: ?[*:0]const u8 = null;
+
+fn setLastError(msg: [*:0]const u8) void {
+	last_error_msg = msg;
+}
+
+fn clearLastError() void {
+	last_error_msg = null;
+}
+
+export fn rarz_last_error() ?[*:0]const u8 {
+	return last_error_msg;
+}
+
+export fn rarz_clear_error() void {
+	clearLastError();
+}
+
+// ============================================================================
 // C FFI Exports
 // ============================================================================
 
@@ -112,16 +134,28 @@ export fn rarz_detect_format_sfx(data_ptr: ?[*]const u8, len: usize, max_sfx_off
 
 
 export fn rarz_open(data_ptr: ?[*]const u8, len: usize) ?*ArchiveHandle {
-	const slice = if (data_ptr) |d| d[0..len] else return null;
-	if (len == 0) return null;
+	const slice = if (data_ptr) |d| d[0..len] else {
+		setLastError("null or empty data");
+		return null;
+	};
+	if (len == 0) {
+		setLastError("null or empty data");
+		return null;
+	}
 
 	const format = detect.detect_format(slice, 0);
-	const family = format.family orelse return null;
+	const family = format.family orelse {
+		setLastError("unrecognized archive format");
+		return null;
+	};
 
 	const block_offset = format.signature_offset + format.signature_len;
 
 	// Allocate handle from page_allocator (arena lives inside it)
-	const handle = std.heap.page_allocator.create(ArchiveHandle) catch return null;
+	const handle = std.heap.page_allocator.create(ArchiveHandle) catch {
+		setLastError("out of memory");
+		return null;
+	};
 	handle.* = .{
 		.data = slice,
 		.family = family,
@@ -138,18 +172,18 @@ export fn rarz_open(data_ptr: ?[*]const u8, len: usize) ?*ArchiveHandle {
 	// Parse file entries based on format family
 	switch (family) {
 		.rar50 => {
-			// Skip past the RAR5 signature to reach blocks
 			const block_data = slice[block_offset..];
 			handle.rar5_files = collectRar5Files(alloc, block_data) catch {
 				handle.deinit();
+				setLastError("failed to parse RAR5 headers");
 				return null;
 			};
 		},
 		.rar15 => {
-			// Skip past the RAR1.5-4.x signature to reach blocks
 			const block_data = slice[block_offset..];
 			handle.rar4_files = collectRar4Files(alloc, block_data) catch {
 				handle.deinit();
+				setLastError("failed to parse RAR4 headers");
 				return null;
 			};
 		},
@@ -158,6 +192,7 @@ export fn rarz_open(data_ptr: ?[*]const u8, len: usize) ?*ArchiveHandle {
 		},
 	}
 
+	clearLastError();
 	return handle;
 }
 
@@ -196,12 +231,21 @@ const RarzFileEntry = extern struct {
 };
 
 export fn rarz_file_info(archive: ?*const ArchiveHandle, index: u32, out: ?*RarzFileEntry) i32 {
-	const a = archive orelse return -1;
-	const entry = out orelse return -1;
+	const a = archive orelse {
+		setLastError("null archive handle");
+		return -1;
+	};
+	const entry = out orelse {
+		setLastError("null output pointer");
+		return -1;
+	};
 
 	// Multi-volume unified files take priority
 	if (a.unified_files) |files| {
-		if (index >= files.len) return -1;
+		if (index >= files.len) {
+			setLastError("file index out of range");
+			return -1;
+		}
 		const uf = files[index];
 		entry.* = .{
 			.name = uf.name.ptr,
@@ -217,11 +261,15 @@ export fn rarz_file_info(archive: ?*const ArchiveHandle, index: u32, out: ?*Rarz
 			.split_before = 0,
 			.split_after = 0,
 		};
+		clearLastError();
 		return 0;
 	}
 
 	if (a.rar5_files) |files| {
-		if (index >= files.len) return -1;
+		if (index >= files.len) {
+			setLastError("file index out of range");
+			return -1;
+		}
 		const f = files[index];
 		entry.* = .{
 			.name = f.name.ptr,
@@ -237,11 +285,15 @@ export fn rarz_file_info(archive: ?*const ArchiveHandle, index: u32, out: ?*Rarz
 			.split_before = @intFromBool(f.header.flags.split_before),
 			.split_after = @intFromBool(f.header.flags.split_after),
 		};
+		clearLastError();
 		return 0;
 	}
 
 	if (a.rar4_files) |files| {
-		if (index >= files.len) return -1;
+		if (index >= files.len) {
+			setLastError("file index out of range");
+			return -1;
+		}
 		const f = files[index];
 		const fflags = rar4_headers.parse_file_flags(f.block.flags);
 		entry.* = .{
@@ -258,16 +310,17 @@ export fn rarz_file_info(archive: ?*const ArchiveHandle, index: u32, out: ?*Rarz
 			.split_before = @intFromBool(fflags.split_before),
 			.split_after = @intFromBool(fflags.split_after),
 		};
+		clearLastError();
 		return 0;
 	}
 
+	setLastError("file index out of range");
 	return -1;
 }
 
 /// C-compatible validation result struct.
 const RarzValidationResult = extern struct {
 	is_valid: i32,
-	depth: i32,
 	family: i32,
 	has_encrypted: i32,
 	block_count: u32,
@@ -278,7 +331,6 @@ const RarzValidationResult = extern struct {
 export fn rarz_validate(data_ptr: ?[*]const u8, len: usize) RarzValidationResult {
 	const invalid_result = RarzValidationResult{
 		.is_valid = 0,
-		.depth = 0,
 		.family = 0,
 		.has_encrypted = 0,
 		.block_count = 0,
@@ -298,12 +350,6 @@ export fn rarz_validate(data_ptr: ?[*]const u8, len: usize) RarzValidationResult
 		.rar50 => @as(i32, 50),
 	} else 0;
 
-	const depth_code: i32 = switch (result.depth) {
-		.signature => 0,
-		.structural => 1,
-		.full => 2,
-	};
-
 	// All error messages from policy.validate are compile-time string literals,
 	// which are null-terminated in memory, so the pointer cast is safe.
 	const error_msg: ?[*:0]const u8 = if (result.error_message) |msg|
@@ -313,7 +359,6 @@ export fn rarz_validate(data_ptr: ?[*]const u8, len: usize) RarzValidationResult
 
 	return RarzValidationResult{
 		.is_valid = @intFromBool(result.is_valid),
-		.depth = depth_code,
 		.family = family_code,
 		.has_encrypted = @intFromBool(result.has_encrypted_content),
 		.block_count = result.block_count,
@@ -328,42 +373,68 @@ export fn rarz_extract_to_buffer(
 	out_buf: ?[*]u8,
 	out_len: usize,
 ) i64 {
-	const a = archive orelse return -1;
-	const buf = out_buf orelse return -1;
+	const a = archive orelse {
+		setLastError("null archive handle");
+		return -1;
+	};
+	const buf = out_buf orelse {
+		setLastError("null output buffer");
+		return -1;
+	};
 
 	// Multi-volume unified extraction path
 	if (a.unified_files) |files| {
-		if (index >= files.len) return -1;
+		if (index >= files.len) {
+			setLastError("file index out of range");
+			return -1;
+		}
 		const uf = files[index];
-		const volumes = a.volumes orelse return -1;
+		const volumes = a.volumes orelse {
+			setLastError("corrupt archive handle");
+			return -1;
+		};
 
 		if (uf.is_directory) {
+			clearLastError();
 			return 0; // directories have no data
 		}
 
-		if (uf.packed_chunks.len == 0) return -1;
+		if (uf.packed_chunks.len == 0) {
+			setLastError("file has no packed data");
+			return -1;
+		}
 
 		if (uf.packed_chunks.len == 1) {
-			// Single chunk — use direct path (same as single-volume)
 			const chunk = uf.packed_chunks[0];
 			const vol = volumes[chunk.volume_index];
 			const packed_data = vol.data[chunk.offset..][0..chunk.length];
 
 			if (uf.compression.method == 0) {
-				if (packed_data.len > out_len) return -2;
+				if (packed_data.len > out_len) {
+					setLastError("output buffer too small");
+					return -2;
+				}
 				@memcpy(buf[0..packed_data.len], packed_data);
+				clearLastError();
 				return @intCast(packed_data.len);
 			}
 
-			if (uf.unpacked_size > out_len) return -2;
+			if (uf.unpacked_size > out_len) {
+				setLastError("output buffer too small");
+				return -2;
+			}
 			const decompressed = dispatch.decompressRar5(
 				std.heap.page_allocator,
 				packed_data,
 				uf.unpacked_size,
 				uf.compression,
-			) catch return -3;
+			) catch {
+				setLastError("decompression failed");
+				return -3;
+			};
 			defer std.heap.page_allocator.free(decompressed);
 			@memcpy(buf[0..decompressed.len], decompressed);
+			clearLastError();
 			return @intCast(decompressed.len);
 		}
 
@@ -373,7 +444,10 @@ export fn rarz_extract_to_buffer(
 			total_packed += chunk.length;
 		}
 
-		const combined = std.heap.page_allocator.alloc(u8, total_packed) catch return -1;
+		const combined = std.heap.page_allocator.alloc(u8, total_packed) catch {
+			setLastError("out of memory");
+			return -1;
+		};
 		defer std.heap.page_allocator.free(combined);
 
 		var write_pos: usize = 0;
@@ -385,74 +459,115 @@ export fn rarz_extract_to_buffer(
 		}
 
 		if (uf.compression.method == 0) {
-			// Store: the combined data IS the file
-			if (combined.len > out_len) return -2;
+			if (combined.len > out_len) {
+				setLastError("output buffer too small");
+				return -2;
+			}
 			@memcpy(buf[0..combined.len], combined);
+			clearLastError();
 			return @intCast(combined.len);
 		}
 
-		if (uf.unpacked_size > out_len) return -2;
+		if (uf.unpacked_size > out_len) {
+			setLastError("output buffer too small");
+			return -2;
+		}
 		const decompressed = dispatch.decompressRar5(
 			std.heap.page_allocator,
 			combined,
 			uf.unpacked_size,
 			uf.compression,
-		) catch return -3;
+		) catch {
+			setLastError("decompression failed");
+			return -3;
+		};
 		defer std.heap.page_allocator.free(decompressed);
 		@memcpy(buf[0..decompressed.len], decompressed);
+		clearLastError();
 		return @intCast(decompressed.len);
 	}
 
 	if (a.rar5_files) |files| {
-		if (index >= files.len) return -1;
+		if (index >= files.len) {
+			setLastError("file index out of range");
+			return -1;
+		}
 		const f = files[index];
 
-		const data_size = f.header.data_size orelse return -1;
+		const data_size = f.header.data_size orelse {
+			setLastError("file has no data size");
+			return -1;
+		};
 
 		// header_start is relative to block_data; add block_data_offset for full archive offset
 		const header_end = a.block_data_offset + f.header.header_start + 4 + f.header.crc_data_len;
-		if (header_end + data_size > a.data.len) return -1;
+		if (header_end + data_size > a.data.len) {
+			setLastError("data extends beyond archive");
+			return -1;
+		}
 		const packed_data = a.data[header_end .. header_end + @as(usize, @intCast(data_size))];
 
 		if (f.compression.method == 0) {
-			// Store: direct copy
-			if (data_size > out_len) return -2;
+			if (data_size > out_len) {
+				setLastError("output buffer too small");
+				return -2;
+			}
 			@memcpy(buf[0..packed_data.len], packed_data);
+			clearLastError();
 			return @intCast(packed_data.len);
 		}
 
 		// Compressed: decompress via dispatch
-		if (f.unpacked_size > out_len) return -2;
+		if (f.unpacked_size > out_len) {
+			setLastError("output buffer too small");
+			return -2;
+		}
 		const decompressed = dispatch.decompressRar5(
 			std.heap.page_allocator,
 			packed_data,
 			f.unpacked_size,
 			f.compression,
-		) catch return -3; // -3 = decompression error
+		) catch {
+			setLastError("decompression failed");
+			return -3;
+		};
 		defer std.heap.page_allocator.free(decompressed);
 		@memcpy(buf[0..decompressed.len], decompressed);
+		clearLastError();
 		return @intCast(decompressed.len);
 	}
 
 	if (a.rar4_files) |files| {
-		if (index >= files.len) return -1;
+		if (index >= files.len) {
+			setLastError("file index out of range");
+			return -1;
+		}
 		const f = files[index];
 
 		// header_offset is relative to block_data; add block_data_offset for full archive offset
 		const data_start = a.block_data_offset + f.block.header_offset + f.block.head_size;
 		const data_end = data_start + @as(usize, @intCast(f.packed_size));
-		if (data_end > a.data.len) return -1;
+		if (data_end > a.data.len) {
+			setLastError("data extends beyond archive");
+			return -1;
+		}
 		const packed_data = a.data[data_start..data_end];
 
 		if (f.method == 0) {
-			// Store: direct copy
-			if (f.packed_size > out_len) return -2;
+			if (f.packed_size > out_len) {
+				setLastError("output buffer too small");
+				return -2;
+			}
 			@memcpy(buf[0..packed_data.len], packed_data);
+			clearLastError();
 			return @intCast(packed_data.len);
 		}
 
 		// Compressed: decompress via dispatch
-		if (f.unpacked_size > out_len) return -2;
+		if (f.unpacked_size > out_len) {
+			setLastError("output buffer too small");
+			return -2;
+		}
 		const decompressed = dispatch.decompressRar4(
 			std.heap.page_allocator,
 			packed_data,
@@ -460,12 +575,17 @@ export fn rarz_extract_to_buffer(
 			f.unpack_version,
 			f.method,
 			f.block.flags,
-		) catch return -3; // -3 = decompression error
+		) catch {
+			setLastError("decompression failed");
+			return -3;
+		};
 		defer std.heap.page_allocator.free(decompressed);
 		@memcpy(buf[0..decompressed.len], decompressed);
+		clearLastError();
 		return @intCast(decompressed.len);
 	}
 
+	setLastError("file index out of range");
 	return -1;
 }
 
@@ -477,10 +597,16 @@ const RarzCreateFileEntry = extern struct {
 	data_len: u64,
 	mtime: u32,
 	is_directory: u8,
+	host_os: u8,
+	_pad: [2]u8 = .{ 0, 0 },
+	attributes: u32,
 };
 
 export fn rarz_calculate_archive_size(entries_ptr: ?[*]const RarzCreateFileEntry, count: u32) i64 {
-	const entries = if (entries_ptr) |p| p[0..count] else return -1;
+	const entries = if (entries_ptr) |p| p[0..count] else {
+		setLastError("null entries pointer");
+		return -1;
+	};
 
 	// Convert to writer.FileEntry array (stack for small counts, heap for large)
 	var writer_entries_buf: [64]writer.FileEntry = undefined;
@@ -488,7 +614,10 @@ export fn rarz_calculate_archive_size(entries_ptr: ?[*]const RarzCreateFileEntry
 	const writer_entries: []writer.FileEntry = if (count <= 64)
 		writer_entries_buf[0..count]
 	else
-		heap_alloc.alloc(writer.FileEntry, count) catch return -1;
+		heap_alloc.alloc(writer.FileEntry, count) catch {
+			setLastError("out of memory");
+			return -1;
+		};
 	defer if (count > 64) heap_alloc.free(writer_entries);
 
 	for (entries, 0..) |e, i| {
@@ -497,9 +626,12 @@ export fn rarz_calculate_archive_size(entries_ptr: ?[*]const RarzCreateFileEntry
 			.data = if (e.data) |d| d[0..@as(usize, @intCast(e.data_len))] else "",
 			.mtime = e.mtime,
 			.is_directory = e.is_directory != 0,
+			.host_os = e.host_os,
+			.attributes = e.attributes,
 		};
 	}
 
+	clearLastError();
 	return @intCast(writer.calculate_archive_size(writer_entries));
 }
 
@@ -509,8 +641,14 @@ export fn rarz_create_archive(
 	out_buf: ?[*]u8,
 	out_len: usize,
 ) i64 {
-	const entries = if (entries_ptr) |p| p[0..count] else return -1;
-	const buf = out_buf orelse return -1;
+	const entries = if (entries_ptr) |p| p[0..count] else {
+		setLastError("null entries pointer");
+		return -1;
+	};
+	const buf = out_buf orelse {
+		setLastError("null output buffer");
+		return -1;
+	};
 
 	// Convert to writer.FileEntry array (stack for small counts, heap for large)
 	var writer_entries_buf: [64]writer.FileEntry = undefined;
@@ -518,7 +656,10 @@ export fn rarz_create_archive(
 	const writer_entries: []writer.FileEntry = if (count <= 64)
 		writer_entries_buf[0..count]
 	else
-		heap_alloc.alloc(writer.FileEntry, count) catch return -1;
+		heap_alloc.alloc(writer.FileEntry, count) catch {
+			setLastError("out of memory");
+			return -1;
+		};
 	defer if (count > 64) heap_alloc.free(writer_entries);
 
 	for (entries, 0..) |e, i| {
@@ -527,16 +668,29 @@ export fn rarz_create_archive(
 			.data = if (e.data) |d| d[0..@as(usize, @intCast(e.data_len))] else "",
 			.mtime = e.mtime,
 			.is_directory = e.is_directory != 0,
+			.host_os = e.host_os,
+			.attributes = e.attributes,
 		};
 	}
 
 	const result = writer.write_archive(writer_entries, buf[0..out_len]) catch |err| {
 		return switch (err) {
-			error.BufferTooSmall => @as(i64, -2),
-			error.NameTooLong, error.TooManyFiles => @as(i64, -1),
+			error.BufferTooSmall => {
+				setLastError("output buffer too small");
+				return @as(i64, -2);
+			},
+			error.NameTooLong => {
+				setLastError("filename exceeds maximum length");
+				return @as(i64, -1);
+			},
+			error.TooManyFiles => {
+				setLastError("too many files for archive");
+				return @as(i64, -1);
+			},
 		};
 	};
 
+	clearLastError();
 	return @intCast(result);
 }
 
@@ -547,9 +701,18 @@ export fn rarz_create_archive_compressed(
 	out_len: usize,
 	method: u8,
 ) i64 {
-	const entries = if (entries_ptr) |p| p[0..count] else return -1;
-	const buf = out_buf orelse return -1;
-	if (method > 5) return -1;
+	const entries = if (entries_ptr) |p| p[0..count] else {
+		setLastError("null entries pointer");
+		return -1;
+	};
+	const buf = out_buf orelse {
+		setLastError("null output buffer");
+		return -1;
+	};
+	if (method > 5) {
+		setLastError("invalid compression method");
+		return -1;
+	}
 	const compression_method: u3 = @intCast(method);
 
 	var writer_entries_buf: [64]writer.FileEntry = undefined;
@@ -557,7 +720,10 @@ export fn rarz_create_archive_compressed(
 	const writer_entries: []writer.FileEntry = if (count <= 64)
 		writer_entries_buf[0..count]
 	else
-		heap_alloc.alloc(writer.FileEntry, count) catch return -1;
+		heap_alloc.alloc(writer.FileEntry, count) catch {
+			setLastError("out of memory");
+			return -1;
+		};
 	defer if (count > 64) heap_alloc.free(writer_entries);
 
 	for (entries, 0..) |e, i| {
@@ -566,17 +732,33 @@ export fn rarz_create_archive_compressed(
 			.data = if (e.data) |d| d[0..@as(usize, @intCast(e.data_len))] else "",
 			.mtime = e.mtime,
 			.is_directory = e.is_directory != 0,
+			.host_os = e.host_os,
+			.attributes = e.attributes,
 		};
 	}
 
 	const result = writer.write_archive_compressed(heap_alloc, writer_entries, buf[0..out_len], compression_method) catch |err| {
 		return switch (err) {
-			error.BufferTooSmall => @as(i64, -2),
-			error.NameTooLong, error.TooManyFiles => @as(i64, -1),
-			else => @as(i64, -3), // compression error
+			error.BufferTooSmall => {
+				setLastError("output buffer too small");
+				return @as(i64, -2);
+			},
+			error.NameTooLong => {
+				setLastError("filename exceeds maximum length");
+				return @as(i64, -1);
+			},
+			error.TooManyFiles => {
+				setLastError("too many files for archive");
+				return @as(i64, -1);
+			},
+			else => {
+				setLastError("compression failed");
+				return @as(i64, -3);
+			},
 		};
 	};
 
+	clearLastError();
 	return @intCast(result);
 }
 
@@ -734,13 +916,25 @@ export fn rarz_open_volumes(
 	lengths_ptr: ?[*]const usize,
 	volume_count: u32,
 ) ?*ArchiveHandle {
-	const vols = if (volumes_ptr) |v| v[0..volume_count] else return null;
-	const lens = if (lengths_ptr) |l| l[0..volume_count] else return null;
-	if (volume_count == 0) return null;
+	const vols = if (volumes_ptr) |v| v[0..volume_count] else {
+		setLastError("null or empty volume data");
+		return null;
+	};
+	const lens = if (lengths_ptr) |l| l[0..volume_count] else {
+		setLastError("null or empty volume data");
+		return null;
+	};
+	if (volume_count == 0) {
+		setLastError("null or empty volume data");
+		return null;
+	}
 
-	const handle = std.heap.page_allocator.create(ArchiveHandle) catch return null;
+	const handle = std.heap.page_allocator.create(ArchiveHandle) catch {
+		setLastError("out of memory");
+		return null;
+	};
 	handle.* = .{
-		.data = vols[0][0..lens[0]], // primary volume data for format detection
+		.data = vols[0][0..lens[0]],
 		.family = .rar50,
 		.block_data_offset = 0,
 		.rar4_files = null,
@@ -757,19 +951,21 @@ export fn rarz_open_volumes(
 	const format = detect.detect_format(first_slice, 0);
 	const family = format.family orelse {
 		handle.deinit();
+		setLastError("unrecognized format in first volume");
 		return null;
 	};
 	handle.family = family;
 
 	if (family != .rar50) {
-		// For now, only RAR5 multi-volume is supported
 		handle.deinit();
+		setLastError("multi-volume only supported for RAR5");
 		return null;
 	}
 
 	// Build VolumeData array
 	const vol_data = alloc.alloc(VolumeData, volume_count) catch {
 		handle.deinit();
+		setLastError("out of memory");
 		return null;
 	};
 
@@ -788,9 +984,11 @@ export fn rarz_open_volumes(
 	// Build unified file list
 	handle.unified_files = collectRar5FilesUnified(alloc, vol_data) catch {
 		handle.deinit();
+		setLastError("failed to collect multi-volume files");
 		return null;
 	};
 
+	clearLastError();
 	return handle;
 }
 
@@ -1049,7 +1247,6 @@ test "rarz_validate returns valid for well-formed RAR5 archive" {
 	const result = rarz_validate(&buf, archive_len);
 	try testing.expectEqual(@as(i32, 1), result.is_valid);
 	try testing.expectEqual(@as(i32, 50), result.family);
-	try testing.expectEqual(@as(i32, 1), result.depth); // structural
 	try testing.expectEqual(@as(u32, 2), result.block_count); // main + end
 	try testing.expectEqual(@as(u32, 0), result.file_count);
 	try testing.expect(result.error_msg == null);
@@ -1077,7 +1274,6 @@ test "rarz_validate returns valid for archive with file" {
 	const result = rarz_validate(&buf, archive_len);
 	try testing.expectEqual(@as(i32, 1), result.is_valid);
 	try testing.expectEqual(@as(i32, 50), result.family);
-	try testing.expectEqual(@as(i32, 2), result.depth); // full (payload CRC verified)
 	try testing.expectEqual(@as(u32, 1), result.file_count);
 	try testing.expectEqual(@as(u32, 3), result.block_count); // main + file + end
 }
@@ -1138,6 +1334,8 @@ test "rarz_create_archive and rarz_open round-trip" {
 		.data_len = data.len,
 		.mtime = 0x5C000000,
 		.is_directory = 0,
+		.host_os = 0,
+		.attributes = 0,
 	}};
 
 	// Calculate size
@@ -1184,6 +1382,8 @@ test "rarz_create_archive returns -2 for small buffer" {
 		.data_len = data.len,
 		.mtime = 0,
 		.is_directory = 0,
+		.host_os = 0,
+		.attributes = 0,
 	}};
 
 	var tiny: [8]u8 = undefined;
@@ -1214,6 +1414,8 @@ test "rarz_create_archive supports more than 64 files" {
 			.data_len = 1,
 			.mtime = 0,
 			.is_directory = 0,
+			.host_os = 0,
+			.attributes = 0,
 		};
 	}
 
@@ -1635,6 +1837,68 @@ test "rarz_file_info reports split flags on single-volume archive" {
 
 test "rarz_open_volumes returns null for empty input" {
 	try testing.expect(rarz_open_volumes(null, null, 0) == null);
+}
+
+// ============================================================================
+// FFI error propagation tests
+// ============================================================================
+
+test "rarz_last_error returns null initially" {
+	rarz_clear_error();
+	try testing.expect(rarz_last_error() == null);
+}
+
+test "rarz_open sets error on garbage data" {
+	rarz_clear_error();
+	const garbage = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF };
+	const handle = rarz_open(&garbage, garbage.len);
+	try testing.expect(handle == null);
+	try testing.expect(rarz_last_error() != null);
+}
+
+test "rarz_extract_to_buffer sets error on bad index" {
+	rarz_clear_error();
+	var buf: [512]u8 = undefined;
+	const archive_len = build_minimal_rar5(&buf);
+	const handle = rarz_open(&buf, archive_len);
+	try testing.expect(handle != null);
+	defer rarz_close(handle);
+
+	var out: [256]u8 = undefined;
+	const result = rarz_extract_to_buffer(handle, 99, &out, out.len);
+	try testing.expectEqual(@as(i64, -1), result);
+	try testing.expect(rarz_last_error() != null);
+}
+
+test "rarz_open clears error on success" {
+	// First cause an error
+	const garbage = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF };
+	_ = rarz_open(&garbage, garbage.len);
+	try testing.expect(rarz_last_error() != null);
+
+	// Now open a valid archive — should clear
+	var buf: [512]u8 = undefined;
+	const archive_len = build_minimal_rar5(&buf);
+	const handle = rarz_open(&buf, archive_len);
+	try testing.expect(handle != null);
+	defer rarz_close(handle);
+	try testing.expect(rarz_last_error() == null);
+}
+
+test "rarz_create_archive sets error on null entries" {
+	rarz_clear_error();
+	var buf: [256]u8 = undefined;
+	const result = rarz_create_archive(null, 0, &buf, buf.len);
+	try testing.expectEqual(@as(i64, -1), result);
+	try testing.expect(rarz_last_error() != null);
+}
+
+test "rarz_file_info sets error on null handle" {
+	rarz_clear_error();
+	var entry: RarzFileEntry = undefined;
+	const result = rarz_file_info(null, 0, &entry);
+	try testing.expectEqual(@as(i32, -1), result);
+	try testing.expect(rarz_last_error() != null);
 }
 
 comptime {

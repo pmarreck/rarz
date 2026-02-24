@@ -65,10 +65,17 @@ See: `docs/plans/2026-02-20-phase2-decompression.md`
 - [ ] Update PLAN.md, CODE_MINIMAP.md
 
 ## Phase 3: Polish + Advanced Features
-- [ ] Add deterministic 5x corruption harness with seed-based PRNG
-- [ ] Classify corruption opacity per RAR profile (`transparent|opaque|mixed`)
+- [x] Remove `circumvented_trivial_protection` from ValidationResult (PDF-specific, doesn't belong in rarz) (2026-02-24 EST)
 - [ ] Multi-volume awareness and reconstruction
-- [ ] RAR5 compression for write path
+- [x] RAR5 compression for write path (2026-02-22 EST)
+- [ ] RAR5 encryption (read + write)
+  - [ ] AES-256-CBC decryption of encrypted file data (CRYPT block + per-file encryption)
+  - [ ] PBKDF2-HMAC-SHA256 key derivation from password + salt
+  - [ ] `--password` CLI flag for extraction and validation of encrypted archives
+  - [ ] AES-256-CBC encryption for archive creation (`-p` flag)
+  - [ ] Header encryption support (encrypted headers mode)
+  - [ ] Interop tests: `rar -p` encrypted → `rarz --password` decrypts, and vice versa
+  - [ ] Validation integration: full payload verification when password provided
 - [ ] Build argument-compatibility matrix against official `rar` CLI grammar
 
 ## Phase 4: Distribution + CI

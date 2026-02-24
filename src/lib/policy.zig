@@ -1,12 +1,10 @@
-//! Validation policy — maps parser outcomes to validation depth levels.
+//! Validation policy — validates RAR archives and reports facts.
 //!
-//! Three validation depths:
-//! - **signature**: magic bytes recognized, format family identified
-//! - **structural**: header/block walk succeeds, all header CRCs valid, sizes coherent
-//! - **full**: payload integrity verified (CRC32/BLAKE2sp of decoded content)
+//! Reports: valid/invalid, error type, whether encrypted content was present.
 
 const std = @import("std");
 const detect_mod = @import("detect.zig");
+const dispatch = @import("decompress/dispatch.zig");
 const integrity = @import("integrity.zig");
 const rar4_headers = @import("rar4_headers.zig");
 const rar5_headers = @import("rar5_headers.zig");
@@ -16,18 +14,11 @@ const reader_mod = @import("reader.zig");
 // Types
 // ============================================================================
 
-pub const ValidationDepth = enum {
-	signature,
-	structural,
-	full,
-};
-
 pub const ValidationResult = struct {
 	is_valid: bool,
-	depth: ValidationDepth,
 	family: ?detect_mod.RarFamily,
 	has_encrypted_content: bool,
-	circumvented_trivial_protection: bool,
+
 	error_message: ?[]const u8,
 	block_count: u32,
 	file_count: u32,
@@ -49,13 +40,12 @@ fn write_u32_le(buf: []u8, offset: usize, val: u32) void {
 	std.mem.writeInt(u32, buf[offset..][0..4], val, .little);
 }
 
-fn invalid_result(depth: ValidationDepth, family: ?detect_mod.RarFamily, msg: []const u8) ValidationResult {
+fn invalid_result(family: ?detect_mod.RarFamily, msg: []const u8) ValidationResult {
 	return .{
 		.is_valid = false,
-		.depth = depth,
 		.family = family,
 		.has_encrypted_content = false,
-		.circumvented_trivial_protection = false,
+
 		.error_message = msg,
 		.block_count = 0,
 		.file_count = 0,
@@ -81,10 +71,9 @@ fn validate_rar4_structural(data: []const u8, sig_offset: usize) ValidationResul
 		const maybe_block = iter.next() catch {
 			return .{
 				.is_valid = false,
-				.depth = .structural,
 				.family = .rar15,
 				.has_encrypted_content = has_encrypted,
-				.circumvented_trivial_protection = false,
+		
 				.error_message = "block parse error",
 				.block_count = block_count,
 				.file_count = file_count,
@@ -118,10 +107,9 @@ fn validate_rar4_structural(data: []const u8, sig_offset: usize) ValidationResul
 			if (!rar4_headers.validate_header_crc(archive_data, block_header)) {
 				return .{
 					.is_valid = false,
-					.depth = .structural,
 					.family = .rar15,
 					.has_encrypted_content = has_encrypted,
-					.circumvented_trivial_protection = false,
+			
 					.error_message = "header CRC mismatch",
 					.block_count = block_count,
 					.file_count = file_count,
@@ -144,29 +132,14 @@ fn validate_rar4_structural(data: []const u8, sig_offset: usize) ValidationResul
 	}
 
 	if (block_count == 0) {
-		return invalid_result(.structural, .rar15, "no blocks found");
-	}
-
-	// If encrypted, cap at structural
-	if (has_encrypted) {
-		return .{
-			.is_valid = true,
-			.depth = .structural,
-			.family = .rar15,
-			.has_encrypted_content = true,
-			.circumvented_trivial_protection = false,
-			.error_message = null,
-			.block_count = block_count,
-			.file_count = file_count,
-		};
+		return invalid_result(.rar15, "no blocks found");
 	}
 
 	return .{
 		.is_valid = true,
-		.depth = .structural,
 		.family = .rar15,
-		.has_encrypted_content = false,
-		.circumvented_trivial_protection = false,
+		.has_encrypted_content = has_encrypted,
+
 		.error_message = null,
 		.block_count = block_count,
 		.file_count = file_count,
@@ -185,7 +158,6 @@ fn validate_rar4_payload(data: []const u8, sig_offset: usize) ValidationResult {
 
 	// Now walk again to check payload CRCs for store-method files
 	var iter = rar4_headers.walk_blocks(data[sig_offset..]);
-	var checked_payload = false;
 
 	while (true) {
 		const maybe_block = iter.next() catch break;
@@ -204,20 +176,14 @@ fn validate_rar4_payload(data: []const u8, sig_offset: usize) ValidationResult {
 						const computed_crc = integrity.crc32(payload);
 						if (computed_crc != f.file_crc) {
 							structural.is_valid = false;
-							structural.depth = .full;
 							structural.error_message = "payload CRC32 mismatch";
 							return structural;
 						}
-						checked_payload = true;
 					}
 				}
 			},
 			else => {},
 		}
-	}
-
-	if (checked_payload) {
-		structural.depth = .full;
 	}
 
 	return structural;
@@ -231,7 +197,7 @@ fn validate_rar5_structural(data: []const u8, sig_offset: usize, sig_len: u8) Va
 	// RAR5 blocks start after the 8-byte signature
 	const block_start = sig_offset + sig_len;
 	if (block_start >= data.len) {
-		return invalid_result(.structural, .rar50, "no data after signature");
+		return invalid_result(.rar50, "no data after signature");
 	}
 
 	var iter = rar5_headers.walk_blocks(data[block_start..]);
@@ -243,10 +209,9 @@ fn validate_rar5_structural(data: []const u8, sig_offset: usize, sig_len: u8) Va
 		const maybe_block = iter.next() catch {
 			return .{
 				.is_valid = false,
-				.depth = .structural,
 				.family = .rar50,
 				.has_encrypted_content = has_encrypted,
-				.circumvented_trivial_protection = false,
+		
 				.error_message = "block parse error",
 				.block_count = block_count,
 				.file_count = file_count,
@@ -269,10 +234,9 @@ fn validate_rar5_structural(data: []const u8, sig_offset: usize, sig_len: u8) Va
 		if (!rar5_headers.validate_header_crc(data[block_start..], block_header)) {
 			return .{
 				.is_valid = false,
-				.depth = .structural,
 				.family = .rar50,
 				.has_encrypted_content = has_encrypted,
-				.circumvented_trivial_protection = false,
+		
 				.error_message = "header CRC mismatch",
 				.block_count = block_count,
 				.file_count = file_count,
@@ -295,28 +259,14 @@ fn validate_rar5_structural(data: []const u8, sig_offset: usize, sig_len: u8) Va
 	}
 
 	if (block_count == 0) {
-		return invalid_result(.structural, .rar50, "no blocks found");
-	}
-
-	if (has_encrypted) {
-		return .{
-			.is_valid = true,
-			.depth = .structural,
-			.family = .rar50,
-			.has_encrypted_content = true,
-			.circumvented_trivial_protection = false,
-			.error_message = null,
-			.block_count = block_count,
-			.file_count = file_count,
-		};
+		return invalid_result(.rar50, "no blocks found");
 	}
 
 	return .{
 		.is_valid = true,
-		.depth = .structural,
 		.family = .rar50,
-		.has_encrypted_content = false,
-		.circumvented_trivial_protection = false,
+		.has_encrypted_content = has_encrypted,
+
 		.error_message = null,
 		.block_count = block_count,
 		.file_count = file_count,
@@ -336,7 +286,6 @@ fn validate_rar5_payload(data: []const u8, sig_offset: usize, sig_len: u8) Valid
 	// Walk again to verify payload CRCs for store-method files
 	const block_start = sig_offset + sig_len;
 	var iter = rar5_headers.walk_blocks(data[block_start..]);
-	var checked_payload = false;
 
 	while (true) {
 		const maybe_block = iter.next() catch break;
@@ -347,10 +296,9 @@ fn validate_rar5_payload(data: []const u8, sig_offset: usize, sig_len: u8) Valid
 				// Skip split files — payload CRC covers the full file, not chunks
 				if (f.header.flags.split_before or f.header.flags.split_after) continue;
 
-				// Only verify store-method files
 				if (f.compression.method == 0) {
+					// Store-method file — verify raw payload directly
 					if (f.header.data_size) |ds| {
-						// data_size bytes follow the header
 						const total_header = 4 + f.header.crc_data_len;
 						const payload_start = block_start + f.header.header_start + total_header;
 						const payload_end = payload_start + @as(usize, @intCast(ds));
@@ -362,18 +310,15 @@ fn validate_rar5_payload(data: []const u8, sig_offset: usize, sig_len: u8) Valid
 								const computed_crc = integrity.crc32(payload);
 								if (computed_crc != f.data_crc32.?) {
 									structural.is_valid = false;
-									structural.depth = .full;
 									structural.error_message = "payload CRC32 mismatch";
 									return structural;
 								}
-								checked_payload = true;
 							}
 
 							// Check BLAKE2sp hash if present in extra records
 							if (f.extra_data) |extra_bytes| {
 								const alloc = std.heap.page_allocator;
 								const extra_records = rar5_headers.parse_extra_records(extra_bytes, alloc) catch {
-									// If we can't parse extra records, skip BLAKE2sp check
 									continue;
 								};
 								defer alloc.free(extra_records);
@@ -383,11 +328,60 @@ fn validate_rar5_payload(data: []const u8, sig_offset: usize, sig_len: u8) Valid
 									integrity.blake2sp(payload, &computed_hash);
 									if (!std.mem.eql(u8, &computed_hash, &expected_hash)) {
 										structural.is_valid = false;
-										structural.depth = .full;
 										structural.error_message = "payload BLAKE2sp mismatch";
 										return structural;
 									}
-									checked_payload = true;
+								}
+							}
+						}
+					}
+				} else {
+					// Compressed file — decompress then verify CRC
+					if (f.header.data_size) |ds| {
+						const total_header = 4 + f.header.crc_data_len;
+						const payload_start = block_start + f.header.header_start + total_header;
+						const payload_end = payload_start + @as(usize, @intCast(ds));
+						if (payload_end <= data.len) {
+							const packed_data = data[payload_start..payload_end];
+							const alloc = std.heap.page_allocator;
+
+							const decompressed = dispatch.decompressRar5(
+								alloc,
+								packed_data,
+								f.unpacked_size,
+								f.compression,
+							) catch {
+								structural.is_valid = false;
+								structural.error_message = "decompression failed during validation";
+								return structural;
+							};
+							defer alloc.free(decompressed);
+
+							// CRC32 check
+							if (f.has_crc32) {
+								const computed_crc = integrity.crc32(decompressed);
+								if (computed_crc != f.data_crc32.?) {
+									structural.is_valid = false;
+									structural.error_message = "payload CRC32 mismatch";
+									return structural;
+								}
+							}
+
+							// Check BLAKE2sp hash if present in extra records
+							if (f.extra_data) |extra_bytes| {
+								const extra_records = rar5_headers.parse_extra_records(extra_bytes, alloc) catch {
+									continue;
+								};
+								defer alloc.free(extra_records);
+
+								if (rar5_headers.extract_blake2sp_hash(extra_records)) |expected_hash| {
+									var computed_hash: [32]u8 = undefined;
+									integrity.blake2sp(decompressed, &computed_hash);
+									if (!std.mem.eql(u8, &computed_hash, &expected_hash)) {
+										structural.is_valid = false;
+										structural.error_message = "payload BLAKE2sp mismatch";
+										return structural;
+									}
 								}
 							}
 						}
@@ -399,10 +393,6 @@ fn validate_rar5_payload(data: []const u8, sig_offset: usize, sig_len: u8) Valid
 		}
 	}
 
-	if (checked_payload) {
-		structural.depth = .full;
-	}
-
 	return structural;
 }
 
@@ -410,17 +400,17 @@ fn validate_rar5_payload(data: []const u8, sig_offset: usize, sig_len: u8) Valid
 // Main entry point
 // ============================================================================
 
-/// Validate a RAR archive at all applicable depth levels.
+/// Validate a RAR archive.
 ///
 /// 1. Signature detection — identifies format family
 /// 2. Structural validation — walks blocks, validates header CRCs
-/// 3. Full validation — verifies payload CRC32 for store-method files
+/// 3. Payload validation — verifies CRC32/BLAKE2sp of file content
 pub fn validate(data: []const u8) ValidationResult {
 	// Step 1: Detect format
 	const fmt = detect_mod.detect_format(data, 0);
 
 	const family = fmt.family orelse {
-		return invalid_result(.signature, null, "no recognized RAR signature");
+		return invalid_result(null, "no recognized RAR signature");
 	};
 
 	// Step 2+3: Validate based on family
@@ -428,10 +418,9 @@ pub fn validate(data: []const u8) ValidationResult {
 		.rar14 => .{
 			// No structural parser for RAR 1.4 yet
 			.is_valid = true,
-			.depth = .signature,
 			.family = .rar14,
 			.has_encrypted_content = false,
-			.circumvented_trivial_protection = false,
+	
 			.error_message = null,
 			.block_count = 0,
 			.file_count = 0,
@@ -521,7 +510,7 @@ test "validate returns invalid for unrecognized data" {
 	const data = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE };
 	const result = validate(&data);
 	try testing.expect(!result.is_valid);
-	try testing.expectEqual(ValidationDepth.signature, result.depth);
+
 	try testing.expectEqual(@as(?detect_mod.RarFamily, null), result.family);
 	try testing.expect(result.error_message != null);
 }
@@ -532,7 +521,7 @@ test "validate returns valid signature for RAR 1.4 data" {
 	const data = detect_mod.RAR14_SIG ++ [_]u8{ 0x00, 0x00, 0x00, 0x00 };
 	const result = validate(&data);
 	try testing.expect(result.is_valid);
-	try testing.expectEqual(ValidationDepth.signature, result.depth);
+
 	try testing.expectEqual(detect_mod.RarFamily.rar14, result.family.?);
 	try testing.expectEqual(@as(u32, 0), result.block_count);
 }
@@ -564,7 +553,7 @@ test "validate returns valid structural for well-formed RAR4 archive" {
 
 	const result = validate(archive[0..pos]);
 	try testing.expect(result.is_valid);
-	try testing.expectEqual(ValidationDepth.structural, result.depth);
+
 	try testing.expectEqual(detect_mod.RarFamily.rar15, result.family.?);
 	try testing.expectEqual(@as(u32, 3), result.block_count); // mark + main + end
 	try testing.expectEqual(@as(u32, 0), result.file_count);
@@ -595,7 +584,7 @@ test "validate returns invalid structural for corrupted RAR4 header CRC" {
 
 	const result = validate(archive[0..pos]);
 	try testing.expect(!result.is_valid);
-	try testing.expectEqual(ValidationDepth.structural, result.depth);
+
 	try testing.expectEqual(detect_mod.RarFamily.rar15, result.family.?);
 	try testing.expect(std.mem.eql(u8, result.error_message.?, "header CRC mismatch"));
 }
@@ -624,7 +613,7 @@ test "validate returns valid structural for well-formed RAR5 archive" {
 
 	const result = validate(archive[0..pos]);
 	try testing.expect(result.is_valid);
-	try testing.expectEqual(ValidationDepth.structural, result.depth);
+
 	try testing.expectEqual(detect_mod.RarFamily.rar50, result.family.?);
 	try testing.expectEqual(@as(u32, 2), result.block_count); // main + end
 	try testing.expectEqual(@as(u32, 0), result.file_count);
@@ -660,7 +649,7 @@ test "validate returns invalid structural for corrupted RAR5 header CRC" {
 
 	const result = validate(archive[0..pos]);
 	try testing.expect(!result.is_valid);
-	try testing.expectEqual(ValidationDepth.structural, result.depth);
+
 	try testing.expectEqual(detect_mod.RarFamily.rar50, result.family.?);
 	try testing.expect(std.mem.eql(u8, result.error_message.?, "header CRC mismatch"));
 }
@@ -748,7 +737,7 @@ test "validate detects encrypted content" {
 
 	const result = validate(archive[0..pos]);
 	try testing.expect(result.is_valid);
-	try testing.expectEqual(ValidationDepth.structural, result.depth);
+
 	try testing.expect(result.has_encrypted_content);
 }
 
@@ -843,7 +832,7 @@ test "validate returns full depth for store-method file with valid CRC" {
 
 	const result = validate(archive[0..pos]);
 	try testing.expect(result.is_valid);
-	try testing.expectEqual(ValidationDepth.full, result.depth);
+
 	try testing.expectEqual(detect_mod.RarFamily.rar50, result.family.?);
 	try testing.expectEqual(@as(u32, 3), result.block_count); // main + file + end
 	try testing.expectEqual(@as(u32, 1), result.file_count);
@@ -913,7 +902,7 @@ test "validate returns invalid at full depth for payload CRC mismatch" {
 
 	const result = validate(archive[0..pos]);
 	try testing.expect(!result.is_valid);
-	try testing.expectEqual(ValidationDepth.full, result.depth);
+
 	try testing.expect(std.mem.eql(u8, result.error_message.?, "payload CRC32 mismatch"));
 }
 
@@ -1014,7 +1003,7 @@ test "validate checks BLAKE2sp hash from extra record" {
 
 	const result = validate(archive[0..pos]);
 	try testing.expect(result.is_valid);
-	try testing.expectEqual(ValidationDepth.full, result.depth);
+
 	try testing.expectEqual(detect_mod.RarFamily.rar50, result.family.?);
 }
 
@@ -1103,7 +1092,7 @@ test "validate returns invalid for BLAKE2sp hash mismatch" {
 
 	const result = validate(archive[0..pos]);
 	try testing.expect(!result.is_valid);
-	try testing.expectEqual(ValidationDepth.full, result.depth);
+
 	try testing.expect(std.mem.eql(u8, result.error_message.?, "payload BLAKE2sp mismatch"));
 }
 
@@ -1127,6 +1116,57 @@ test "validate detects RAR4 encrypted content via main password flag" {
 
 	const result = validate(archive[0..pos]);
 	try testing.expect(result.is_valid);
-	try testing.expectEqual(ValidationDepth.structural, result.depth);
+
 	try testing.expect(result.has_encrypted_content);
+}
+
+// --- Test: validate returns full depth for compressed file with valid CRC ---
+
+test "validate returns full depth for compressed file with valid CRC" {
+	const writer = @import("writer.zig");
+	const alloc = testing.allocator;
+
+	const file_data = "The quick brown fox jumps over the lazy dog. The quick brown fox!";
+	const entries = [_]writer.FileEntry{.{
+		.name = "test.txt",
+		.data = file_data,
+		.mtime = 0x5C000000,
+		.is_directory = false,
+	}};
+
+	var buf: [16384]u8 = undefined;
+	const archive_len = try writer.write_archive_compressed(alloc, &entries, &buf, 3);
+
+	const result = validate(buf[0..archive_len]);
+	try testing.expect(result.is_valid);
+
+	try testing.expectEqual(detect_mod.RarFamily.rar50, result.family.?);
+	try testing.expectEqual(@as(u32, 1), result.file_count);
+}
+
+// --- Test: validate returns invalid at full depth for compressed payload CRC mismatch ---
+
+test "validate returns invalid at full depth for compressed payload CRC mismatch" {
+	const writer = @import("writer.zig");
+	const alloc = testing.allocator;
+
+	const file_data = "The quick brown fox jumps over the lazy dog. The quick brown fox!";
+	const entries = [_]writer.FileEntry{.{
+		.name = "test.txt",
+		.data = file_data,
+		.mtime = 0x5C000000,
+		.is_directory = false,
+	}};
+
+	var buf: [16384]u8 = undefined;
+	const archive_len = try writer.write_archive_compressed(alloc, &entries, &buf, 3);
+
+	// Corrupt a byte in the compressed data area (last byte before end block)
+	// The end block is at the very end; corrupt a byte a few bytes before it
+	buf[archive_len - 20] ^= 0xFF;
+
+	const result = validate(buf[0..archive_len]);
+	try testing.expect(!result.is_valid);
+
+	try testing.expect(result.error_message != null);
 }

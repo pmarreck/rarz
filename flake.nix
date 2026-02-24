@@ -54,6 +54,7 @@
           buildInputs = with pkgs; [
             zig
             unrar
+            hyperfine
           ] ++ pkgs.lib.optionals (builtins.elem system [ "x86_64-linux" "x86_64-darwin" "aarch64-darwin" ]) [
             rar
           ];

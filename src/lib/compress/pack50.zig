@@ -30,8 +30,39 @@ pub fn compressBlock(
     var mf = try match_finder.MatchFinder.init(allocator, window_size, level);
     defer mf.deinit();
 
-    const tokens = try mf.compress(data, allocator);
-    defer allocator.free(tokens);
+    const raw_tokens = try mf.compress(data, allocator);
+    defer allocator.free(raw_tokens);
+
+    // Step 1b: Replace matches whose adjusted length < 2 with literals.
+    // RAR5 subtracts a distance-dependent bonus on decode (up to +3 for large distances),
+    // so the encoder must subtract it before encoding. If that makes the length < 2,
+    // the match is unencodable — emit the original bytes as literals instead.
+    var filtered = std.ArrayList(LzToken).empty;
+    defer filtered.deinit(allocator);
+    {
+        var data_pos: usize = 0;
+        for (raw_tokens) |tok| {
+            switch (tok) {
+                .literal => {
+                    try filtered.append(allocator, tok);
+                    data_pos += 1;
+                },
+                .match => |m| {
+                    const adj_len = slot_tables.adjustLengthForDistance(m.length, m.distance);
+                    if (adj_len < 2) {
+                        // Unencodable after distance bonus adjustment — emit as literals
+                        for (0..m.length) |i| {
+                            try filtered.append(allocator, .{ .literal = data[data_pos + i] });
+                        }
+                    } else {
+                        try filtered.append(allocator, tok);
+                    }
+                    data_pos += m.length;
+                },
+            }
+        }
+    }
+    const tokens = filtered.items;
 
     // Step 2: Count frequencies for all alphabets
     var ld_freq: [NC]u32 = [_]u32{0} ** NC;
@@ -118,7 +149,7 @@ pub fn compressBlock(
 
     // Step 4: Build the block data (tables + compressed symbols)
     // Allocate generous output buffer
-    const max_output = data.len + 4096; // compressed size + overhead
+    const max_output = data.len * 2 + 8192; // worst-case: incompressible data expands under Huffman
     const output = try allocator.alloc(u8, max_output);
     errdefer allocator.free(output);
 

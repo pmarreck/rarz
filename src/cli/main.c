@@ -5,8 +5,15 @@
 #include <errno.h>
 #include <time.h>
 #ifndef _WIN32
+#include <unistd.h>
 #include <libgen.h>
 #include <dirent.h>
+#include <sys/time.h>
+#include <sys/ioctl.h>
+#else
+#include <io.h>
+#define isatty _isatty
+#define fileno _fileno
 #endif
 #include "rarz.h"
 
@@ -15,6 +22,122 @@
 #else
 #define MKDIR(path) mkdir(path, 0755)
 #endif
+
+/* ========================================================================== */
+/* Progress display                                                           */
+/* ========================================================================== */
+
+static int g_is_tty = 0;  /* set once in main() */
+
+static double get_time_sec(void) {
+#ifndef _WIN32
+	struct timeval tv;
+	gettimeofday(&tv, NULL);
+	return (double)tv.tv_sec + (double)tv.tv_usec / 1e6;
+#else
+	return (double)clock() / CLOCKS_PER_SEC;
+#endif
+}
+
+static int get_term_width(void) {
+#ifndef _WIN32
+	struct winsize ws;
+	if (ioctl(STDERR_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
+		return ws.ws_col;
+#endif
+	return 80;
+}
+
+/** Format bytes as human-readable string into buf (e.g., "1.2 MB") */
+static void format_bytes(char *buf, size_t buflen, uint64_t bytes) {
+	if (bytes >= 1073741824ULL)
+		snprintf(buf, buflen, "%.1f GB", (double)bytes / 1073741824.0);
+	else if (bytes >= 1048576ULL)
+		snprintf(buf, buflen, "%.1f MB", (double)bytes / 1048576.0);
+	else if (bytes >= 1024ULL)
+		snprintf(buf, buflen, "%.1f KB", (double)bytes / 1024.0);
+	else
+		snprintf(buf, buflen, "%llu B", (unsigned long long)bytes);
+}
+
+/** Format seconds as M:SS or H:MM:SS */
+static void format_eta(char *buf, size_t buflen, double seconds) {
+	if (seconds < 0 || seconds > 86400) {
+		snprintf(buf, buflen, "--:--");
+		return;
+	}
+	int s = (int)(seconds + 0.5);
+	if (s >= 3600)
+		snprintf(buf, buflen, "%d:%02d:%02d", s / 3600, (s % 3600) / 60, s % 60);
+	else
+		snprintf(buf, buflen, "%d:%02d", s / 60, s % 60);
+}
+
+/** Format throughput as "XX.X MB/s" */
+static void format_throughput(char *buf, size_t buflen, uint64_t bytes, double elapsed) {
+	if (elapsed <= 0.001) {
+		snprintf(buf, buflen, "-- MB/s");
+		return;
+	}
+	double mbps = ((double)bytes / 1048576.0) / elapsed;
+	if (mbps >= 1000.0)
+		snprintf(buf, buflen, "%.1f GB/s", mbps / 1024.0);
+	else
+		snprintf(buf, buflen, "%.1f MB/s", mbps);
+}
+
+/**
+ * Show a progress line on stderr (TTY only). Overwrites previous line with \r.
+ * pass -1 for pct to show indeterminate progress.
+ */
+static void progress_show(const char *verb, const char *filename,
+                           int file_idx, int file_total,
+                           int pct, const char *rate, const char *eta) {
+	if (!g_is_tty) return;
+
+	int width = get_term_width();
+	char line[512];
+	int pos = 0;
+
+	if (pct >= 0) {
+		/* Draw a mini progress bar */
+		int bar_width = 20;
+		int filled = (pct * bar_width) / 100;
+		char bar[32];
+		for (int i = 0; i < bar_width; i++)
+			bar[i] = (i < filled) ? '#' : '-';
+		bar[bar_width] = '\0';
+
+		pos = snprintf(line, sizeof(line), "\r  %s: %s (%d/%d) [%s] %3d%%",
+		               verb, filename, file_idx, file_total, bar, pct);
+	} else {
+		pos = snprintf(line, sizeof(line), "\r  %s: %s (%d/%d)",
+		               verb, filename, file_idx, file_total);
+	}
+
+	if (rate && rate[0]) {
+		pos += snprintf(line + pos, sizeof(line) - (size_t)pos, " | %s", rate);
+	}
+	if (eta && eta[0]) {
+		pos += snprintf(line + pos, sizeof(line) - (size_t)pos, " | ETA %s", eta);
+	}
+
+	/* Pad with spaces to clear previous longer line */
+	while (pos < width - 1 && pos < (int)sizeof(line) - 1)
+		line[pos++] = ' ';
+	line[pos] = '\0';
+
+	fprintf(stderr, "%s", line);
+	fflush(stderr);
+}
+
+/** Clear the progress line */
+static void progress_clear(void) {
+	if (!g_is_tty) return;
+	int width = get_term_width();
+	fprintf(stderr, "\r%*s\r", width - 1, "");
+	fflush(stderr);
+}
 
 /* ========================================================================== */
 /* Command enum + parser                                                      */
@@ -796,6 +919,21 @@ static int cmd_extract(const char *archive_path, const char *dest_dir) {
 	uint32_t count = rarz_file_count(archive);
 	int errors = 0;
 
+	/* Pre-compute total unpacked size for progress tracking */
+	uint64_t total_size = 0;
+	uint32_t file_count = 0; /* non-directory count */
+	for (uint32_t i = 0; i < count; i++) {
+		rarz_file_entry pe;
+		if (rarz_file_info(archive, i, &pe) == 0 && !pe.is_directory) {
+			total_size += pe.unpacked_size;
+			file_count++;
+		}
+	}
+
+	uint64_t bytes_done = 0;
+	uint32_t files_done = 0;
+	double start_time = get_time_sec();
+
 	for (uint32_t i = 0; i < count; i++) {
 		rarz_file_entry entry;
 		if (rarz_file_info(archive, i, &entry) != 0) {
@@ -829,6 +967,20 @@ static int cmd_extract(const char *archive_path, const char *dest_dir) {
 			continue;
 		}
 
+		/* Show progress (TTY) or filename (non-TTY) */
+		files_done++;
+		if (g_is_tty) {
+			double elapsed = get_time_sec() - start_time;
+			int pct = total_size > 0 ? (int)((bytes_done * 100) / total_size) : 0;
+			char rate_buf[32], eta_buf[16];
+			format_throughput(rate_buf, sizeof(rate_buf), bytes_done, elapsed);
+			double eta = (pct > 0 && elapsed > 0.1)
+				? elapsed * (100.0 - pct) / pct : -1;
+			format_eta(eta_buf, sizeof(eta_buf), eta);
+			progress_show("Extracting", name_buf, (int)files_done, (int)file_count,
+			              pct, rate_buf, pct > 0 ? eta_buf : NULL);
+		}
+
 		/* Ensure parent directory exists */
 		if (ensure_parent_dir(out_path) != 0) {
 			fprintf(stderr, "error: cannot create parent directory for '%s': %s\n",
@@ -849,6 +1001,7 @@ static int cmd_extract(const char *archive_path, const char *dest_dir) {
 		int64_t extracted = rarz_extract_to_buffer(archive, i, file_buf,
 		                                           (size_t)entry.unpacked_size);
 		if (extracted < 0) {
+			progress_clear();
 			const char *exerr = rarz_last_error();
 			fprintf(stderr, "error: extraction failed for '%s' (code %lld)%s%s\n",
 			        name_buf, (long long)extracted,
@@ -861,6 +1014,7 @@ static int cmd_extract(const char *archive_path, const char *dest_dir) {
 		/* Write to disk */
 		FILE *out = fopen(out_path, "wb");
 		if (!out) {
+			progress_clear();
 			fprintf(stderr, "error: cannot create '%s': %s\n",
 			        out_path, strerror(errno));
 			free(file_buf);
@@ -873,15 +1027,29 @@ static int cmd_extract(const char *archive_path, const char *dest_dir) {
 		free(file_buf);
 
 		if (written != (size_t)extracted) {
+			progress_clear();
 			fprintf(stderr, "error: short write for '%s'\n", name_buf);
 			errors++;
 			continue;
 		}
 
-		printf("  %s\n", name_buf);
+		bytes_done += (uint64_t)extracted;
+
+		if (!g_is_tty) {
+			printf("  %s\n", name_buf);
+		}
 	}
 
-	printf("\nExtracted %u file%s", count, count == 1 ? "" : "s");
+	progress_clear();
+
+	/* Final summary */
+	double total_elapsed = get_time_sec() - start_time;
+	char size_buf[32], rate_buf[32];
+	format_bytes(size_buf, sizeof(size_buf), total_size);
+	format_throughput(rate_buf, sizeof(rate_buf), total_size, total_elapsed);
+
+	printf("Extracted %u file%s", file_count, file_count == 1 ? "" : "s");
+	printf(" (%s in %.2fs, %s)", size_buf, total_elapsed, rate_buf);
 	if (errors > 0) {
 		printf(" (%d error%s)", errors, errors == 1 ? "" : "s");
 	}
@@ -939,7 +1107,15 @@ static int cmd_add(int argc, char **argv) {
 		const char *path = argv[arg_start + 1 + i];
 		struct stat st;
 
+		if (g_is_tty) {
+			/* Show which file we're reading */
+			const char *bname = strrchr(path, '/');
+			bname = bname ? bname + 1 : path;
+			progress_show("Reading", bname, i + 1, input_count, -1, NULL, NULL);
+		}
+
 		if (lstat(path, &st) != 0) {
+			progress_clear();
 			fprintf(stderr, "error: cannot stat '%s': %s\n", path, strerror(errno));
 			entry_list_free(&list);
 			return 1;
@@ -947,6 +1123,7 @@ static int cmd_add(int argc, char **argv) {
 
 #ifndef _WIN32
 		if (S_ISLNK(st.st_mode)) {
+			progress_clear();
 			fprintf(stderr, "warning: skipping symlink '%s'\n", path);
 			continue;
 		}
@@ -1009,12 +1186,36 @@ static int cmd_add(int argc, char **argv) {
 		return 1;
 	}
 
+	/* Compute total input size for progress/summary */
+	uint64_t total_input = 0;
+	int file_entries = 0;
+	for (int i = 0; i < list.count; i++) {
+		total_input += list.entries[i].data_len;
+		if (!list.entries[i].is_directory) file_entries++;
+	}
+
 	int result = 0;
+	double compress_start = get_time_sec();
+
+	/* Show compression start (TTY only) */
+	if (g_is_tty) {
+		char size_buf[32], method_buf[8];
+		format_bytes(size_buf, sizeof(size_buf), total_input);
+		if (method == 0)
+			snprintf(method_buf, sizeof(method_buf), "store");
+		else
+			snprintf(method_buf, sizeof(method_buf), "m%d", method);
+		fprintf(stderr, "\r  Compressing %d file%s (%s) with %s...    ",
+		        file_entries, file_entries == 1 ? "" : "s",
+		        size_buf, method_buf);
+		fflush(stderr);
+	}
 
 	/* For store mode, use the simpler path with exact size calculation */
 	if (method == 0) {
 		int64_t needed = rarz_calculate_archive_size(list.entries, (uint32_t)list.count);
 		if (needed <= 0) {
+			progress_clear();
 			const char *cerr = rarz_last_error();
 			fprintf(stderr, "error: cannot calculate archive size%s%s\n",
 			        cerr ? ": " : "", cerr ? cerr : "");
@@ -1024,6 +1225,7 @@ static int cmd_add(int argc, char **argv) {
 
 		uint8_t *archive_buf = (uint8_t *)malloc((size_t)needed);
 		if (!archive_buf) {
+			progress_clear();
 			fprintf(stderr, "error: cannot allocate %lld bytes\n", (long long)needed);
 			entry_list_free(&list);
 			return 1;
@@ -1032,6 +1234,7 @@ static int cmd_add(int argc, char **argv) {
 		int64_t written = rarz_create_archive(list.entries, (uint32_t)list.count,
 		                                       archive_buf, (size_t)needed);
 		if (written <= 0) {
+			progress_clear();
 			const char *aerr = rarz_last_error();
 			fprintf(stderr, "error: archive creation failed (code %lld)%s%s\n",
 			        (long long)written,
@@ -1043,6 +1246,7 @@ static int cmd_add(int argc, char **argv) {
 
 		FILE *out = fopen(archive_path, "wb");
 		if (!out) {
+			progress_clear();
 			fprintf(stderr, "error: cannot create '%s': %s\n",
 			        archive_path, strerror(errno));
 			free(archive_buf);
@@ -1055,26 +1259,31 @@ static int cmd_add(int argc, char **argv) {
 		free(archive_buf);
 
 		if (nwritten != (size_t)written) {
+			progress_clear();
 			fprintf(stderr, "error: short write to '%s'\n", archive_path);
 			entry_list_free(&list);
 			return 1;
 		}
 
-		printf("Created %s (%lld bytes, %d file%s, store)\n",
-		       archive_path, (long long)written,
-		       list.count, list.count == 1 ? "" : "s");
+		progress_clear();
+		double elapsed = get_time_sec() - compress_start;
+		char in_buf[32], out_buf2[32], rate_buf[32];
+		format_bytes(in_buf, sizeof(in_buf), total_input);
+		format_bytes(out_buf2, sizeof(out_buf2), (uint64_t)written);
+		format_throughput(rate_buf, sizeof(rate_buf), total_input, elapsed);
+		printf("Created %s (%s -> %s, %d file%s, store, %.2fs, %s)\n",
+		       archive_path, in_buf, out_buf2,
+		       file_entries, file_entries == 1 ? "" : "s",
+		       elapsed, rate_buf);
 	} else {
 		/* Compressed mode: allocate generous buffer (input size + overhead) */
-		uint64_t total_input = 0;
-		for (int i = 0; i < list.count; i++) {
-			total_input += list.entries[i].data_len;
-		}
 		/* Compressed output can be larger than input for incompressible data,
 		 * plus we need space for headers. Use 2x input + 64KB per file. */
 		size_t buf_size = (size_t)(total_input * 2 + (uint64_t)list.count * 65536 + 4096);
 
 		uint8_t *archive_buf = (uint8_t *)malloc(buf_size);
 		if (!archive_buf) {
+			progress_clear();
 			fprintf(stderr, "error: cannot allocate %zu bytes\n", buf_size);
 			entry_list_free(&list);
 			return 1;
@@ -1085,6 +1294,7 @@ static int cmd_add(int argc, char **argv) {
 			archive_buf, buf_size, method);
 
 		if (written <= 0) {
+			progress_clear();
 			const char *cerr2 = rarz_last_error();
 			fprintf(stderr, "error: archive creation failed (code %lld)%s%s\n",
 			        (long long)written,
@@ -1096,6 +1306,7 @@ static int cmd_add(int argc, char **argv) {
 
 		FILE *out = fopen(archive_path, "wb");
 		if (!out) {
+			progress_clear();
 			fprintf(stderr, "error: cannot create '%s': %s\n",
 			        archive_path, strerror(errno));
 			free(archive_buf);
@@ -1108,14 +1319,23 @@ static int cmd_add(int argc, char **argv) {
 		free(archive_buf);
 
 		if (nwritten != (size_t)written) {
+			progress_clear();
 			fprintf(stderr, "error: short write to '%s'\n", archive_path);
 			entry_list_free(&list);
 			return 1;
 		}
 
-		printf("Created %s (%lld bytes, %d file%s, -m%d)\n",
-		       archive_path, (long long)written,
-		       list.count, list.count == 1 ? "" : "s", method);
+		progress_clear();
+		double elapsed = get_time_sec() - compress_start;
+		char in_buf[32], out_buf2[32], rate_buf[32];
+		format_bytes(in_buf, sizeof(in_buf), total_input);
+		format_bytes(out_buf2, sizeof(out_buf2), (uint64_t)written);
+		format_throughput(rate_buf, sizeof(rate_buf), total_input, elapsed);
+		int ratio = total_input > 0 ? (int)(((uint64_t)written * 100) / total_input) : 100;
+		printf("Created %s (%s -> %s, %d%%, %d file%s, -m%d, %.2fs, %s)\n",
+		       archive_path, in_buf, out_buf2, ratio,
+		       file_entries, file_entries == 1 ? "" : "s",
+		       method, elapsed, rate_buf);
 	}
 
 	entry_list_free(&list);
@@ -1127,6 +1347,8 @@ static int cmd_add(int argc, char **argv) {
 /* ========================================================================== */
 
 int main(int argc, char **argv) {
+	g_is_tty = isatty(fileno(stderr));
+
 #ifndef NDEBUG
 	fprintf(stderr, "\033[33mDEBUG BUILD\033[0m\n");
 #endif

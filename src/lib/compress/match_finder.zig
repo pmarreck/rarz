@@ -70,14 +70,14 @@ pub const MatchFinder = struct {
         self.allocator.free(self.chain);
     }
 
-    /// Compute 3-byte hash at position `pos` in `data`.
+    /// Compute 3-byte multiplicative hash at position `pos` in `data`.
+    /// Uses FNV-style constant for good bit dispersion across the hash table.
     fn hash3(data: []const u8, pos: usize) u32 {
         if (pos + 2 >= data.len) return 0;
-        const b0: u32 = data[pos];
-        const b1: u32 = data[pos + 1];
-        const b2: u32 = data[pos + 2];
-        // Simple multiplicative hash
-        return ((b0 << 10) ^ (b1 << 5) ^ b2) & HASH_MASK;
+        const v: u32 = @as(u32, data[pos]) |
+            (@as(u32, data[pos + 1]) << 8) |
+            (@as(u32, data[pos + 2]) << 16);
+        return (v *% 0x56A3B17D) >> @as(u5, 32 - @as(u6, HASH_BITS));
     }
 
     /// Insert position into the hash chain.
@@ -85,6 +85,28 @@ pub const MatchFinder = struct {
         const h = hash3(data, pos);
         self.chain[pos & self.chain_mask] = self.hash_table[h];
         self.hash_table[h] = pos;
+    }
+
+    /// Compare bytes at positions `a` and `b` in `data`, starting from `start`.
+    /// Uses u64 fast path (8 bytes at a time via XOR + CTZ) with byte-by-byte tail.
+    /// Returns total matching length.
+    fn extendMatch(data: []const u8, a: usize, b: usize, start: u32, max_len: u32) u32 {
+        var common = start;
+        // u64 fast path: compare 8 bytes at a time
+        while (common + 8 <= max_len) {
+            const va = std.mem.readInt(u64, @as(*const [8]u8, @ptrCast(data.ptr + a + common)), .little);
+            const vb = std.mem.readInt(u64, @as(*const [8]u8, @ptrCast(data.ptr + b + common)), .little);
+            const diff = va ^ vb;
+            if (diff != 0) {
+                return common + @as(u32, @intCast(@ctz(diff) >> 3));
+            }
+            common += 8;
+        }
+        // Byte-by-byte tail
+        while (common < max_len and data[a + common] == data[b + common]) {
+            common += 1;
+        }
+        return common;
     }
 
     /// Find the longest match at `pos` in `data`.
@@ -112,14 +134,11 @@ pub const MatchFinder = struct {
                 }
             }
 
-            // Compare bytes
-            var len: u32 = 0;
+            // Compare bytes using u64 fast path
             const max_len = @min(self.max_match, @as(u32, @intCast(data.len - pos)));
             const max_src = @min(max_len, @as(u32, @intCast(data.len - chain_pos)));
             const limit = @min(max_len, max_src);
-            while (len < limit and data[chain_pos + len] == data[pos + len]) {
-                len += 1;
-            }
+            const len = extendMatch(data, chain_pos, pos, 0, limit);
 
             if (len > best_len) {
                 best_len = len;
@@ -204,6 +223,27 @@ pub const MatchFinder = struct {
 
 const testing = std.testing;
 const lz = @import("../decompress/lz.zig");
+
+test "extendMatch: u64 fast-path correctness" {
+    // Identical slices: full match
+    const data = "ABCDEFGHIJKLMNOPABCDEFGHIJKLMNOP";
+    try testing.expectEqual(@as(u32, 16), MatchFinder.extendMatch(data, 0, 16, 0, 16));
+
+    // Differ at byte 5
+    const data2 = "ABCDEfghijABCDExghij";
+    try testing.expectEqual(@as(u32, 5), MatchFinder.extendMatch(data2, 0, 10, 0, 10));
+
+    // Differ at byte 0
+    try testing.expectEqual(@as(u32, 0), MatchFinder.extendMatch("AB", 0, 1, 0, 1));
+
+    // Long match crossing u64 boundary (>8 bytes)
+    const long = "0123456789ABCDEF0123456789ABCDEFxx";
+    try testing.expectEqual(@as(u32, 16), MatchFinder.extendMatch(long, 0, 16, 0, 18));
+
+    // Start from nonzero offset (positions 0 and 7 share "HELLO" starting at offset 2)
+    const data3 = "xxHELLOyyHELLO";
+    try testing.expectEqual(@as(u32, 7), MatchFinder.extendMatch(data3, 0, 7, 2, 7));
+}
 
 test "compress all-literal data (random)" {
     var mf = try MatchFinder.init(testing.allocator, 4096, 3);

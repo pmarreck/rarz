@@ -4,14 +4,18 @@ set -euo pipefail
 # =============================================================================
 # rarz Benchmark Suite
 # Compares rarz vs official rar/unrar on:
-#   - Extraction speed (decompression)
 #   - Compression ratio (archive size vs original)
-#   - Archive creation speed (store mode only for rarz, compressed for rar)
+#   - Compression speed (archive creation)
+#   - Extraction speed (decompression)
+#   - Validation speed (rarz t)
+#
+# Uses hyperfine for all timing measurements.
 # =============================================================================
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 RARZ="$PROJECT_ROOT/zig-out/bin/rarz"
-ITERATIONS=${BENCHMARK_ITERATIONS:-5}  # number of timing iterations
+WARMUP=${BENCHMARK_WARMUP:-1}
+RUNS=${BENCHMARK_RUNS:-5}
 
 # Ensure tools exist
 if [ ! -x "$RARZ" ]; then
@@ -20,8 +24,9 @@ if [ ! -x "$RARZ" ]; then
 	exit 1
 fi
 
-command -v rar >/dev/null 2>&1 || { echo "ERROR: rar not found"; exit 1; }
-command -v unrar >/dev/null 2>&1 || { echo "ERROR: unrar not found"; exit 1; }
+for tool in rar unrar hyperfine; do
+	command -v "$tool" >/dev/null 2>&1 || { echo "ERROR: $tool not found"; exit 1; }
+done
 
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT
@@ -61,47 +66,42 @@ file_count=$(find "$tmpdir/corpus" -type f | wc -l | tr -d ' ')
 echo "Corpus: ${file_count} files, ${corpus_size}KB total"
 echo ""
 
-# =============================================================================
-# Helper: precise timing (uses 'gdate' on macOS if available, falls back to bash)
-# =============================================================================
-
-time_cmd() {
-	local cmd="$1"
-	local start end elapsed
-
-	# Use perl for sub-second precision (available on macOS + Linux)
-	start=$(perl -MTime::HiRes=time -e 'printf "%.6f\n", time')
-	eval "$cmd" >/dev/null 2>&1
-	end=$(perl -MTime::HiRes=time -e 'printf "%.6f\n", time')
-
-	elapsed=$(perl -e "printf '%.3f', $end - $start")
-	echo "$elapsed"
+# Helper: human-readable file size
+human_size() {
+	local bytes=$1
+	if [ "$bytes" -ge 1048576 ]; then
+		awk "BEGIN { printf \"%.1fM\", $bytes / 1048576 }"
+	elif [ "$bytes" -ge 1024 ]; then
+		awk "BEGIN { printf \"%.0fK\", $bytes / 1024 }"
+	else
+		echo "${bytes}B"
+	fi
 }
 
-# Run N iterations and return the median time
-median_time() {
-	local cmd="$1"
-	local n="$2"
-	local times=()
-
-	for ((i=1; i<=n; i++)); do
-		t=$(time_cmd "$cmd")
-		times+=("$t")
-	done
-
-	# Sort and pick median
-	printf '%s\n' "${times[@]}" | sort -n | awk -v n="$n" 'NR==int(n/2)+1{print}'
+# Helper: get file size portably
+file_size() {
+	stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null
 }
+
+# Collect corpus file list for rarz
+corpus_files=(
+	"$tmpdir/corpus/text_200k.txt"
+	"$tmpdir/corpus/code_150k.c"
+	"$tmpdir/corpus/random_256k.bin"
+	"$tmpdir/corpus/large_2m.txt"
+	"$tmpdir/corpus/dup1.txt"
+	"$tmpdir/corpus/dup2.txt"
+)
 
 # =============================================================================
 # Section 1: Compression ratio comparison
 # =============================================================================
 
-echo "╔══════════════════════════════════════════════════════════════════════╗"
-echo "║                    COMPRESSION RATIO COMPARISON                     ║"
-echo "╠══════════════════════════════════════════════════════════════════════╣"
-printf "║ %-10s │ %8s │ %8s │ %8s │ %8s │ %7s ║\n" "Level" "Original" "rar" "rarz" "rar %" "rarz %"
-echo "╠══════════════════════════════════════════════════════════════════════╣"
+echo "=================================================================="
+echo "  COMPRESSION RATIO COMPARISON"
+echo "=================================================================="
+printf "%-12s  %10s  %10s  %10s  %8s  %8s\n" "Level" "Original" "rar" "rarz" "rar %" "rarz %"
+echo "------------------------------------------------------------------"
 
 cd "$tmpdir/corpus"
 original_size=$(du -sb . 2>/dev/null | cut -f1 || du -sk . | awk '{print $1*1024}')
@@ -110,169 +110,129 @@ for level in 0 1 2 3 4 5; do
 	# Compress with official rar
 	rar_archive="$tmpdir/rar_m${level}.rar"
 	rar a -m${level} -r "$rar_archive" . >/dev/null 2>&1
-	rar_size=$(stat -f%z "$rar_archive" 2>/dev/null || stat -c%s "$rar_archive" 2>/dev/null)
-	rar_pct=$(perl -e "printf '%.1f', ($rar_size / $original_size) * 100")
+	rar_size=$(file_size "$rar_archive")
+	rar_pct=$(awk "BEGIN { printf \"%.1f\", ($rar_size / $original_size) * 100 }")
 
-	# rarz only does store (m0) currently
-	if [ "$level" -eq 0 ]; then
-		rarz_archive="$tmpdir/rarz_store.rar"
-		cd "$PROJECT_ROOT"
-		# Create individual file archives isn't great — use the API
-		# For now, create a single-file store archive
-		"$RARZ" a "$rarz_archive" "$tmpdir/corpus/text_200k.txt" "$tmpdir/corpus/code_150k.c" "$tmpdir/corpus/random_256k.bin" >/dev/null 2>&1 || true
-		if [ -f "$rarz_archive" ]; then
-			rarz_size=$(stat -f%z "$rarz_archive" 2>/dev/null || stat -c%s "$rarz_archive" 2>/dev/null)
-			rarz_pct=$(perl -e "printf '%.1f', ($rarz_size / $original_size) * 100")
-		else
-			rarz_size="N/A"
-			rarz_pct="N/A"
-		fi
-		cd "$tmpdir/corpus"
+	# Compress with rarz
+	rarz_archive="$tmpdir/rarz_m${level}.rar"
+	cd "$PROJECT_ROOT"
+	"$RARZ" a -m${level} "$rarz_archive" "${corpus_files[@]}" >/dev/null 2>&1 || true
+	cd "$tmpdir/corpus"
 
-		printf "║ %-10s │ %7sB │ %7sB │ %7sB │ %7s%% │ %6s%% ║\n" \
-			"Store (m0)" \
-			"$(numfmt --to=iec-i $original_size 2>/dev/null || echo $original_size)" \
-			"$(numfmt --to=iec-i $rar_size 2>/dev/null || echo $rar_size)" \
-			"$(if [ "$rarz_size" = "N/A" ]; then echo "N/A"; else numfmt --to=iec-i $rarz_size 2>/dev/null || echo $rarz_size; fi)" \
-			"$rar_pct" \
-			"$rarz_pct"
+	if [ -f "$rarz_archive" ]; then
+		rarz_size=$(file_size "$rarz_archive")
+		rarz_pct=$(awk "BEGIN { printf \"%.1f\", ($rarz_size / $original_size) * 100 }")
 	else
-		printf "║ %-10s │ %7sB │ %7sB │ %8s │ %7s%% │ %7s ║\n" \
-			"m${level}" \
-			"$(numfmt --to=iec-i $original_size 2>/dev/null || echo $original_size)" \
-			"$(numfmt --to=iec-i $rar_size 2>/dev/null || echo $rar_size)" \
-			"--" \
-			"$rar_pct" \
-			"--"
+		rarz_size="N/A"
+		rarz_pct="N/A"
 	fi
+
+	label="m${level}"
+	[ "$level" -eq 0 ] && label="Store (m0)"
+
+	printf "%-12s  %10s  %10s  %10s  %7s%%  %7s%%\n" \
+		"$label" \
+		"$(human_size "$original_size")" \
+		"$(human_size "$rar_size")" \
+		"$(if [ "$rarz_size" = "N/A" ]; then echo "N/A"; else human_size "$rarz_size"; fi)" \
+		"$rar_pct" \
+		"$rarz_pct"
 done
 
-echo "╚══════════════════════════════════════════════════════════════════════╝"
-echo ""
-echo "(rarz currently only supports store/m0 for creation; compression TBD)"
 echo ""
 
 # =============================================================================
-# Section 2: Extraction speed comparison
+# Section 2: Compression speed comparison (hyperfine)
 # =============================================================================
 
-echo "╔══════════════════════════════════════════════════════════════════════╗"
-echo "║                    EXTRACTION SPEED COMPARISON                      ║"
-echo "║                    (median of $ITERATIONS iterations)                            ║"
-echo "╠══════════════════════════════════════════════════════════════════════╣"
-printf "║ %-22s │ %10s │ %10s │ %10s ║\n" "Archive" "unrar" "rarz" "Speedup"
-echo "╠══════════════════════════════════════════════════════════════════════╣"
+echo "=================================================================="
+echo "  COMPRESSION SPEED: rar vs rarz"
+echo "=================================================================="
+echo ""
 
 cd "$PROJECT_ROOT"
 
 for level in 0 1 3 5; do
-	archive="$tmpdir/rar_m${level}.rar"
-	[ -f "$archive" ] || continue
-
-	label="m${level}"
-	archive_size=$(stat -f%z "$archive" 2>/dev/null || stat -c%s "$archive" 2>/dev/null)
-	label="${label} ($(numfmt --to=iec-i $archive_size 2>/dev/null || echo ${archive_size}B))"
-
-	# Time unrar extraction
-	unrar_time=$(median_time "unrar x -o+ '$archive' '$tmpdir/bench_unrar/'" "$ITERATIONS")
-	rm -rf "$tmpdir/bench_unrar"
-
-	# Time rarz extraction
-	rarz_time=$(median_time "'$RARZ' x '$archive' '$tmpdir/bench_rarz'" "$ITERATIONS")
-	rm -rf "$tmpdir/bench_rarz"
-
-	# Calculate speedup
-	speedup=$(perl -e "
-		my \$u = $unrar_time;
-		my \$r = $rarz_time;
-		if (\$r > 0 && \$u > 0) {
-			my \$s = \$u / \$r;
-			printf '%.2fx', \$s;
-		} else {
-			print 'N/A';
-		}
-	")
-
-	printf "║ %-22s │ %8ss │ %8ss │ %10s ║\n" "$label" "$unrar_time" "$rarz_time" "$speedup"
-	rm -rf "$tmpdir/bench_unrar" "$tmpdir/bench_rarz"
+	echo "--- m${level} ---"
+	hyperfine \
+		--warmup "$WARMUP" \
+		--runs "$RUNS" \
+		--cleanup "rm -f '$tmpdir/bench_rar.rar' '$tmpdir/bench_rarz.rar'" \
+		--command-name "rar -m${level}" \
+		"cd '$tmpdir/corpus' && rar a -m${level} -r '$tmpdir/bench_rar.rar' ." \
+		--command-name "rarz -m${level}" \
+		"'$RARZ' a -m${level} '$tmpdir/bench_rarz.rar' ${corpus_files[*]}"
+	rm -f "$tmpdir/bench_rar.rar" "$tmpdir/bench_rarz.rar"
+	echo ""
 done
 
-echo "╚══════════════════════════════════════════════════════════════════════╝"
+# =============================================================================
+# Section 3: Extraction speed comparison (hyperfine)
+# =============================================================================
+
+echo "=================================================================="
+echo "  EXTRACTION SPEED: unrar vs rarz"
+echo "=================================================================="
 echo ""
-
-# =============================================================================
-# Section 3: Per-file-type extraction analysis
-# =============================================================================
-
-echo "╔══════════════════════════════════════════════════════════════════════╗"
-echo "║                  PER-FILE EXTRACTION ANALYSIS (m3)                  ║"
-echo "╠══════════════════════════════════════════════════════════════════════╣"
-printf "║ %-20s │ %8s │ %8s │ %6s │ %10s ║\n" "File" "Original" "Packed" "Ratio" "Type"
-echo "╠══════════════════════════════════════════════════════════════════════╣"
-
-m3_archive="$tmpdir/rar_m3.rar"
-if [ -f "$m3_archive" ]; then
-	# Use rarz verbose list
-	"$RARZ" v "$m3_archive" 2>/dev/null | tail -n +3 | head -n -2 | while IFS= read -r line; do
-		# Parse the verbose listing format
-		unpacked=$(echo "$line" | awk '{print $1}')
-		packed=$(echo "$line" | awk '{print $2}')
-		ratio=$(echo "$line" | awk '{print $3}')
-		name=$(echo "$line" | awk '{print $NF}')
-
-		[ "$unpacked" = "--------" ] && continue
-		[ -z "$name" ] && continue
-
-		# Determine type
-		case "$name" in
-			*.txt) type="Text" ;;
-			*.c)   type="Source" ;;
-			*.bin) type="Binary" ;;
-			*)     type="Other" ;;
-		esac
-
-		printf "║ %-20s │ %7sB │ %7sB │ %5s │ %10s ║\n" \
-			"$(echo "$name" | head -c 20)" "$unpacked" "$packed" "$ratio" "$type"
-	done
-fi
-
-echo "╚══════════════════════════════════════════════════════════════════════╝"
-echo ""
-
-# =============================================================================
-# Section 4: Validation speed
-# =============================================================================
-
-echo "╔══════════════════════════════════════════════════════════════════════╗"
-echo "║                    VALIDATION SPEED (rarz t)                        ║"
-echo "║                    (median of $ITERATIONS iterations)                            ║"
-echo "╠══════════════════════════════════════════════════════════════════════╣"
-printf "║ %-30s │ %10s │ %10s ║\n" "Archive" "Time" "Throughput"
-echo "╠══════════════════════════════════════════════════════════════════════╣"
 
 for level in 0 1 3 5; do
 	archive="$tmpdir/rar_m${level}.rar"
 	[ -f "$archive" ] || continue
-	archive_size=$(stat -f%z "$archive" 2>/dev/null || stat -c%s "$archive" 2>/dev/null)
 
-	t=$(median_time "'$RARZ' t '$archive'" "$ITERATIONS")
-
-	throughput=$(perl -e "
-		my \$size = $archive_size;
-		my \$time = $t;
-		if (\$time > 0) {
-			my \$mbps = (\$size / 1048576) / \$time;
-			printf '%.1f MB/s', \$mbps;
-		} else {
-			print 'N/A';
-		}
-	")
-
-	label="m${level} ($(numfmt --to=iec-i $archive_size 2>/dev/null || echo ${archive_size}B))"
-	printf "║ %-30s │ %8ss │ %10s ║\n" "$label" "$t" "$throughput"
+	archive_size=$(file_size "$archive")
+	echo "--- m${level} ($(human_size "$archive_size")) ---"
+	hyperfine \
+		--warmup "$WARMUP" \
+		--runs "$RUNS" \
+		--prepare "rm -rf '$tmpdir/bench_extract'" \
+		--command-name "unrar m${level}" \
+		"unrar x -o+ '$archive' '$tmpdir/bench_extract/'" \
+		--command-name "rarz m${level}" \
+		"'$RARZ' x '$archive' '$tmpdir/bench_extract'"
+	rm -rf "$tmpdir/bench_extract"
+	echo ""
 done
 
-echo "╚══════════════════════════════════════════════════════════════════════╝"
+# =============================================================================
+# Section 4: Per-file extraction analysis
+# =============================================================================
+
+echo "=================================================================="
+echo "  PER-FILE ANALYSIS (rar m3 archive)"
+echo "=================================================================="
+
+m3_archive="$tmpdir/rar_m3.rar"
+if [ -f "$m3_archive" ]; then
+	"$RARZ" v "$m3_archive" 2>/dev/null || true
+fi
+echo ""
+
+# =============================================================================
+# Section 5: Validation speed (hyperfine)
+# =============================================================================
+
+echo "=================================================================="
+echo "  VALIDATION SPEED: rarz t"
+echo "=================================================================="
+echo ""
+
+# Build command list for a single hyperfine invocation
+hf_args=(--warmup "$WARMUP" --runs "$RUNS")
+has_archives=false
+
+for level in 0 1 3 5; do
+	archive="$tmpdir/rar_m${level}.rar"
+	[ -f "$archive" ] || continue
+	archive_size=$(file_size "$archive")
+	hf_args+=(--command-name "m${level} ($(human_size "$archive_size"))")
+	hf_args+=("'$RARZ' t '$archive'")
+	has_archives=true
+done
+
+if [ "$has_archives" = true ]; then
+	hyperfine "${hf_args[@]}"
+fi
+
 echo ""
 
 # =============================================================================
@@ -282,7 +242,7 @@ echo ""
 echo "Benchmark complete."
 echo ""
 echo "Notes:"
-echo "  - rarz currently supports store (m0) for archive creation"
+echo "  - rarz supports store (m0) and compression (m1-m5) for archive creation"
 echo "  - Extraction supports all compression levels (m0-m5)"
-echo "  - All extractions verified byte-for-byte against unrar"
-echo "  - Speedup >1.0x means rarz is faster than unrar"
+echo "  - All archives verified against unrar for correctness"
+echo "  - Runs: $RUNS, Warmup: $WARMUP (override with BENCHMARK_RUNS / BENCHMARK_WARMUP)"

@@ -1902,6 +1902,43 @@ test "rarz_file_info sets error on null handle" {
 }
 
 // ============================================================================
+// Compression of large/incompressible data (regression: segfault > ~10KB)
+// ============================================================================
+
+test "rarz_create_archive_compressed handles 50KB random data without crashing" {
+	// Reproduces segfault: compressing incompressible data > ~10KB
+	const alloc = std.heap.page_allocator;
+	const data_size: usize = 50 * 1024;
+	const data = try alloc.alloc(u8, data_size);
+	defer alloc.free(data);
+
+	// Fill with pseudo-random data (incompressible)
+	var prng = std.Random.DefaultPrng.init(0xDEADBEEF);
+	const random = prng.random();
+	for (data) |*b| b.* = random.int(u8);
+
+	const c_entries = [_]RarzCreateFileEntry{.{
+		.name = "random.bin",
+		.name_len = 10,
+		.data = data.ptr,
+		.data_len = data_size,
+		.mtime = 0,
+		.is_directory = 0,
+		.host_os = 0,
+		.attributes = 0,
+	}};
+
+	// Generous output buffer: 2x input + overhead
+	const out_size = data_size * 2 + 65536;
+	const out_buf = try alloc.alloc(u8, out_size);
+	defer alloc.free(out_buf);
+
+	const result = rarz_create_archive_compressed(&c_entries, 1, out_buf.ptr, out_size, 3);
+	// Must not crash. Should succeed or return a clean error code.
+	try testing.expect(result > 0 or result == -2 or result == -3);
+}
+
+// ============================================================================
 // Corruption robustness tests (must never crash/abort)
 // ============================================================================
 

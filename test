@@ -5,16 +5,21 @@ errors=0
 
 echo "=== Zig unit tests ==="
 if ! nix develop -c zig build test; then
-    ((errors++))
+    ((errors += 1))
 fi
 
 if [ -d tests/cli ]; then
+    echo "=== Build CLI for CLI tests ==="
+    if ! nix develop -c zig build; then
+        ((errors += 1))
+    fi
+
     echo "=== CLI tests ==="
     for t in tests/cli/test_*.sh; do
         [ -f "$t" ] || continue
         echo "  running $t"
         if ! bash "$t"; then
-            ((errors++))
+            ((errors += 1))
         fi
     done
 fi

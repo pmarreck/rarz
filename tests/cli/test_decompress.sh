@@ -8,12 +8,12 @@ pass=0
 
 fail() {
 	echo "  FAIL: $1"
-	((errors++))
+	((errors += 1))
 }
 
 ok() {
 	echo "  OK: $1"
-	((pass++))
+	((pass += 1))
 }
 
 # Ensure fixtures exist
@@ -162,7 +162,7 @@ for f in "$FIXTURES"/rar5_m3.rar; do
 		printf '\xFF' | dd of="$corrupt_file" bs=1 seek="$offset" count=1 conv=notrunc 2>/dev/null
 
 		if ! "$RARZ" t "$corrupt_file" >/dev/null 2>&1; then
-			((detected++))
+			((detected += 1))
 		fi
 
 		rm -f "$corrupt_file"

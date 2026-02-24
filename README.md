@@ -9,9 +9,9 @@ Written in Zig with a C FFI and drop-in C CLI.
 
 ## Status
 
-**Decompression** — extracts RAR5 archives at all compression levels (m0-m5), plus legacy RAR 1.5-4.x store-method extraction. Verified byte-perfect against unrar 7.20.
+**Decompression** — extracts RAR5 archives at all compression levels (m0-m5), plus legacy RAR 1.5-4.x store-method extraction. Verified byte-perfect against independent reference extraction tooling.
 
-**Compression** — creates RAR5 archives with LZ77 + Huffman compression at levels m0 (store) through m5 (best). Output is extractable by both rarz and unrar.
+**Compression** — creates RAR5 archives with LZ77 + Huffman compression at levels m0 (store) through m5 (best). Output is extractable by rarz and mainstream RAR extractors.
 
 **Parsing & validation** — full structural parsing and multi-depth validation for RAR 1.4, RAR 1.5-4.x, and RAR5+ archives.
 
@@ -38,7 +38,7 @@ zig build run -- help  # run CLI
 ### With Nix
 
 ```sh
-nix develop            # enter dev shell with zig, rar, unrar
+nix develop            # enter dev shell with zig + reference RAR tools
 zig build
 ```
 

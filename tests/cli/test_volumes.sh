@@ -116,6 +116,23 @@ for f in hello.txt medium.txt large.txt random.bin binary.bin; do
 done
 
 # ============================================================================
+# Test 3b: Explicit volume inspection command
+# ============================================================================
+echo "=== Test 3b: Volume inspection command ==="
+
+vol_output=$("$RARZ" vol "$FIXTURES/rar5_vol_store.part1.rar" 2>&1) || fail "rarz vol failed on vol_store"
+if echo "$vol_output" | grep -q "Volumes: 6"; then
+	pass "vol command: reports volume count"
+else
+	fail "vol command: missing expected volume count"
+fi
+if echo "$vol_output" | grep -q "part1.rar" && echo "$vol_output" | grep -q "part6.rar"; then
+	pass "vol command: lists first/last volume"
+else
+	fail "vol command: does not list full volume set"
+fi
+
+# ============================================================================
 # Test 4: Multi-volume test validates all volumes
 # ============================================================================
 echo "=== Test 4: Multi-volume test ==="

@@ -1,5 +1,9 @@
 # Code Minimap
 
+## Recent Maintenance
+- 2026-02-22: Adjusted implementation-facing wording to reference format behavior/spec mappings instead of upstream internal symbol names in `src/lib/decompress/huffman.zig`, `src/lib/decompress/unpack50.zig`, and `README.md`.
+- 2026-02-22: CLI command surface now disambiguates volume inspection via explicit `vol|volumes` in `src/cli/main.c`, while preserving `v|list-verbose` as verbose listing aliases; `./test` now runs `zig build` before CLI scripts to avoid stale binary mismatches.
+
 ## Source: `src/lib/`
 
 ### `root.zig`

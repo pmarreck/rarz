@@ -23,6 +23,7 @@ typedef enum {
 	CMD_HELP,
 	CMD_TEST,
 	CMD_LIST,
+	CMD_VOLUMES,
 	CMD_EXTRACT,
 	CMD_ADD,
 } Command;
@@ -30,7 +31,9 @@ typedef enum {
 static Command parse_command(const char *arg) {
 	if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) return CMD_HELP;
 	if (strcmp(arg, "t") == 0 || strcmp(arg, "test") == 0) return CMD_TEST;
-	if (strcmp(arg, "l") == 0 || strcmp(arg, "list") == 0) return CMD_LIST;
+	if (strcmp(arg, "l") == 0 || strcmp(arg, "list") == 0 ||
+	    strcmp(arg, "v") == 0 || strcmp(arg, "list-verbose") == 0) return CMD_LIST;
+	if (strcmp(arg, "vol") == 0 || strcmp(arg, "volumes") == 0) return CMD_VOLUMES;
 	if (strcmp(arg, "x") == 0 || strcmp(arg, "extract") == 0) return CMD_EXTRACT;
 	if (strcmp(arg, "a") == 0 || strcmp(arg, "add") == 0) return CMD_ADD;
 	return CMD_UNKNOWN;
@@ -45,7 +48,9 @@ static void print_usage(void) {
 	printf("RAR format and original/primary implementation by Alexander Roshal\n\n");
 	printf("Usage:\n");
 	printf("  rarz t|test <archive>            Test archive integrity\n");
-	printf("  rarz l|list <archive>            List archive contents\n");
+	printf("  rarz l|list|v|list-verbose <archive>\n");
+	printf("                                   List archive contents\n");
+	printf("  rarz vol|volumes <archive>       Show detected archive volume set\n");
 	printf("  rarz x|extract <archive> [dest]  Extract with full paths\n");
 	printf("  rarz a|add [-m0..-m5] <archive> <files...>\n");
 	printf("                                   Add files to archive\n");
@@ -454,6 +459,27 @@ static int cmd_test(const char *path) {
 	printf("Validation: %s\n", all_valid ? "VALID" : "INVALID");
 	free_volume_set(&vs);
 	return all_valid ? 0 : 1;
+}
+
+/* ========================================================================== */
+/* cmd_volumes                                                                */
+/* ========================================================================== */
+
+static int cmd_volumes(const char *path) {
+	volume_set vs = discover_volumes(path);
+	if (vs.count == 0) {
+		fprintf(stderr, "error: cannot discover volumes for '%s'\n", path);
+		return 1;
+	}
+
+	printf("Archive: %s\n", path);
+	printf("Volumes: %d\n", vs.count);
+	for (int i = 0; i < vs.count; i++) {
+		printf("  %2d: %s\n", i + 1, vs.paths[i]);
+	}
+
+	free_volume_set(&vs);
+	return 0;
 }
 
 /* ========================================================================== */
@@ -878,6 +904,13 @@ int main(int argc, char **argv) {
 			return 1;
 		}
 		return cmd_list(argv[2]);
+
+	case CMD_VOLUMES:
+		if (argc < 3) {
+			fprintf(stderr, "error: 'volumes' requires an archive path\n");
+			return 1;
+		}
+		return cmd_volumes(argv[2]);
 
 	case CMD_EXTRACT:
 		if (argc < 3) {

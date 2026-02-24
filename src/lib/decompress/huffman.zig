@@ -2,7 +2,7 @@ const std = @import("std");
 const BitReader = @import("bitreader.zig").BitReader;
 
 pub const MAX_CODE_LENGTH: u5 = 15;
-pub const MAX_QUICK_BITS: u5 = 9; // matches unRAR's MAX_QUICK_DECODE_BITS
+pub const MAX_QUICK_BITS: u5 = 9; // quick-decode width for large RAR alphabets
 pub const QUICK_TABLE_SIZE: usize = 1 << MAX_QUICK_BITS; // 512
 
 pub const DecodeTable = struct {
@@ -25,7 +25,7 @@ pub const DecodeTable = struct {
     /// Number of symbols in the alphabet.
     max_num: u16 = 0,
 
-    /// Number of bits used for quick decode (matches unRAR's QuickBits).
+    /// Number of bits used for quick decode.
     /// 9 for large alphabets (NC=306, NC20=298, NC30=299), 6 for smaller ones.
     quick_bits: u5 = MAX_QUICK_BITS,
 
@@ -39,8 +39,8 @@ pub const DecodeTable = struct {
 };
 
 /// Build Huffman decode tables from code-length array using range-based boundaries.
-/// This matches unRAR's MakeDecodeTables approach: instead of computing canonical codes
-/// and matching them exactly, it builds left-aligned 16-bit range boundaries. This
+/// Instead of computing canonical codes and matching them exactly, it builds
+/// left-aligned 16-bit range boundaries. This
 /// correctly handles over-committed Huffman tables (Kraft sum > 1.0) that appear in
 /// real RAR archives.
 ///
@@ -66,7 +66,9 @@ pub fn makeDecodeTables(
     // decode_len[L] = upper boundary for all codes of length <= L, left-aligned to 16 bits.
     // Formula: decode_len[L] = sum_{k=1}^{L} len_count[k] << (16 - k)
     //
-    // This is equivalent to unRAR's: M = 2*(M + LenCount[I]); DecodeLen[I] = M << (15-I)
+    // Equivalent recurrence:
+    //   M = 2 * (M + LenCount[I])
+    //   DecodeLen[I] = M << (15 - I)
     // For well-formed trees, decode_len[max_used] = 0x10000 (exactly fills the code space).
     // For over-committed trees (Kraft > 1.0), it may exceed 0x10000, which is fine in u32.
     table.decode_len[0] = 0;
@@ -103,7 +105,7 @@ pub fn makeDecodeTables(
         }
     }
 
-    // Set quick_bits based on alphabet size (matches unRAR):
+    // Set quick_bits based on alphabet size:
     // NC (306), NC20 (298), NC30 (299) -> MAX_QUICK_BITS (9)
     // All others -> MAX_QUICK_BITS - 3 (6)
     const size = code_lengths.len;
@@ -117,7 +119,7 @@ pub fn makeDecodeTables(
     // Step 4: Build quick-path lookup table.
     // For each possible quick_bits-wide value, left-align to 16 bits and find
     // which length bucket it falls into using the range boundaries.
-    // Uses monotonic CurBitLength optimization matching unRAR.
+    // Uses a monotonic current-bit-length optimization.
     const quick_data_size: usize = @as(usize, 1) << table.quick_bits;
     var cur_bit_length: usize = 1;
     for (0..quick_data_size) |quick_val| {
@@ -147,7 +149,7 @@ pub fn makeDecodeTables(
 }
 
 /// Decode one symbol from the bitstream using the given table.
-/// Uses range-comparison decoding matching unRAR's DecodeNumber approach:
+/// Uses range-comparison decoding:
 /// peek 16 bits, left-align to 16-bit field, compare against decode_len boundaries
 /// to find the code length, then compute the symbol index.
 pub fn decodeNumber(br: *BitReader, table: *const DecodeTable) !u16 {
@@ -165,7 +167,7 @@ pub fn decodeNumber(br: *BitReader, table: *const DecodeTable) !u16 {
         peeked;
 
     // Quick table check: if the value falls within the quick_bits boundary
-    // (matching unRAR: BitField < DecodeLen[QuickBits])
+    // Fast-path condition: bit_field < decode_len[quick_bits]
     const qb = table.quick_bits;
     if (bit_field < table.decode_len[qb]) {
         const quick_idx: u32 = bit_field >> @intCast(16 - qb);
@@ -177,7 +179,7 @@ pub fn decodeNumber(br: *BitReader, table: *const DecodeTable) !u16 {
     }
 
     // Slow path: find the correct code length by scanning range boundaries.
-    // Matches unRAR: scan from QuickBits+1 to 14, default to 15.
+    // Scan from quick_bits+1 to 14; default to 15.
     var bits: u5 = MAX_CODE_LENGTH;
     {
         var len: usize = @as(usize, qb) + 1;
@@ -201,7 +203,7 @@ pub fn decodeNumber(br: *BitReader, table: *const DecodeTable) !u16 {
     var n: u32 = table.decode_pos[bits] +
         ((bit_field -| prev_boundary) >> @intCast(16 - bits));
 
-    // Overflow protection (matches unRAR's N >= MaxNum check)
+    // Overflow protection for out-of-range symbol positions.
     if (n >= table.max_num or n >= table.decode_num.len) {
         n = 0;
     }

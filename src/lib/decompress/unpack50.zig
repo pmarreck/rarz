@@ -39,7 +39,7 @@ const MAX_TOTAL_SYMBOLS: usize = NC + DC_RAR7 + LDC + RC;
 const SlotEntry = struct { base: u32, extra: u5 };
 
 /// Length decoding table: slot -> (base_length, extra_bits).
-/// Matches unRAR's SlotToLength exactly:
+/// Follows the RAR5 slot-to-length mapping:
 ///   Slots 0-7: length = 2 + slot, no extra bits.
 ///   Slots 8+:  LBits = slot/4 - 1, base = 2 + (4 | (slot & 3)) << LBits
 /// Extra bits increase every 4 slots (not every 2).
@@ -198,7 +198,7 @@ pub fn readTables(state: *Unpack50State) !void {
     if (!cl_table.valid) return error.InvalidTable;
 
     // Stage 2: Decode actual code lengths for the full alphabet
-    // RAR5 code-length symbols (from unRAR ReadTables50):
+    // RAR5 code-length symbols:
     //   0-15: direct code length (no delta encoding in RAR5)
     //   16:   repeat previous length, 3 + readBits(3) = 3-10 times
     //   17:   repeat previous length, 11 + readBits(7) = 11-138 times
@@ -337,7 +337,7 @@ fn readFilterSize(br: *BitReader) !usize {
 
 /// Read and decode one block of compressed data. Returns true if more blocks follow.
 ///
-/// RAR5 block header format (from unRAR ReadBlockHeader):
+/// RAR5 block header format:
 ///   1. Byte-align the bit reader
 ///   2. Read 8-bit flags byte:
 ///      - bits 0-2: BlockBitSize = (flags & 7) + 1 (valid bits in last byte)
@@ -438,7 +438,7 @@ fn decodeBlock(state: *Unpack50State, unpacked_size: u64) !bool {
             var length = try decodeLengthSlot(br, length_slot);
             const distance = try decodeDistance(br, &state.dd, &state.ldd);
 
-            // Distance-dependent length adjustment (matches unRAR):
+            // Distance-dependent length adjustment:
             // Longer distances get +1 to +3 added to the length.
             if (distance > 0x100) {
                 length += 1;
@@ -852,7 +852,7 @@ test "decompression with repeated match (symbol 257)" {
     // This is too complex to hand-build in a test. We verify the mechanism works
     // at the unit level via individual function tests above.
     //
-    // Instead, let's verify the LENGTH_TABLE matches unRAR's SlotToLength.
+    // Instead, verify LENGTH_TABLE follows the slot-to-length mapping.
     // Verify slots 0-7 are direct: base = 2 + slot, extra = 0
     for (0..8) |slot| {
         try testing.expectEqual(@as(u32, @intCast(slot + 2)), LENGTH_TABLE[slot].base);

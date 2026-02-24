@@ -80,3 +80,5 @@ See: `docs/plans/2026-02-20-phase2-decompression.md`
 - [x] Add GitHub Actions CI across 4 platforms: macOS ARM, Linux Intel/ARM, Windows Intel (2026-02-20 EST)
 - [x] Verify CI passes on all platforms (2026-02-20 EST)
 - [x] Add CI badges to top of README.md (2026-02-20 EST)
+- [x] Neutralize implementation-facing upstream-internal wording in source comments and README for legal-surface review (2026-02-22 EST)
+- [x] Resolve `v` command surface collision by keeping `v`/`list-verbose` as listing aliases and adding explicit `vol`/`volumes` command; ensure `./test` rebuilds CLI before CLI tests (2026-02-22 EST)

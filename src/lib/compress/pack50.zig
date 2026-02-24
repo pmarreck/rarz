@@ -92,9 +92,10 @@ pub fn compressBlock(
                     }
                     // Rotate distances
                     rotatePrevDistances(&prev_distances, idx);
-                    // Length goes to RD table
-                    const adj_len = slot_tables.adjustLengthForDistance(m.length, m.distance);
-                    const len_enc = slot_tables.encodeLengthSlot(adj_len);
+                    // Length goes to RD table — raw length, no distance adjustment.
+                    // The decoder does NOT add the distance-dependent bonus for
+                    // repeat-distance matches (only for new matches, symbol >= 262).
+                    const len_enc = slot_tables.encodeLengthSlot(m.length);
                     rd_freq[len_enc.slot] += 1;
                 } else {
                     // New match: symbol 262+slot
@@ -176,9 +177,10 @@ pub fn compressBlock(
                     try bw.writeBits(ld_codes[sym], @intCast(ld_lengths[sym]));
                     rotatePrevDistances(&prev_distances, idx);
 
-                    // Emit length via RD table
-                    const adj_len = slot_tables.adjustLengthForDistance(m.length, m.distance);
-                    const len_enc = slot_tables.encodeLengthSlot(adj_len);
+                    // Emit length via RD table — raw length, no distance adjustment.
+                    // The decoder does NOT add the distance-dependent bonus for
+                    // repeat-distance matches (only for new matches, symbol >= 262).
+                    const len_enc = slot_tables.encodeLengthSlot(m.length);
                     try bw.writeBits(rd_codes[len_enc.slot], @intCast(rd_lengths[len_enc.slot]));
                     if (len_enc.extra_bits > 0) {
                         try bw.writeBits(len_enc.extra, len_enc.extra_bits);
@@ -634,6 +636,98 @@ test "findRepeatDistance: finds matching distance" {
     try testing.expectEqual(@as(?usize, 2), findRepeatDistance(prev, 15));
     try testing.expectEqual(@as(?usize, 3), findRepeatDistance(prev, 20));
     try testing.expectEqual(@as(?usize, null), findRepeatDistance(prev, 25));
+}
+
+test "compressBlock: repeated-lines round-trip (BT4 regression)" {
+    // This pattern triggers bad matches with BT4 at ~591 bytes.
+    var buf: [1024]u8 = undefined;
+    var pos: usize = 0;
+    for (1..21) |i| {
+        const line = std.fmt.bufPrint(buf[pos..], "Line {d}: The quick brown fox.\n", .{i}) catch unreachable;
+        pos += line.len;
+    }
+    const data = buf[0..pos];
+
+    for ([_]u3{ 1, 2, 3, 4, 5 }) |level| {
+        const compressed = try compressBlock(testing.allocator, data, level, true);
+        defer testing.allocator.free(compressed);
+
+        const decompressed = try unpack50.decompress(
+            testing.allocator,
+            compressed,
+            data.len,
+            50,
+            20,
+        );
+        defer testing.allocator.free(decompressed);
+
+        try testing.expectEqual(data.len, decompressed.len);
+        try testing.expectEqualSlices(u8, data, decompressed);
+    }
+}
+
+test "compressBlock: token stream byte count matches data length" {
+    var buf: [1024]u8 = undefined;
+    var pos: usize = 0;
+    for (1..21) |i| {
+        const line = std.fmt.bufPrint(buf[pos..], "Line {d}: The quick brown fox.\n", .{i}) catch unreachable;
+        pos += line.len;
+    }
+    const data = buf[0..pos];
+
+    // Step 1: Run match finder
+    const window_size: u32 = 1 << 20;
+    var mf = try match_finder.MatchFinder.init(testing.allocator, window_size, 1);
+    defer mf.deinit();
+
+    const raw_tokens = try mf.compress(data, testing.allocator);
+    defer testing.allocator.free(raw_tokens);
+
+    // Check raw token total
+    var raw_total: usize = 0;
+    for (raw_tokens) |tok| {
+        switch (tok) {
+            .literal => raw_total += 1,
+            .match => |m| raw_total += m.length,
+        }
+    }
+    try testing.expectEqual(data.len, raw_total);
+
+    // Step 2: Filter unencodable matches
+    var filtered_data = std.ArrayList(LzToken).empty;
+    defer filtered_data.deinit(testing.allocator);
+    {
+        var data_pos: usize = 0;
+        for (raw_tokens) |tok| {
+            switch (tok) {
+                .literal => {
+                    try filtered_data.append(testing.allocator, tok);
+                    data_pos += 1;
+                },
+                .match => |m| {
+                    const adj_len = slot_tables.adjustLengthForDistance(m.length, m.distance);
+                    if (adj_len < 2) {
+                        for (0..m.length) |i| {
+                            try filtered_data.append(testing.allocator, .{ .literal = data[data_pos + i] });
+                        }
+                    } else {
+                        try filtered_data.append(testing.allocator, tok);
+                    }
+                    data_pos += m.length;
+                },
+            }
+        }
+    }
+
+    // Check filtered token total
+    var filtered_total: usize = 0;
+    for (filtered_data.items) |tok| {
+        switch (tok) {
+            .literal => filtered_total += 1,
+            .match => |m| filtered_total += m.length,
+        }
+    }
+    try testing.expectEqual(data.len, filtered_total);
 }
 
 test "rotatePrevDistances: moves to front" {

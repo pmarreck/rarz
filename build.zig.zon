@@ -5,7 +5,8 @@
     .minimum_zig_version = "0.14.0",
     .dependencies = .{
         .progrez = .{
-            .path = "../progrez",
+            .url = "https://github.com/pmarreck/progrez/archive/377256d88ef8e664177b88a66a361a46be4e4c83.tar.gz",
+            .hash = "progrez-0.1.0-0YJXrl0CAgCI-gvYCSEWEnW2rsWMTPbehyOnOveB4EJp",
         },
     },
     .paths = .{

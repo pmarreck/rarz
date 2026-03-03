@@ -1126,7 +1126,11 @@ static int cmd_add(int argc, char **argv) {
 
 		progrez_update(pctx, (uint64_t)(i + 1), 0);
 
+#ifdef _WIN32
+		if (stat(path, &st) != 0) {
+#else
 		if (lstat(path, &st) != 0) {
+#endif
 			fprintf(stderr, "error: cannot stat '%s': %s\n", path, strerror(errno));
 			progrez_finish(pctx);
 			progrez_destroy(pctx);

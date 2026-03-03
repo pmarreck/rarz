@@ -763,6 +763,114 @@ export fn rarz_create_archive_compressed(
 }
 
 // ============================================================================
+// Volume creation FFI
+// ============================================================================
+
+/// Opaque handle for volume creation result.
+const VolumeHandle = struct {
+	result: writer.VolumeResult,
+};
+
+export fn rarz_create_volumes(
+	entries_ptr: ?[*]const RarzCreateFileEntry,
+	count: u32,
+	volume_size: u64,
+	method: u8,
+) ?*VolumeHandle {
+	const entries = if (entries_ptr) |p| p[0..count] else {
+		setLastError("null entries pointer");
+		return null;
+	};
+	if (method > 5) {
+		setLastError("invalid compression method");
+		return null;
+	}
+	if (volume_size < 1024) {
+		setLastError("volume size must be at least 1024 bytes");
+		return null;
+	}
+
+	const heap_alloc = std.heap.page_allocator;
+
+	// Convert to writer.FileEntry array
+	const writer_entries = heap_alloc.alloc(writer.FileEntry, count) catch {
+		setLastError("out of memory");
+		return null;
+	};
+	defer heap_alloc.free(writer_entries);
+
+	for (entries, 0..) |e, i| {
+		writer_entries[i] = .{
+			.name = if (e.name) |n| n[0..e.name_len] else "",
+			.data = if (e.data) |d| d[0..@as(usize, @intCast(e.data_len))] else "",
+			.mtime = e.mtime,
+			.is_directory = e.is_directory != 0,
+			.host_os = e.host_os,
+			.attributes = e.attributes,
+		};
+	}
+
+	const config = writer.VolumeConfig{ .volume_size = volume_size };
+	const compression_method: u3 = @intCast(method);
+
+	const vol_result = if (method == 0)
+		writer.write_archive_volumes(heap_alloc, writer_entries, config) catch {
+			setLastError("volume creation failed");
+			return null;
+		}
+	else
+		writer.write_archive_volumes_compressed(heap_alloc, writer_entries, config, compression_method) catch {
+			setLastError("volume creation failed");
+			return null;
+		};
+
+	const handle = heap_alloc.create(VolumeHandle) catch {
+		var mutable_result = vol_result;
+		mutable_result.deinit();
+		setLastError("out of memory");
+		return null;
+	};
+	handle.* = .{ .result = vol_result };
+
+	clearLastError();
+	return handle;
+}
+
+export fn rarz_volume_count(handle: ?*const VolumeHandle) u32 {
+	const h = handle orelse return 0;
+	return @intCast(h.result.count);
+}
+
+export fn rarz_volume_data(
+	handle: ?*const VolumeHandle,
+	index: u32,
+	out_buf: ?*[*]const u8,
+	out_len: ?*usize,
+) i32 {
+	const h = handle orelse {
+		setLastError("null volume handle");
+		return -1;
+	};
+	if (index >= h.result.count) {
+		setLastError("volume index out of range");
+		return -1;
+	}
+
+	const vol = h.result.volumes[index];
+	if (out_buf) |ob| ob.* = vol.ptr;
+	if (out_len) |ol| ol.* = vol.len;
+
+	clearLastError();
+	return 0;
+}
+
+export fn rarz_volumes_free(handle: ?*VolumeHandle) void {
+	const h = handle orelse return;
+	h.result.deinit();
+	std.heap.page_allocator.destroy(h);
+}
+
+// ============================================================================
 // Internal helpers
 // ============================================================================
 

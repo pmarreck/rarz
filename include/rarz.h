@@ -175,6 +175,37 @@ int64_t rarz_create_archive_compressed(const rarz_create_file_entry *entries,
                                        uint8_t *out_buf, size_t out_len,
                                        uint8_t method);
 
+/* ========================================================================== */
+/* Volume creation                                                            */
+/* ========================================================================== */
+
+/** Opaque handle for volume creation result. */
+typedef struct rarz_volumes rarz_volumes;
+
+/**
+ * Create a multi-volume archive from file entries.
+ * method: 0=store, 1-5=compression levels.
+ * volume_size: maximum bytes per volume (minimum 1024).
+ * Returns NULL on error (check rarz_last_error()).
+ */
+rarz_volumes *rarz_create_volumes(const rarz_create_file_entry *entries,
+                                   uint32_t count, uint64_t volume_size,
+                                   uint8_t method);
+
+/** Get the number of volumes in the result. */
+uint32_t rarz_volume_count(const rarz_volumes *handle);
+
+/**
+ * Get volume data by index.
+ * Sets *out_buf to point to the volume data and *out_len to its size.
+ * Returns 0 on success, -1 on error.
+ */
+int32_t rarz_volume_data(const rarz_volumes *handle, uint32_t index,
+                          const uint8_t **out_buf, size_t *out_len);
+
+/** Free volume creation result. */
+void rarz_volumes_free(rarz_volumes *handle);
+
 #ifdef __cplusplus
 }
 #endif

@@ -43,46 +43,63 @@ fn write_signature(out: []u8, pos: usize) usize {
 	return pos + detect.RAR50_SIG.len;
 }
 
-/// Write a minimal main block (no volume, not solid). Returns new position.
-fn write_main_block(out: []u8, pos: usize) usize {
-	// Main block body: archive_flags vint = 0 (no volume, no solid)
-	// Block structure:
-	//   [4 bytes CRC32] [header_size vint] [type vint=1] [flags vint=0] [archive_flags vint=0]
-
-	// Compute body contents first (type + flags + body)
-	var contents: [32]u8 = undefined;
+/// Write a main block with configurable archive_flags and volume_number. Returns new position.
+/// archive_flags: bit 0 (0x01)=VOLUME, bit 1 (0x02)=VOLNUMBER (include volume_number vint)
+/// volume_number: only encoded if VOLNUMBER bit is set in archive_flags
+fn write_main_block_ex(out: []u8, pos: usize, archive_flags: u64, volume_number: u64) usize {
+	var contents: [64]u8 = undefined;
 	var cpos: usize = 0;
 
 	// header_type = 1 (main)
 	cpos += encode_vint(1, contents[cpos..]);
 	// header_flags = 0
 	cpos += encode_vint(0, contents[cpos..]);
-	// archive_flags = 0
-	cpos += encode_vint(0, contents[cpos..]);
+	// archive_flags
+	cpos += encode_vint(archive_flags, contents[cpos..]);
+	// volume_number (only if VOLNUMBER flag is set)
+	if (archive_flags & 0x02 != 0) {
+		cpos += encode_vint(volume_number, contents[cpos..]);
+	}
 
-	// Build header_size_vint + contents into temp buffer
-	var tmp: [64]u8 = undefined;
+	var tmp: [128]u8 = undefined;
 	var tpos: usize = 0;
-	tpos += encode_vint(cpos, tmp[tpos..]); // header_size = length of contents
+	tpos += encode_vint(cpos, tmp[tpos..]);
 	@memcpy(tmp[tpos..][0..cpos], contents[0..cpos]);
 	tpos += cpos;
 
-	// CRC32 over header_size_vint + contents
 	const crc = integrity.crc32(tmp[0..tpos]);
 
-	// Write CRC32 (little-endian)
 	std.mem.writeInt(u32, out[pos..][0..4], crc, .little);
-	// Write header_size_vint + contents
 	@memcpy(out[pos + 4 ..][0..tpos], tmp[0..tpos]);
 
 	return pos + 4 + tpos;
 }
 
+/// Write a minimal main block (no volume, not solid). Returns new position.
+fn write_main_block(out: []u8, pos: usize) usize {
+	return write_main_block_ex(out, pos, 0, 0);
+}
+
 /// Calculate the size of the main block in bytes.
 fn main_block_size() usize {
-	// CRC32(4) + header_size_vint(1) + type_vint(1) + flags_vint(1) + archive_flags_vint(1)
-	// All vints here are single-byte since values are 0, 0, and 1
-	const contents_size: usize = vint_size(1) + vint_size(0) + vint_size(0); // type=1, flags=0, archive_flags=0
+	return main_block_size_ex(0);
+}
+
+/// Calculate the size of a main block with given archive_flags.
+fn main_block_size_ex(archive_flags: u64) usize {
+	var contents_size: usize = vint_size(1) + vint_size(0) + vint_size(archive_flags);
+	if (archive_flags & 0x02 != 0) {
+		contents_size += vint_size(0); // volume_number (varies, use 0 as min)
+	}
+	return 4 + vint_size(contents_size) + contents_size;
+}
+
+/// Calculate exact main block size with specific volume_number.
+fn main_block_size_exact(archive_flags: u64, volume_number: u64) usize {
+	var contents_size: usize = vint_size(1) + vint_size(0) + vint_size(archive_flags);
+	if (archive_flags & 0x02 != 0) {
+		contents_size += vint_size(volume_number);
+	}
 	return 4 + vint_size(contents_size) + contents_size;
 }
 
@@ -228,9 +245,253 @@ fn file_block_size(entry: FileEntry) usize {
 	return 4 + vint_size(contents_size) + contents_size + @as(usize, @intCast(data_size));
 }
 
-/// Write end-of-archive block. Returns new position.
-fn write_end_block(out: []u8, pos: usize) usize {
-	// End block: type=5, flags=0, body=end_flags(0)
+/// Write a file block for volume splitting. Like write_file_block but with:
+/// - split_before/split_after header flags
+/// - custom data chunk (may be a subset of the file data)
+/// - unpacked_size and data_crc always reflect the FULL file, not the chunk
+/// compression_info=0 (store mode).
+fn write_file_block_split(
+	out: []u8,
+	pos: usize,
+	entry: FileEntry,
+	data_chunk: []const u8,
+	split_before: bool,
+	split_after: bool,
+) usize {
+	const full_data_crc = integrity.crc32(entry.data);
+
+	var file_flags: u64 = 0;
+	if (entry.is_directory) file_flags |= 0x01;
+	file_flags |= 0x02; // FHFL_UTIME
+	if (!entry.is_directory) file_flags |= 0x04; // FHFL_CRC32
+
+	const attributes: u64 = if (entry.attributes != 0)
+		entry.attributes
+	else if (entry.is_directory)
+		0x10
+	else
+		0x20;
+
+	var body: [4096]u8 = undefined;
+	var bpos: usize = 0;
+	bpos += encode_vint(file_flags, body[bpos..]);
+	bpos += encode_vint(if (entry.is_directory) 0 else entry.data.len, body[bpos..]); // full unpacked_size
+	bpos += encode_vint(attributes, body[bpos..]);
+	std.mem.writeInt(u32, body[bpos..][0..4], entry.mtime, .little);
+	bpos += 4;
+	if (!entry.is_directory) {
+		std.mem.writeInt(u32, body[bpos..][0..4], full_data_crc, .little);
+		bpos += 4;
+	}
+	bpos += encode_vint(0, body[bpos..]); // compression_info = store
+	bpos += encode_vint(entry.host_os, body[bpos..]);
+	bpos += encode_vint(entry.name.len, body[bpos..]);
+	@memcpy(body[bpos..][0..entry.name.len], entry.name);
+	bpos += entry.name.len;
+
+	const chunk_size: u64 = data_chunk.len;
+	// Header flags: HFL_DATA(0x02), HFL_SPLIT_BEFORE(0x08), HFL_SPLIT_AFTER(0x10)
+	var header_flags: u64 = 0;
+	if (chunk_size > 0) header_flags |= 0x02;
+	if (split_before) header_flags |= 0x08;
+	if (split_after) header_flags |= 0x10;
+
+	var contents: [4096]u8 = undefined;
+	var cpos: usize = 0;
+	cpos += encode_vint(2, contents[cpos..]); // type = file
+	cpos += encode_vint(header_flags, contents[cpos..]);
+	if (chunk_size > 0) {
+		cpos += encode_vint(chunk_size, contents[cpos..]);
+	}
+	@memcpy(contents[cpos..][0..bpos], body[0..bpos]);
+	cpos += bpos;
+
+	var tmp: [8192]u8 = undefined;
+	var tpos: usize = 0;
+	tpos += encode_vint(cpos, tmp[tpos..]);
+	@memcpy(tmp[tpos..][0..cpos], contents[0..cpos]);
+	tpos += cpos;
+
+	const crc = integrity.crc32(tmp[0..tpos]);
+
+	std.mem.writeInt(u32, out[pos..][0..4], crc, .little);
+	@memcpy(out[pos + 4 ..][0..tpos], tmp[0..tpos]);
+	var new_pos = pos + 4 + tpos;
+
+	if (chunk_size > 0) {
+		@memcpy(out[new_pos..][0..data_chunk.len], data_chunk);
+		new_pos += data_chunk.len;
+	}
+
+	return new_pos;
+}
+
+/// Calculate the header-only size for a split file block (without data).
+fn file_block_header_size(entry: FileEntry, chunk_size: u64, split_before: bool, split_after: bool) usize {
+	var file_flags: u64 = 0;
+	if (entry.is_directory) file_flags |= 0x01;
+	file_flags |= 0x02;
+	if (!entry.is_directory) file_flags |= 0x04;
+
+	const attributes: u64 = if (entry.attributes != 0)
+		entry.attributes
+	else if (entry.is_directory)
+		0x10
+	else
+		0x20;
+
+	var body_size: usize = 0;
+	body_size += vint_size(file_flags);
+	body_size += vint_size(if (entry.is_directory) 0 else entry.data.len);
+	body_size += vint_size(attributes);
+	body_size += 4; // mtime
+	if (!entry.is_directory) body_size += 4; // data_crc32
+	body_size += vint_size(0); // compression_info
+	body_size += vint_size(entry.host_os);
+	body_size += vint_size(entry.name.len);
+	body_size += entry.name.len;
+
+	var header_flags: u64 = 0;
+	if (chunk_size > 0) header_flags |= 0x02;
+	if (split_before) header_flags |= 0x08;
+	if (split_after) header_flags |= 0x10;
+
+	var contents_size: usize = 0;
+	contents_size += vint_size(2); // type
+	contents_size += vint_size(header_flags);
+	if (chunk_size > 0) {
+		contents_size += vint_size(chunk_size);
+	}
+	contents_size += body_size;
+
+	return 4 + vint_size(contents_size) + contents_size;
+}
+
+/// Write a compressed file block for volume splitting.
+fn write_file_block_precompressed_split(
+	out: []u8,
+	pos: usize,
+	entry: FileEntry,
+	compressed_chunk: []const u8,
+	full_compressed_size: u64,
+	method: u3,
+	split_before: bool,
+	split_after: bool,
+) usize {
+	const data_crc = integrity.crc32(entry.data);
+
+	var file_flags: u64 = 0;
+	if (entry.is_directory) file_flags |= 0x01;
+	file_flags |= 0x02;
+	if (!entry.is_directory) file_flags |= 0x04;
+
+	const attributes: u64 = if (entry.attributes != 0)
+		entry.attributes
+	else if (entry.is_directory)
+		0x10
+	else
+		0x20;
+	const dict_bits: u4 = 3;
+
+	var body: [4096]u8 = undefined;
+	var bpos: usize = 0;
+	bpos += encode_vint(file_flags, body[bpos..]);
+	bpos += encode_vint(entry.data.len, body[bpos..]);
+	bpos += encode_vint(attributes, body[bpos..]);
+	std.mem.writeInt(u32, body[bpos..][0..4], entry.mtime, .little);
+	bpos += 4;
+	if (!entry.is_directory) {
+		std.mem.writeInt(u32, body[bpos..][0..4], data_crc, .little);
+		bpos += 4;
+	}
+	bpos += encode_vint(encode_compression_info(method, dict_bits), body[bpos..]);
+	bpos += encode_vint(entry.host_os, body[bpos..]);
+	bpos += encode_vint(entry.name.len, body[bpos..]);
+	@memcpy(body[bpos..][0..entry.name.len], entry.name);
+	bpos += entry.name.len;
+
+	const chunk_size: u64 = compressed_chunk.len;
+	var header_flags: u64 = 0;
+	if (chunk_size > 0) header_flags |= 0x02;
+	if (split_before) header_flags |= 0x08;
+	if (split_after) header_flags |= 0x10;
+
+	var contents: [4096]u8 = undefined;
+	var cpos: usize = 0;
+	cpos += encode_vint(2, contents[cpos..]);
+	cpos += encode_vint(header_flags, contents[cpos..]);
+	if (chunk_size > 0) {
+		cpos += encode_vint(chunk_size, contents[cpos..]);
+	}
+	@memcpy(contents[cpos..][0..bpos], body[0..bpos]);
+	cpos += bpos;
+
+	var tmp: [8192]u8 = undefined;
+	var tpos: usize = 0;
+	tpos += encode_vint(cpos, tmp[tpos..]);
+	@memcpy(tmp[tpos..][0..cpos], contents[0..cpos]);
+	tpos += cpos;
+
+	const crc = integrity.crc32(tmp[0..tpos]);
+
+	std.mem.writeInt(u32, out[pos..][0..4], crc, .little);
+	@memcpy(out[pos + 4 ..][0..tpos], tmp[0..tpos]);
+	var new_pos = pos + 4 + tpos;
+
+	if (chunk_size > 0) {
+		@memcpy(out[new_pos..][0..compressed_chunk.len], compressed_chunk);
+		new_pos += compressed_chunk.len;
+	}
+
+	_ = full_compressed_size;
+	return new_pos;
+}
+
+/// Calculate header-only size for a compressed split file block.
+fn file_block_header_size_compressed(entry: FileEntry, chunk_size: u64, method: u3, split_before: bool, split_after: bool) usize {
+	var file_flags: u64 = 0;
+	if (entry.is_directory) file_flags |= 0x01;
+	file_flags |= 0x02;
+	if (!entry.is_directory) file_flags |= 0x04;
+
+	const attributes: u64 = if (entry.attributes != 0)
+		entry.attributes
+	else if (entry.is_directory)
+		0x10
+	else
+		0x20;
+	const dict_bits: u4 = 3;
+
+	var body_size: usize = 0;
+	body_size += vint_size(file_flags);
+	body_size += vint_size(entry.data.len);
+	body_size += vint_size(attributes);
+	body_size += 4;
+	if (!entry.is_directory) body_size += 4;
+	body_size += vint_size(encode_compression_info(method, dict_bits));
+	body_size += vint_size(entry.host_os);
+	body_size += vint_size(entry.name.len);
+	body_size += entry.name.len;
+
+	var header_flags: u64 = 0;
+	if (chunk_size > 0) header_flags |= 0x02;
+	if (split_before) header_flags |= 0x08;
+	if (split_after) header_flags |= 0x10;
+
+	var contents_size: usize = 0;
+	contents_size += vint_size(2);
+	contents_size += vint_size(header_flags);
+	if (chunk_size > 0) {
+		contents_size += vint_size(chunk_size);
+	}
+	contents_size += body_size;
+
+	return 4 + vint_size(contents_size) + contents_size;
+}
+
+/// Write end-of-archive block with configurable end_flags. Returns new position.
+/// end_flags: bit 0 (0x01) = next_volume (more volumes follow)
+fn write_end_block_ex(out: []u8, pos: usize, end_flags: u64) usize {
 	var contents: [32]u8 = undefined;
 	var cpos: usize = 0;
 
@@ -238,12 +499,12 @@ fn write_end_block(out: []u8, pos: usize) usize {
 	cpos += encode_vint(5, contents[cpos..]);
 	// header_flags = 0
 	cpos += encode_vint(0, contents[cpos..]);
-	// end_flags = 0 (no next volume)
-	cpos += encode_vint(0, contents[cpos..]);
+	// end_flags
+	cpos += encode_vint(end_flags, contents[cpos..]);
 
 	var tmp: [64]u8 = undefined;
 	var tpos: usize = 0;
-	tpos += encode_vint(cpos, tmp[tpos..]); // header_size
+	tpos += encode_vint(cpos, tmp[tpos..]);
 	@memcpy(tmp[tpos..][0..cpos], contents[0..cpos]);
 	tpos += cpos;
 
@@ -255,9 +516,19 @@ fn write_end_block(out: []u8, pos: usize) usize {
 	return pos + 4 + tpos;
 }
 
+/// Write end-of-archive block (no next volume). Returns new position.
+fn write_end_block(out: []u8, pos: usize) usize {
+	return write_end_block_ex(out, pos, 0);
+}
+
 /// Calculate the size of the end block.
 fn end_block_size() usize {
-	const contents_size: usize = vint_size(5) + vint_size(0) + vint_size(0); // type=5, flags=0, end_flags=0
+	return end_block_size_ex(0);
+}
+
+/// Calculate the size of an end block with given end_flags.
+fn end_block_size_ex(end_flags: u64) usize {
+	const contents_size: usize = vint_size(5) + vint_size(0) + vint_size(end_flags);
 	return 4 + vint_size(contents_size) + contents_size;
 }
 
@@ -563,6 +834,315 @@ pub fn write_archive_compressed(
 	pos = write_end_block(output, pos);
 
 	return pos;
+}
+
+// ============================================================================
+// Volume creation API
+// ============================================================================
+
+pub const VolumeConfig = struct {
+	volume_size: u64, // max bytes per volume
+};
+
+pub const VolumeResult = struct {
+	volumes: [][]u8,
+	count: usize,
+	allocator: std.mem.Allocator,
+
+	pub fn deinit(self: *VolumeResult) void {
+		for (self.volumes[0..self.count]) |vol| {
+			self.allocator.free(vol);
+		}
+		self.allocator.free(self.volumes);
+	}
+};
+
+/// Per-file data to distribute across volumes (after optional compression).
+const FilePayload = struct {
+	entry: FileEntry,
+	data: []const u8, // actual data to write (raw or compressed)
+	method: u3,
+	is_compressed: bool,
+};
+
+/// Write volume archives from pre-prepared file payloads.
+/// Each volume gets: signature + main block (VOLUME+VOLNUMBER) + file blocks + end block.
+/// Files that don't fit in the current volume are split across volumes.
+fn write_volumes_from_payloads(
+	allocator: std.mem.Allocator,
+	payloads: []const FilePayload,
+	config: VolumeConfig,
+) !VolumeResult {
+	// Volume flags for multi-volume archives
+	const VOLUME_FLAG: u64 = 0x01;
+	const VOLNUMBER_FLAG: u64 = 0x02;
+	const archive_flags = VOLUME_FLAG | VOLNUMBER_FLAG;
+	const END_NEXT_VOLUME: u64 = 0x01;
+
+	// Estimate max volumes (generous upper bound)
+	var total_data_size: usize = 0;
+	for (payloads) |p| {
+		total_data_size += p.data.len + 256; // data + header overhead
+	}
+	const estimated_volumes = (total_data_size / @as(usize, @intCast(config.volume_size))) + 2;
+	const max_volumes = @max(estimated_volumes, 4);
+
+	// Allocate volume buffer pointers
+	var vol_list = try allocator.alloc([]u8, max_volumes);
+	var vol_count: usize = 0;
+	errdefer {
+		for (vol_list[0..vol_count]) |vol| allocator.free(vol);
+		allocator.free(vol_list);
+	}
+
+	// Track progress through files
+	var file_idx: usize = 0;
+	var data_offset: usize = 0; // how far into current file's data we've written
+
+	while (file_idx < payloads.len or vol_count == 0) {
+		// Start a new volume
+		const vol_num = vol_count;
+		const vol_buf_size = @as(usize, @intCast(config.volume_size)) + 65536; // extra for header overhead
+		var vol_buf = try allocator.alloc(u8, vol_buf_size);
+
+		var pos: usize = 0;
+		pos = write_signature(vol_buf, pos);
+		pos = write_main_block_ex(vol_buf, pos, archive_flags, vol_num);
+
+		const overhead = detect.RAR50_SIG.len + main_block_size_exact(archive_flags, vol_num) + end_block_size_ex(END_NEXT_VOLUME);
+		const usable = if (config.volume_size > overhead) config.volume_size - overhead else 256;
+
+		var written_in_vol: u64 = 0;
+		while (file_idx < payloads.len) {
+			const p = payloads[file_idx];
+			const remaining_data = p.data[data_offset..];
+			const is_continuation = data_offset > 0;
+
+			// Calculate header size for this chunk
+			const trial_header_size = if (p.is_compressed)
+				file_block_header_size_compressed(p.entry, remaining_data.len, p.method, is_continuation, false)
+			else
+				file_block_header_size(p.entry, remaining_data.len, is_continuation, false);
+
+			const full_block_size = trial_header_size + remaining_data.len;
+
+			if (written_in_vol + full_block_size <= usable) {
+				// Whole file (or remainder) fits in this volume
+				if (p.is_compressed) {
+					pos = write_file_block_precompressed_split(
+						vol_buf, pos, p.entry, remaining_data,
+						p.data.len, p.method, is_continuation, false,
+					);
+				} else {
+					pos = write_file_block_split(
+						vol_buf, pos, p.entry, remaining_data,
+						is_continuation, false,
+					);
+				}
+				written_in_vol += full_block_size;
+				file_idx += 1;
+				data_offset = 0;
+			} else {
+				// Need to split the file
+				// Calculate how much data we can fit
+				const header_for_split = if (p.is_compressed)
+					file_block_header_size_compressed(p.entry, 1, p.method, is_continuation, true)
+				else
+					file_block_header_size(p.entry, 1, is_continuation, true);
+
+				if (written_in_vol + header_for_split >= usable) {
+					// Can't fit even a header — end this volume
+					break;
+				}
+
+				// Chunk size = remaining usable space - header overhead
+				// We need to iterate because vint_size changes with chunk_size
+				var chunk_size = usable - written_in_vol - header_for_split;
+				if (chunk_size > remaining_data.len) chunk_size = remaining_data.len;
+
+				// Refine: recalculate header with actual chunk_size
+				const actual_header = if (p.is_compressed)
+					file_block_header_size_compressed(p.entry, chunk_size, p.method, is_continuation, true)
+				else
+					file_block_header_size(p.entry, chunk_size, is_continuation, true);
+
+				if (actual_header + chunk_size > usable - written_in_vol) {
+					if (chunk_size > 1) {
+						chunk_size -= 1; // vint size grew, trim a byte
+					}
+				}
+
+				if (chunk_size == 0) break;
+
+				const chunk_data = remaining_data[0..@as(usize, @intCast(chunk_size))];
+				if (p.is_compressed) {
+					pos = write_file_block_precompressed_split(
+						vol_buf, pos, p.entry, chunk_data,
+						p.data.len, p.method, is_continuation, true,
+					);
+				} else {
+					pos = write_file_block_split(
+						vol_buf, pos, p.entry, chunk_data,
+						is_continuation, true,
+					);
+				}
+				data_offset += @as(usize, @intCast(chunk_size));
+				break; // End this volume, continue file in next
+			}
+		}
+
+		// Write end block
+		const is_last = (file_idx >= payloads.len);
+		const end_flags: u64 = if (is_last) 0 else END_NEXT_VOLUME;
+		pos = write_end_block_ex(vol_buf, pos, end_flags);
+
+		// Shrink volume to actual size
+		if (vol_count >= vol_list.len) {
+			// Grow vol_list
+			const new_list = try allocator.alloc([]u8, vol_list.len * 2);
+			@memcpy(new_list[0..vol_count], vol_list[0..vol_count]);
+			allocator.free(vol_list);
+			vol_list = new_list;
+		}
+
+		const final_buf = try allocator.alloc(u8, pos);
+		@memcpy(final_buf, vol_buf[0..pos]);
+		allocator.free(vol_buf);
+
+		vol_list[vol_count] = final_buf;
+		vol_count += 1;
+
+		if (is_last) break;
+	}
+
+	return VolumeResult{
+		.volumes = vol_list,
+		.count = vol_count,
+		.allocator = allocator,
+	};
+}
+
+/// Write store-mode volume archives.
+pub fn write_archive_volumes(
+	allocator: std.mem.Allocator,
+	entries: []const FileEntry,
+	config: VolumeConfig,
+) !VolumeResult {
+	// Build payloads (no compression)
+	const payloads = try allocator.alloc(FilePayload, entries.len);
+	defer allocator.free(payloads);
+
+	for (entries, 0..) |entry, i| {
+		payloads[i] = .{
+			.entry = entry,
+			.data = if (entry.is_directory) "" else entry.data,
+			.method = 0,
+			.is_compressed = false,
+		};
+	}
+
+	return write_volumes_from_payloads(allocator, payloads, config);
+}
+
+/// Write compressed volume archives. Files are compressed first (in parallel),
+/// then distributed across volumes.
+pub fn write_archive_volumes_compressed(
+	allocator: std.mem.Allocator,
+	entries: []const FileEntry,
+	config: VolumeConfig,
+	method: u3,
+) !VolumeResult {
+	if (method == 0) {
+		return write_archive_volumes(allocator, entries, config);
+	}
+
+	// Compress all files first (reuse parallel compression logic)
+	var compressible_count: usize = 0;
+	for (entries) |entry| {
+		if (!entry.is_directory and entry.data.len > 0) compressible_count += 1;
+	}
+
+	const results = try allocator.alloc(CompressResult, entries.len);
+	defer allocator.free(results);
+	@memset(results, CompressResult{});
+
+	if (compressible_count >= 2) {
+		const threads = try allocator.alloc(?std.Thread, entries.len);
+		defer allocator.free(threads);
+
+		for (entries, 0..) |entry, i| {
+			if (!entry.is_directory and entry.data.len > 0) {
+				threads[i] = std.Thread.spawn(.{}, compressWorker, .{
+					entry.data, method, &results[i],
+				}) catch blk: {
+					results[i].data = pack50.compressBlock(
+						std.heap.page_allocator, entry.data, method, true,
+					) catch {
+						results[i].failed = true;
+						break :blk null;
+					};
+					break :blk null;
+				};
+			} else {
+				threads[i] = null;
+			}
+		}
+
+		for (threads) |t| {
+			if (t) |thread| thread.join();
+		}
+	} else {
+		for (entries, 0..) |entry, i| {
+			if (!entry.is_directory and entry.data.len > 0) {
+				results[i].data = pack50.compressBlock(
+					allocator, entry.data, method, true,
+				) catch {
+					results[i].failed = true;
+					continue;
+				};
+			}
+		}
+	}
+
+	defer {
+		for (results) |r| {
+			if (r.data) |d| {
+				if (compressible_count >= 2) {
+					std.heap.page_allocator.free(d);
+				} else {
+					allocator.free(d);
+				}
+			}
+		}
+	}
+
+	for (results) |r| {
+		if (r.failed) return error.CompressionFailed;
+	}
+
+	// Build payloads with compressed data
+	const payloads = try allocator.alloc(FilePayload, entries.len);
+	defer allocator.free(payloads);
+
+	for (entries, 0..) |entry, i| {
+		if (entry.is_directory or entry.data.len == 0) {
+			payloads[i] = .{
+				.entry = entry,
+				.data = if (entry.is_directory) "" else entry.data,
+				.method = 0,
+				.is_compressed = false,
+			};
+		} else {
+			payloads[i] = .{
+				.entry = entry,
+				.data = results[i].data.?,
+				.method = method,
+				.is_compressed = true,
+			};
+		}
+	}
+
+	return write_volumes_from_payloads(allocator, payloads, config);
 }
 
 // ============================================================================
@@ -979,4 +1559,239 @@ test "encode_compression_info: method 3 with dict_bits=3 (1MB)" {
 	try testing.expectEqual(@as(u3, 3), parsed.method);
 	try testing.expectEqual(@as(u4, 3), parsed.dict_bits);
 	try testing.expect(!parsed.solid);
+}
+
+// ============================================================================
+// Volume creation tests
+// ============================================================================
+
+test "write_archive_volumes: single volume when data fits" {
+	const entries = [_]FileEntry{.{
+		.name = "small.txt",
+		.data = "hello",
+		.mtime = 0,
+		.is_directory = false,
+	}};
+
+	var result = try write_archive_volumes(testing.allocator, &entries, .{ .volume_size = 4096 });
+	defer result.deinit();
+
+	// Should produce exactly 1 volume
+	try testing.expectEqual(@as(usize, 1), result.count);
+
+	// The single volume should be a valid RAR5 archive
+	const vol = result.volumes[0];
+	try testing.expectEqualSlices(u8, &detect.RAR50_SIG, vol[0..8]);
+
+	// Parse and verify
+	const block_data = vol[detect.RAR50_SIG.len..];
+	var iter = rar5_headers.walk_blocks(block_data);
+
+	// Main block should have VOLUME flag
+	const b1 = (try iter.next()) orelse return error.EndOfData;
+	switch (b1) {
+		.main => |m| {
+			try testing.expect(m.volume);
+		},
+		else => return error.EndOfData,
+	}
+
+	// File block
+	const b2 = (try iter.next()) orelse return error.EndOfData;
+	switch (b2) {
+		.file => |f| {
+			try testing.expectEqualSlices(u8, "small.txt", f.name);
+			try testing.expectEqual(@as(u64, 5), f.unpacked_size);
+		},
+		else => return error.EndOfData,
+	}
+
+	// End block (no next volume)
+	const b3 = (try iter.next()) orelse return error.EndOfData;
+	switch (b3) {
+		.end_archive => |e| {
+			try testing.expect(!e.next_volume);
+		},
+		else => return error.EndOfData,
+	}
+}
+
+test "write_archive_volumes: two volumes split between files" {
+	// Create two files. Set volume_size small enough that both can't fit in one volume.
+	// File block: ~35 bytes header + data. Volume overhead: sig(8) + main(~12) + end(~8) = ~28
+	const data_a = "alpha alpha alpha alpha alpha alpha"; // 35 bytes
+	const data_b = "bravo bravo bravo bravo bravo bravo"; // 35 bytes
+	const entries = [_]FileEntry{
+		.{ .name = "a.txt", .data = data_a, .mtime = 0, .is_directory = false },
+		.{ .name = "b.txt", .data = data_b, .mtime = 0, .is_directory = false },
+	};
+
+	// One file block = ~35 header + 35 data = ~70 bytes.
+	// Volume overhead = ~28. So volume_size=100 fits one file but not two.
+	var result = try write_archive_volumes(testing.allocator, &entries, .{ .volume_size = 105 });
+	defer result.deinit();
+
+	// Should produce 2 or more volumes
+	try testing.expect(result.count >= 2);
+
+	// First volume should have end block with next_volume flag
+	const vol1 = result.volumes[0];
+	const bd1 = vol1[detect.RAR50_SIG.len..];
+	var iter1 = rar5_headers.walk_blocks(bd1);
+	_ = try iter1.next(); // main
+	_ = try iter1.next(); // file
+
+	// Walk to end block
+	var found_end = false;
+	while (try iter1.next()) |block| {
+		switch (block) {
+			.end_archive => |e| {
+				try testing.expect(e.next_volume);
+				found_end = true;
+			},
+			else => {},
+		}
+	}
+	try testing.expect(found_end);
+
+	// Last volume should have end block without next_volume flag
+	const last_vol = result.volumes[result.count - 1];
+	const bdl = last_vol[detect.RAR50_SIG.len..];
+	var iter_l = rar5_headers.walk_blocks(bdl);
+
+	var last_end_found = false;
+	while (try iter_l.next()) |block| {
+		switch (block) {
+			.end_archive => |e| {
+				try testing.expect(!e.next_volume);
+				last_end_found = true;
+			},
+			else => {},
+		}
+	}
+	try testing.expect(last_end_found);
+}
+
+test "write_archive_volumes: file split across volumes" {
+	// One large file that must be split
+	const big_data = "x" ** 200;
+	const entries = [_]FileEntry{.{
+		.name = "big.txt",
+		.data = big_data,
+		.mtime = 0,
+		.is_directory = false,
+	}};
+
+	// Volume size small enough to force a split (overhead ~50 bytes, so ~100 for data)
+	var result = try write_archive_volumes(testing.allocator, &entries, .{ .volume_size = 160 });
+	defer result.deinit();
+
+	try testing.expect(result.count >= 2);
+
+	// Check first volume: file should have split_after
+	const vol1 = result.volumes[0];
+	const bd1 = vol1[detect.RAR50_SIG.len..];
+	var iter1 = rar5_headers.walk_blocks(bd1);
+	_ = try iter1.next(); // main
+	const fb1 = (try iter1.next()) orelse return error.EndOfData;
+	switch (fb1) {
+		.file => |f| {
+			try testing.expectEqualSlices(u8, "big.txt", f.name);
+			try testing.expect(!f.header.flags.split_before);
+			try testing.expect(f.header.flags.split_after);
+		},
+		else => return error.EndOfData,
+	}
+
+	// Check second volume: file should have split_before
+	const vol2 = result.volumes[1];
+	const bd2 = vol2[detect.RAR50_SIG.len..];
+	var iter2 = rar5_headers.walk_blocks(bd2);
+	_ = try iter2.next(); // main
+	const fb2 = (try iter2.next()) orelse return error.EndOfData;
+	switch (fb2) {
+		.file => |f| {
+			try testing.expectEqualSlices(u8, "big.txt", f.name);
+			try testing.expect(f.header.flags.split_before);
+		},
+		else => return error.EndOfData,
+	}
+}
+
+test "write_archive_volumes: volume numbers increment" {
+	const entries = [_]FileEntry{
+		.{ .name = "a.txt", .data = "aaaa aaaa aaaa", .mtime = 0, .is_directory = false },
+		.{ .name = "b.txt", .data = "bbbb bbbb bbbb", .mtime = 0, .is_directory = false },
+		.{ .name = "c.txt", .data = "cccc cccc cccc", .mtime = 0, .is_directory = false },
+	};
+
+	var result = try write_archive_volumes(testing.allocator, &entries, .{ .volume_size = 110 });
+	defer result.deinit();
+
+	try testing.expect(result.count >= 2);
+
+	// Check volume numbers
+	for (result.volumes[0..result.count], 0..) |vol, expected_num| {
+		const bd = vol[detect.RAR50_SIG.len..];
+		var iter = rar5_headers.walk_blocks(bd);
+		const mb = (try iter.next()) orelse return error.EndOfData;
+		switch (mb) {
+			.main => |m| {
+				try testing.expect(m.volume);
+				if (m.volume_number) |vn| {
+					try testing.expectEqual(@as(u64, expected_num), vn);
+				}
+			},
+			else => return error.EndOfData,
+		}
+	}
+}
+
+test "write_archive_volumes: round-trip reassemble data from chunks" {
+	const file_data = "The quick brown fox jumps over the lazy dog. " ** 3;
+	const entries = [_]FileEntry{.{
+		.name = "fox.txt",
+		.data = file_data,
+		.mtime = 0x5A000000,
+		.is_directory = false,
+	}};
+
+	// Force splitting into multiple volumes
+	var result = try write_archive_volumes(testing.allocator, &entries, .{ .volume_size = 130 });
+	defer result.deinit();
+
+	try testing.expect(result.count >= 2);
+
+	// Reassemble the file data from all volume chunks
+	var reassembled: [file_data.len]u8 = undefined;
+	var reassembled_len: usize = 0;
+
+	for (result.volumes[0..result.count]) |vol| {
+		const bd = vol[detect.RAR50_SIG.len..];
+		var iter = rar5_headers.walk_blocks(bd);
+
+		while (try iter.next()) |block| {
+			switch (block) {
+				.file => |f| {
+					try testing.expectEqualSlices(u8, "fox.txt", f.name);
+					try testing.expectEqual(@as(u64, file_data.len), f.unpacked_size);
+
+					// Extract the data chunk from this volume
+					const total_header = 4 + f.header.crc_data_len;
+					const payload_start = f.header.header_start + total_header;
+					if (f.header.data_size) |ds| {
+						const chunk_len = @as(usize, @intCast(ds));
+						const chunk = bd[payload_start .. payload_start + chunk_len];
+						@memcpy(reassembled[reassembled_len..][0..chunk_len], chunk);
+						reassembled_len += chunk_len;
+					}
+				},
+				else => {},
+			}
+		}
+	}
+
+	// Reassembled data should match original
+	try testing.expectEqual(file_data.len, reassembled_len);
+	try testing.expectEqualSlices(u8, file_data, reassembled[0..reassembled_len]);
 }

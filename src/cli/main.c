@@ -8,14 +8,13 @@
 #include <unistd.h>
 #include <libgen.h>
 #include <dirent.h>
-#include <sys/time.h>
-#include <sys/ioctl.h>
 #else
 #include <io.h>
 #define isatty _isatty
 #define fileno _fileno
 #endif
 #include "rarz.h"
+#include "progrez.h"
 
 #ifdef _WIN32
 #define MKDIR(path) mkdir(path)
@@ -24,29 +23,10 @@
 #endif
 
 /* ========================================================================== */
-/* Progress display                                                           */
+/* Display helpers                                                            */
 /* ========================================================================== */
 
-static int g_is_tty = 0;  /* set once in main() */
-
-static double get_time_sec(void) {
-#ifndef _WIN32
-	struct timeval tv;
-	gettimeofday(&tv, NULL);
-	return (double)tv.tv_sec + (double)tv.tv_usec / 1e6;
-#else
-	return (double)clock() / CLOCKS_PER_SEC;
-#endif
-}
-
-static int get_term_width(void) {
-#ifndef _WIN32
-	struct winsize ws;
-	if (ioctl(STDERR_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
-		return ws.ws_col;
-#endif
-	return 80;
-}
+static int g_is_tty = 0;  /* set once in main() — used for non-TTY filename printing */
 
 /** Format bytes as human-readable string into buf (e.g., "1.2 MB") */
 static void format_bytes(char *buf, size_t buflen, uint64_t bytes) {
@@ -58,85 +38,6 @@ static void format_bytes(char *buf, size_t buflen, uint64_t bytes) {
 		snprintf(buf, buflen, "%.1f KB", (double)bytes / 1024.0);
 	else
 		snprintf(buf, buflen, "%llu B", (unsigned long long)bytes);
-}
-
-/** Format seconds as M:SS or H:MM:SS */
-static void format_eta(char *buf, size_t buflen, double seconds) {
-	if (seconds < 0 || seconds > 86400) {
-		snprintf(buf, buflen, "--:--");
-		return;
-	}
-	int s = (int)(seconds + 0.5);
-	if (s >= 3600)
-		snprintf(buf, buflen, "%d:%02d:%02d", s / 3600, (s % 3600) / 60, s % 60);
-	else
-		snprintf(buf, buflen, "%d:%02d", s / 60, s % 60);
-}
-
-/** Format throughput as "XX.X MB/s" */
-static void format_throughput(char *buf, size_t buflen, uint64_t bytes, double elapsed) {
-	if (elapsed <= 0.001) {
-		snprintf(buf, buflen, "-- MB/s");
-		return;
-	}
-	double mbps = ((double)bytes / 1048576.0) / elapsed;
-	if (mbps >= 1000.0)
-		snprintf(buf, buflen, "%.1f GB/s", mbps / 1024.0);
-	else
-		snprintf(buf, buflen, "%.1f MB/s", mbps);
-}
-
-/**
- * Show a progress line on stderr (TTY only). Overwrites previous line with \r.
- * pass -1 for pct to show indeterminate progress.
- */
-static void progress_show(const char *verb, const char *filename,
-                           int file_idx, int file_total,
-                           int pct, const char *rate, const char *eta) {
-	if (!g_is_tty) return;
-
-	int width = get_term_width();
-	char line[512];
-	int pos = 0;
-
-	if (pct >= 0) {
-		/* Draw a mini progress bar */
-		int bar_width = 20;
-		int filled = (pct * bar_width) / 100;
-		char bar[32];
-		for (int i = 0; i < bar_width; i++)
-			bar[i] = (i < filled) ? '#' : '-';
-		bar[bar_width] = '\0';
-
-		pos = snprintf(line, sizeof(line), "\r  %s: %s (%d/%d) [%s] %3d%%",
-		               verb, filename, file_idx, file_total, bar, pct);
-	} else {
-		pos = snprintf(line, sizeof(line), "\r  %s: %s (%d/%d)",
-		               verb, filename, file_idx, file_total);
-	}
-
-	if (rate && rate[0]) {
-		pos += snprintf(line + pos, sizeof(line) - (size_t)pos, " | %s", rate);
-	}
-	if (eta && eta[0]) {
-		pos += snprintf(line + pos, sizeof(line) - (size_t)pos, " | ETA %s", eta);
-	}
-
-	/* Pad with spaces to clear previous longer line */
-	while (pos < width - 1 && pos < (int)sizeof(line) - 1)
-		line[pos++] = ' ';
-	line[pos] = '\0';
-
-	fprintf(stderr, "%s", line);
-	fflush(stderr);
-}
-
-/** Clear the progress line */
-static void progress_clear(void) {
-	if (!g_is_tty) return;
-	int width = get_term_width();
-	fprintf(stderr, "\r%*s\r", width - 1, "");
-	fflush(stderr);
 }
 
 /* ========================================================================== */
@@ -177,9 +78,12 @@ static void print_usage(void) {
 	printf("                                   List archive contents\n");
 	printf("  rarz vol|volumes <archive>       Show detected archive volume set\n");
 	printf("  rarz x|extract <archive> [dest]  Extract with full paths\n");
-	printf("  rarz a|add [-m0..-m5] <archive> <files...>\n");
+	printf("  rarz a|add [options] <archive> <files...>\n");
+	printf("  rarz a|add [options] -o <path> <files...>\n");
 	printf("                                   Add files to archive\n");
-	printf("                                   -m0=store, -m1..-m5=compress (default -m3)\n");
+	printf("    -m0..-m5                       Compression (default -m3, -m0=store)\n");
+	printf("    -o|--output <path>             Output path (dir: auto-name, file: use as-is)\n");
+	printf("    -v<size>                       Split into volumes (e.g. -v10m, -v700k, -v1g)\n");
 	printf("  rarz --help                      Show this help\n");
 }
 
@@ -932,7 +836,10 @@ static int cmd_extract(const char *archive_path, const char *dest_dir) {
 
 	uint64_t bytes_done = 0;
 	uint32_t files_done = 0;
-	double start_time = get_time_sec();
+
+	progrez_ctx *pctx = progrez_create("Extracting");
+	progrez_set_identity(pctx, "rarz", archive_path);
+	progrez_set_determinate(pctx, file_count, total_size);
 
 	for (uint32_t i = 0; i < count; i++) {
 		rarz_file_entry entry;
@@ -967,19 +874,9 @@ static int cmd_extract(const char *archive_path, const char *dest_dir) {
 			continue;
 		}
 
-		/* Show progress (TTY) or filename (non-TTY) */
+		/* Update progress */
 		files_done++;
-		if (g_is_tty) {
-			double elapsed = get_time_sec() - start_time;
-			int pct = total_size > 0 ? (int)((bytes_done * 100) / total_size) : 0;
-			char rate_buf[32], eta_buf[16];
-			format_throughput(rate_buf, sizeof(rate_buf), bytes_done, elapsed);
-			double eta = (pct > 0 && elapsed > 0.1)
-				? elapsed * (100.0 - pct) / pct : -1;
-			format_eta(eta_buf, sizeof(eta_buf), eta);
-			progress_show("Extracting", name_buf, (int)files_done, (int)file_count,
-			              pct, rate_buf, pct > 0 ? eta_buf : NULL);
-		}
+		progrez_update(pctx, files_done, bytes_done);
 
 		/* Ensure parent directory exists */
 		if (ensure_parent_dir(out_path) != 0) {
@@ -1001,7 +898,6 @@ static int cmd_extract(const char *archive_path, const char *dest_dir) {
 		int64_t extracted = rarz_extract_to_buffer(archive, i, file_buf,
 		                                           (size_t)entry.unpacked_size);
 		if (extracted < 0) {
-			progress_clear();
 			const char *exerr = rarz_last_error();
 			fprintf(stderr, "error: extraction failed for '%s' (code %lld)%s%s\n",
 			        name_buf, (long long)extracted,
@@ -1014,7 +910,6 @@ static int cmd_extract(const char *archive_path, const char *dest_dir) {
 		/* Write to disk */
 		FILE *out = fopen(out_path, "wb");
 		if (!out) {
-			progress_clear();
 			fprintf(stderr, "error: cannot create '%s': %s\n",
 			        out_path, strerror(errno));
 			free(file_buf);
@@ -1027,29 +922,23 @@ static int cmd_extract(const char *archive_path, const char *dest_dir) {
 		free(file_buf);
 
 		if (written != (size_t)extracted) {
-			progress_clear();
 			fprintf(stderr, "error: short write for '%s'\n", name_buf);
 			errors++;
 			continue;
 		}
 
 		bytes_done += (uint64_t)extracted;
+		progrez_update(pctx, files_done, bytes_done);
 
 		if (!g_is_tty) {
 			printf("  %s\n", name_buf);
 		}
 	}
 
-	progress_clear();
-
-	/* Final summary */
-	double total_elapsed = get_time_sec() - start_time;
-	char size_buf[32], rate_buf[32];
-	format_bytes(size_buf, sizeof(size_buf), total_size);
-	format_throughput(rate_buf, sizeof(rate_buf), total_size, total_elapsed);
+	progrez_finish(pctx);
+	progrez_destroy(pctx);
 
 	printf("Extracted %u file%s", file_count, file_count == 1 ? "" : "s");
-	printf(" (%s in %.2fs, %s)", size_buf, total_elapsed, rate_buf);
 	if (errors > 0) {
 		printf(" (%d error%s)", errors, errors == 1 ? "" : "s");
 	}
@@ -1063,37 +952,161 @@ static int cmd_extract(const char *archive_path, const char *dest_dir) {
 }
 
 /* ========================================================================== */
+/* cmd_add helpers                                                            */
+/* ========================================================================== */
+
+/**
+ * Parse a size string with optional k/m/g suffix.
+ * Returns the size in bytes, or 0 on error.
+ * Examples: "10k" -> 10240, "10m" -> 10485760, "1g" -> 1073741824, "4096" -> 4096
+ */
+static uint64_t parse_size_suffix(const char *str) {
+	char *endptr = NULL;
+	unsigned long long val = strtoull(str, &endptr, 10);
+	if (endptr == str || val == 0) return 0;
+
+	if (*endptr == '\0') return (uint64_t)val;
+	if (endptr[1] != '\0') return 0; /* trailing garbage */
+
+	switch (*endptr) {
+	case 'k': case 'K': return (uint64_t)val * 1024ULL;
+	case 'm': case 'M': return (uint64_t)val * 1048576ULL;
+	case 'g': case 'G': return (uint64_t)val * 1073741824ULL;
+	default: return 0;
+	}
+}
+
+/**
+ * Derive archive name from output directory and first input path.
+ * Strips trailing slashes, extracts basename, strips extension, appends .rar.
+ * Example: dir="/tmp", first_input="mydir/" -> "/tmp/mydir.rar"
+ * Example: dir="/tmp", first_input="file1.txt" -> "/tmp/file1.rar"
+ */
+static void derive_archive_name(char *out, size_t out_size,
+                                const char *dir, const char *first_input) {
+	/* Copy first_input and strip trailing slashes */
+	char tmp[4096];
+	size_t len = strlen(first_input);
+	if (len >= sizeof(tmp)) len = sizeof(tmp) - 1;
+	memcpy(tmp, first_input, len);
+	tmp[len] = '\0';
+	while (len > 1 && tmp[len - 1] == '/') tmp[--len] = '\0';
+
+	/* Extract basename (after last /) */
+	const char *base = strrchr(tmp, '/');
+	base = base ? base + 1 : tmp;
+
+	/* Strip extension (after last . in basename) */
+	char base_copy[4096];
+	snprintf(base_copy, sizeof(base_copy), "%s", base);
+	char *dot = strrchr(base_copy, '.');
+	if (dot && dot != base_copy) *dot = '\0';
+
+	/* Build: dir + / + basename + .rar */
+	/* Strip trailing slash from dir */
+	char dir_clean[4096];
+	size_t dlen = strlen(dir);
+	if (dlen >= sizeof(dir_clean)) dlen = sizeof(dir_clean) - 1;
+	memcpy(dir_clean, dir, dlen);
+	dir_clean[dlen] = '\0';
+	while (dlen > 1 && dir_clean[dlen - 1] == '/') dir_clean[--dlen] = '\0';
+
+	snprintf(out, out_size, "%s/%s.rar", dir_clean, base_copy);
+}
+
+/* ========================================================================== */
 /* cmd_add — create RAR5 archive with optional compression                    */
 /* ========================================================================== */
 
 static int cmd_add(int argc, char **argv) {
-	/* Parse optional -mN flag before archive path */
+	/* Parse flags: -mN, -o/--output, -v<size> in any order */
 	uint8_t method = 3; /* default compression level */
-	int arg_start = 2;  /* index of archive path in argv */
+	const char *output_path = NULL;
+	uint64_t volume_size = 0;
 
-	if (argc > 2 && argv[2][0] == '-' && argv[2][1] == 'm') {
-		char level_ch = argv[2][2];
-		if (level_ch >= '0' && level_ch <= '5' && argv[2][3] == '\0') {
-			method = (uint8_t)(level_ch - '0');
-			arg_start = 3;
+	/* Collect positional arguments (non-flag args after command) */
+	const char *positionals[4096];
+	int positional_count = 0;
+
+	for (int i = 2; i < argc; i++) {
+		if (argv[i][0] == '-') {
+			/* -mN */
+			if (argv[i][1] == 'm' && argv[i][2] >= '0' && argv[i][2] <= '5' && argv[i][3] == '\0') {
+				method = (uint8_t)(argv[i][2] - '0');
+			}
+			/* -o <path> or --output <path> */
+			else if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0) {
+				if (i + 1 >= argc) {
+					fprintf(stderr, "error: '%s' requires an argument\n", argv[i]);
+					return 1;
+				}
+				output_path = argv[++i];
+			}
+			/* -v<size> */
+			else if (argv[i][1] == 'v' && argv[i][2] != '\0') {
+				volume_size = parse_size_suffix(&argv[i][2]);
+				if (volume_size == 0) {
+					fprintf(stderr, "error: invalid volume size '%s' (use e.g. -v10k, -v10m, -v1g)\n",
+					        argv[i]);
+					return 1;
+				}
+				if (volume_size < 1024) {
+					fprintf(stderr, "error: minimum volume size is 1k (1024 bytes)\n");
+					return 1;
+				}
+			}
+			else {
+				fprintf(stderr, "error: unknown option '%s'\n", argv[i]);
+				return 1;
+			}
 		} else {
-			fprintf(stderr, "error: invalid compression level '%s' (use -m0 through -m5)\n",
-			        argv[2]);
-			return 1;
+			if (positional_count < (int)(sizeof(positionals) / sizeof(positionals[0]))) {
+				positionals[positional_count++] = argv[i];
+			}
 		}
 	}
 
-	if (argc <= arg_start) {
-		fprintf(stderr, "error: 'add' requires an archive path\n");
-		return 1;
-	}
+	/* Determine archive path and input files */
+	const char *archive_path;
+	const char **input_files;
+	int input_count;
+	char derived_name[4096];
 
-	const char *archive_path = argv[arg_start];
-	int input_count = argc - arg_start - 1;
+	if (output_path) {
+		/* -o mode: all positionals are input files */
+		if (positional_count == 0) {
+			fprintf(stderr, "error: no files specified\n");
+			return 1;
+		}
 
-	if (input_count == 0) {
-		fprintf(stderr, "error: no files specified\n");
-		return 1;
+		/* Check if output_path is an existing directory */
+		struct stat out_st;
+		if (stat(output_path, &out_st) == 0 && S_ISDIR(out_st.st_mode)) {
+			/* Directory: derive archive name from first input */
+			derive_archive_name(derived_name, sizeof(derived_name),
+			                    output_path, positionals[0]);
+			archive_path = derived_name;
+		} else {
+			/* File path: use as-is */
+			archive_path = output_path;
+		}
+
+		input_files = positionals;
+		input_count = positional_count;
+	} else {
+		/* No -o: first positional is archive path, rest are files */
+		if (positional_count < 1) {
+			fprintf(stderr, "error: 'add' requires an archive path\n");
+			return 1;
+		}
+		if (positional_count < 2) {
+			fprintf(stderr, "error: no files specified\n");
+			return 1;
+		}
+
+		archive_path = positionals[0];
+		input_files = &positionals[1];
+		input_count = positional_count - 1;
 	}
 
 	/* Build entry list from arguments (may expand via directory recursion) */
@@ -1103,27 +1116,26 @@ static int cmd_add(int argc, char **argv) {
 		return 1;
 	}
 
+	progrez_ctx *pctx = progrez_create("Reading");
+	progrez_set_identity(pctx, "rarz", archive_path);
+	progrez_set_indeterminate(pctx);
+
 	for (int i = 0; i < input_count; i++) {
-		const char *path = argv[arg_start + 1 + i];
+		const char *path = input_files[i];
 		struct stat st;
 
-		if (g_is_tty) {
-			/* Show which file we're reading */
-			const char *bname = strrchr(path, '/');
-			bname = bname ? bname + 1 : path;
-			progress_show("Reading", bname, i + 1, input_count, -1, NULL, NULL);
-		}
+		progrez_update(pctx, (uint64_t)(i + 1), 0);
 
 		if (lstat(path, &st) != 0) {
-			progress_clear();
 			fprintf(stderr, "error: cannot stat '%s': %s\n", path, strerror(errno));
+			progrez_finish(pctx);
+			progrez_destroy(pctx);
 			entry_list_free(&list);
 			return 1;
 		}
 
 #ifndef _WIN32
 		if (S_ISLNK(st.st_mode)) {
-			progress_clear();
 			fprintf(stderr, "warning: skipping symlink '%s'\n", path);
 			continue;
 		}
@@ -1155,6 +1167,8 @@ static int cmd_add(int argc, char **argv) {
 			walk_directory(&list, clean_path, dir_archive);
 #else
 			fprintf(stderr, "error: directory archiving not supported on Windows yet\n");
+			progrez_finish(pctx);
+			progrez_destroy(pctx);
 			entry_list_free(&list);
 			return 1;
 #endif
@@ -1166,12 +1180,16 @@ static int cmd_add(int argc, char **argv) {
 			size_t fsize = 0;
 			uint8_t *fdata = read_file(path, &fsize);
 			if (!fdata) {
+				progrez_finish(pctx);
+				progrez_destroy(pctx);
 				entry_list_free(&list);
 				return 1;
 			}
 			if (entry_list_add_file(&list, name, fdata, fsize, &st) != 0) {
 				free(fdata);
 				fprintf(stderr, "error: out of memory\n");
+				progrez_finish(pctx);
+				progrez_destroy(pctx);
 				entry_list_free(&list);
 				return 1;
 			}
@@ -1182,6 +1200,8 @@ static int cmd_add(int argc, char **argv) {
 
 	if (list.count == 0) {
 		fprintf(stderr, "error: no files to archive\n");
+		progrez_finish(pctx);
+		progrez_destroy(pctx);
 		entry_list_free(&list);
 		return 1;
 	}
@@ -1195,38 +1215,133 @@ static int cmd_add(int argc, char **argv) {
 	}
 
 	int result = 0;
-	double compress_start = get_time_sec();
 
-	/* Show compression start (TTY only) */
-	if (g_is_tty) {
-		char size_buf[32], method_buf[8];
-		format_bytes(size_buf, sizeof(size_buf), total_input);
-		if (method == 0)
-			snprintf(method_buf, sizeof(method_buf), "store");
-		else
-			snprintf(method_buf, sizeof(method_buf), "m%d", method);
-		fprintf(stderr, "\r  Compressing %d file%s (%s) with %s...    ",
-		        file_entries, file_entries == 1 ? "" : "s",
-		        size_buf, method_buf);
-		fflush(stderr);
+	/* Switch progress to compression mode */
+	progrez_set_label(pctx, method == 0 ? "Storing" : "Compressing");
+	progrez_update(pctx, (uint64_t)file_entries, total_input);
+
+	/* ============================================================ */
+	/* Volume creation path                                         */
+	/* ============================================================ */
+	if (volume_size > 0) {
+		rarz_volumes *vols = rarz_create_volumes(list.entries, (uint32_t)list.count,
+		                                          volume_size, method);
+		if (!vols) {
+			const char *verr = rarz_last_error();
+			fprintf(stderr, "error: volume creation failed%s%s\n",
+			        verr ? ": " : "", verr ? verr : "");
+			progrez_finish(pctx);
+			progrez_destroy(pctx);
+			entry_list_free(&list);
+			return 1;
+		}
+
+		uint32_t nvols = rarz_volume_count(vols);
+
+		/* Build base path: strip .rar extension from archive_path */
+		char base_path[4096];
+		size_t ap_len = strlen(archive_path);
+		if (ap_len >= 4 && strcmp(archive_path + ap_len - 4, ".rar") == 0) {
+			memcpy(base_path, archive_path, ap_len - 4);
+			base_path[ap_len - 4] = '\0';
+		} else {
+			snprintf(base_path, sizeof(base_path), "%s", archive_path);
+		}
+
+		/* Determine digit width for part numbers */
+		int digits = 1;
+		if (nvols > 9) digits = 2;
+		if (nvols > 99) digits = 3;
+		if (nvols > 999) digits = 4;
+
+		uint64_t total_written = 0;
+		int write_errors = 0;
+
+		for (uint32_t vi = 0; vi < nvols; vi++) {
+			const uint8_t *vol_data = NULL;
+			size_t vol_len = 0;
+			if (rarz_volume_data(vols, vi, &vol_data, &vol_len) != 0) {
+				fprintf(stderr, "error: cannot get volume %u data\n", vi + 1);
+				write_errors++;
+				continue;
+			}
+
+			char vol_path[4096];
+			snprintf(vol_path, sizeof(vol_path), "%s.part%0*u.rar",
+			         base_path, digits, vi + 1);
+
+			/* Ensure parent directory exists */
+			if (ensure_parent_dir(vol_path) != 0) {
+				fprintf(stderr, "error: cannot create parent directory for '%s'\n", vol_path);
+				write_errors++;
+				continue;
+			}
+
+			FILE *vf = fopen(vol_path, "wb");
+			if (!vf) {
+				fprintf(stderr, "error: cannot create '%s': %s\n",
+				        vol_path, strerror(errno));
+				write_errors++;
+				continue;
+			}
+
+			size_t nw = fwrite(vol_data, 1, vol_len, vf);
+			fclose(vf);
+
+			if (nw != vol_len) {
+				fprintf(stderr, "error: short write to '%s'\n", vol_path);
+				write_errors++;
+				continue;
+			}
+
+			total_written += vol_len;
+		}
+
+		rarz_volumes_free(vols);
+		progrez_finish(pctx);
+		progrez_destroy(pctx);
+		entry_list_free(&list);
+
+		if (write_errors > 0) {
+			fprintf(stderr, "error: %d volume(s) failed to write\n", write_errors);
+			return 1;
+		}
+
+		char in_buf[32], out_buf2[32];
+		format_bytes(in_buf, sizeof(in_buf), total_input);
+		format_bytes(out_buf2, sizeof(out_buf2), total_written);
+		int ratio = total_input > 0 ? (int)((total_written * 100) / total_input) : 100;
+		printf("Created %u volume%s (%s -> %s, %d%%, %d file%s, %s)\n",
+		       nvols, nvols == 1 ? "" : "s",
+		       in_buf, out_buf2, ratio,
+		       file_entries, file_entries == 1 ? "" : "s",
+		       method == 0 ? "store" : "compressed");
+
+		return 0;
 	}
+
+	/* ============================================================ */
+	/* Single-archive path                                          */
+	/* ============================================================ */
 
 	/* For store mode, use the simpler path with exact size calculation */
 	if (method == 0) {
 		int64_t needed = rarz_calculate_archive_size(list.entries, (uint32_t)list.count);
 		if (needed <= 0) {
-			progress_clear();
 			const char *cerr = rarz_last_error();
 			fprintf(stderr, "error: cannot calculate archive size%s%s\n",
 			        cerr ? ": " : "", cerr ? cerr : "");
+			progrez_finish(pctx);
+			progrez_destroy(pctx);
 			entry_list_free(&list);
 			return 1;
 		}
 
 		uint8_t *archive_buf = (uint8_t *)malloc((size_t)needed);
 		if (!archive_buf) {
-			progress_clear();
 			fprintf(stderr, "error: cannot allocate %lld bytes\n", (long long)needed);
+			progrez_finish(pctx);
+			progrez_destroy(pctx);
 			entry_list_free(&list);
 			return 1;
 		}
@@ -1234,22 +1349,24 @@ static int cmd_add(int argc, char **argv) {
 		int64_t written = rarz_create_archive(list.entries, (uint32_t)list.count,
 		                                       archive_buf, (size_t)needed);
 		if (written <= 0) {
-			progress_clear();
 			const char *aerr = rarz_last_error();
 			fprintf(stderr, "error: archive creation failed (code %lld)%s%s\n",
 			        (long long)written,
 			        aerr ? ": " : "", aerr ? aerr : "");
 			free(archive_buf);
+			progrez_finish(pctx);
+			progrez_destroy(pctx);
 			entry_list_free(&list);
 			return 1;
 		}
 
 		FILE *out = fopen(archive_path, "wb");
 		if (!out) {
-			progress_clear();
 			fprintf(stderr, "error: cannot create '%s': %s\n",
 			        archive_path, strerror(errno));
 			free(archive_buf);
+			progrez_finish(pctx);
+			progrez_destroy(pctx);
 			entry_list_free(&list);
 			return 1;
 		}
@@ -1259,22 +1376,22 @@ static int cmd_add(int argc, char **argv) {
 		free(archive_buf);
 
 		if (nwritten != (size_t)written) {
-			progress_clear();
 			fprintf(stderr, "error: short write to '%s'\n", archive_path);
+			progrez_finish(pctx);
+			progrez_destroy(pctx);
 			entry_list_free(&list);
 			return 1;
 		}
 
-		progress_clear();
-		double elapsed = get_time_sec() - compress_start;
-		char in_buf[32], out_buf2[32], rate_buf[32];
+		progrez_finish(pctx);
+		progrez_destroy(pctx);
+
+		char in_buf[32], out_buf2[32];
 		format_bytes(in_buf, sizeof(in_buf), total_input);
 		format_bytes(out_buf2, sizeof(out_buf2), (uint64_t)written);
-		format_throughput(rate_buf, sizeof(rate_buf), total_input, elapsed);
-		printf("Created %s (%s -> %s, %d file%s, store, %.2fs, %s)\n",
+		printf("Created %s (%s -> %s, %d file%s, store)\n",
 		       archive_path, in_buf, out_buf2,
-		       file_entries, file_entries == 1 ? "" : "s",
-		       elapsed, rate_buf);
+		       file_entries, file_entries == 1 ? "" : "s");
 	} else {
 		/* Compressed mode: allocate generous buffer (input size + overhead) */
 		/* Compressed output can be larger than input for incompressible data,
@@ -1283,8 +1400,9 @@ static int cmd_add(int argc, char **argv) {
 
 		uint8_t *archive_buf = (uint8_t *)malloc(buf_size);
 		if (!archive_buf) {
-			progress_clear();
 			fprintf(stderr, "error: cannot allocate %zu bytes\n", buf_size);
+			progrez_finish(pctx);
+			progrez_destroy(pctx);
 			entry_list_free(&list);
 			return 1;
 		}
@@ -1294,22 +1412,24 @@ static int cmd_add(int argc, char **argv) {
 			archive_buf, buf_size, method);
 
 		if (written <= 0) {
-			progress_clear();
 			const char *cerr2 = rarz_last_error();
 			fprintf(stderr, "error: archive creation failed (code %lld)%s%s\n",
 			        (long long)written,
 			        cerr2 ? ": " : "", cerr2 ? cerr2 : "");
 			free(archive_buf);
+			progrez_finish(pctx);
+			progrez_destroy(pctx);
 			entry_list_free(&list);
 			return 1;
 		}
 
 		FILE *out = fopen(archive_path, "wb");
 		if (!out) {
-			progress_clear();
 			fprintf(stderr, "error: cannot create '%s': %s\n",
 			        archive_path, strerror(errno));
 			free(archive_buf);
+			progrez_finish(pctx);
+			progrez_destroy(pctx);
 			entry_list_free(&list);
 			return 1;
 		}
@@ -1319,23 +1439,24 @@ static int cmd_add(int argc, char **argv) {
 		free(archive_buf);
 
 		if (nwritten != (size_t)written) {
-			progress_clear();
 			fprintf(stderr, "error: short write to '%s'\n", archive_path);
+			progrez_finish(pctx);
+			progrez_destroy(pctx);
 			entry_list_free(&list);
 			return 1;
 		}
 
-		progress_clear();
-		double elapsed = get_time_sec() - compress_start;
-		char in_buf[32], out_buf2[32], rate_buf[32];
+		progrez_finish(pctx);
+		progrez_destroy(pctx);
+
+		char in_buf[32], out_buf2[32];
 		format_bytes(in_buf, sizeof(in_buf), total_input);
 		format_bytes(out_buf2, sizeof(out_buf2), (uint64_t)written);
-		format_throughput(rate_buf, sizeof(rate_buf), total_input, elapsed);
 		int ratio = total_input > 0 ? (int)(((uint64_t)written * 100) / total_input) : 100;
-		printf("Created %s (%s -> %s, %d%%, %d file%s, -m%d, %.2fs, %s)\n",
+		printf("Created %s (%s -> %s, %d%%, %d file%s, -m%d)\n",
 		       archive_path, in_buf, out_buf2, ratio,
 		       file_entries, file_entries == 1 ? "" : "s",
-		       method, elapsed, rate_buf);
+		       method);
 	}
 
 	entry_list_free(&list);
@@ -1395,11 +1516,8 @@ int main(int argc, char **argv) {
 		return cmd_extract(argv[2], argc >= 4 ? argv[3] : NULL);
 
 	case CMD_ADD: {
-		/* Minimum: rarz add archive file (4 args), or rarz add -mN archive file (5 args) */
-		int min_args = 4;
-		if (argc > 2 && argv[2][0] == '-' && argv[2][1] == 'm') min_args = 5;
-		if (argc < min_args) {
-			fprintf(stderr, "error: 'add' requires an archive path and at least one file\n");
+		if (argc < 4) {
+			fprintf(stderr, "error: 'add' requires at least an archive path and one file\n");
 			return 1;
 		}
 		return cmd_add(argc, argv);

@@ -32,6 +32,15 @@ pub fn build(b: *std.Build) void {
 	exe.root_module.addIncludePath(b.path("include"));
 	exe.linkLibrary(lib);
 	exe.root_module.link_libc = true;
+
+	// Link progrez library for progress indication
+	const progrez_dep = b.dependency("progrez", .{
+		.target = target,
+		.optimize = optimize,
+	});
+	exe.linkLibrary(progrez_dep.artifact("progrez"));
+	exe.root_module.addIncludePath(progrez_dep.path("include"));
+
 	b.installArtifact(exe);
 
 	// Run step

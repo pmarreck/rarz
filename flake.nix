@@ -15,40 +15,97 @@
             builtins.elem (nixpkgs.lib.getName pkg) [ "rar" "unrar" ];
         };
 
+        pname = "rarz";
+        version = "0.1.0";
+
+        isDarwin = pkgs.stdenv.isDarwin;
+
+        zigDepsHash = "sha256-+IL2kbFzS94RtafZEei+azVo32dFAr6IFr0Pky6qURc=";
+
+        zigDeps = pkgs.stdenv.mkDerivation {
+          pname = "${pname}-zig-deps";
+          inherit version;
+          src = self;
+          nativeBuildInputs = with pkgs; [ zig git cacert ]
+            ++ pkgs.lib.optionals isDarwin [
+              pkgs.darwin.cctools
+              pkgs.apple-sdk
+            ];
+          outputHashMode = "recursive";
+          outputHashAlgo = "sha256";
+          outputHash = zigDepsHash;
+          buildPhase = ''
+            export HOME=$TMPDIR
+            export ZIG_GLOBAL_CACHE_DIR=$out
+            export SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
+            export GIT_SSL_CAINFO=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
+            zig build --fetch=all
+          '';
+          dontInstall = true;
+          dontFixup = true;
+        };
+
         rarz = pkgs.stdenv.mkDerivation {
-          pname = "rarz";
-          version = "0.1.0";
+          inherit pname version;
           src = self;
 
-          nativeBuildInputs = [ pkgs.zig ];
+          nativeBuildInputs = [ pkgs.zig ]
+            ++ pkgs.lib.optionals isDarwin [
+              pkgs.darwin.cctools
+              pkgs.apple-sdk
+            ];
 
           dontConfigure = true;
           dontFixup = true;
 
           buildPhase = ''
+            export HOME="$TMPDIR"
             export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-cache
-            zig build --cache-dir .zig-cache -Doptimize=ReleaseFast
+            mkdir -p $ZIG_GLOBAL_CACHE_DIR
+            cp -r ${zigDeps}/* $ZIG_GLOBAL_CACHE_DIR/
+            chmod -R u+w $ZIG_GLOBAL_CACHE_DIR
+            zig build --prefix $out -Doptimize=ReleaseFast
           '';
-
-          checkPhase = ''
-            export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-cache
-            zig build test --cache-dir .zig-cache
-          '';
-          doCheck = true;
 
           installPhase = ''
-            mkdir -p $out/bin $out/lib $out/include
-            cp zig-out/bin/rarz $out/bin/
-            cp zig-out/lib/librarz.a $out/lib/
-            cp include/rarz.h $out/include/
+            mkdir -p $out/lib $out/include
+            cp zig-out/lib/librarz.a $out/lib/ || true
+            cp include/rarz.h $out/include/ || true
+          '';
+        };
+
+        checks-test = pkgs.stdenv.mkDerivation {
+          pname = "${pname}-tests";
+          inherit version;
+          src = self;
+
+          nativeBuildInputs = [ pkgs.zig ]
+            ++ pkgs.lib.optionals isDarwin [
+              pkgs.darwin.cctools
+              pkgs.apple-sdk
+            ];
+
+          dontConfigure = true;
+          dontFixup = true;
+
+          buildPhase = ''
+            export HOME="$TMPDIR"
+            export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-cache
+            mkdir -p $ZIG_GLOBAL_CACHE_DIR
+            cp -r ${zigDeps}/* $ZIG_GLOBAL_CACHE_DIR/
+            chmod -R u+w $ZIG_GLOBAL_CACHE_DIR
+            timeout 600 zig build test || { echo "Tests failed"; exit 1; }
+          '';
+
+          installPhase = ''
+            mkdir -p $out
+            echo "tests passed" > $out/result
           '';
         };
       in {
         packages.default = rarz;
 
-        checks.default = rarz.overrideAttrs (old: {
-          doCheck = true;
-        });
+        checks.default = checks-test;
 
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [

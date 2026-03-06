@@ -397,6 +397,263 @@ fn validate_rar5_payload(data: []const u8, sig_offset: usize, sig_len: u8) Valid
 }
 
 // ============================================================================
+// Multi-volume validation
+// ============================================================================
+
+/// Internal type for tracking file chunks across volumes.
+const VolumeFileChunk = struct {
+	volume_idx: usize,
+	data_ptr: [*]const u8,
+	data_len: usize,
+	name: []const u8,
+	unpacked_size: u64,
+	compression: rar5_headers.CompressionInfo,
+	data_crc32: ?u32,
+	has_crc32: bool,
+	split_before: bool,
+	split_after: bool,
+};
+
+/// Validate a multi-volume RAR5 archive.
+///
+/// Validates structural integrity of each volume, then concatenates split file
+/// data across volumes and verifies CRC32 of the reassembled content.
+pub fn validate_volumes(volumes: []const []const u8) ValidationResult {
+	if (volumes.len == 0) {
+		return invalid_result(null, "empty volumes list");
+	}
+
+	// Single volume: delegate to standard validate
+	if (volumes.len == 1) {
+		return validate(volumes[0]);
+	}
+
+	const alloc = std.heap.page_allocator;
+
+	// Step 1: Structural validation of each volume, all must be RAR5
+	var total_block_count: u32 = 0;
+	for (volumes) |vol_data| {
+		const fmt = detect_mod.detect_format(vol_data, 0);
+		const family = fmt.family orelse {
+			return invalid_result(null, "no recognized RAR signature in volume");
+		};
+		if (family != .rar50) {
+			return invalid_result(family, "multi-volume validation only supported for RAR5");
+		}
+
+		// Structural validation
+		const structural = validate_rar5_structural(vol_data, fmt.signature_offset, fmt.signature_len);
+		if (!structural.is_valid) return structural;
+		if (structural.has_encrypted_content) return structural;
+		total_block_count += structural.block_count;
+	}
+
+	// Step 2: Collect file chunks from all volumes
+	var chunks: std.ArrayList(VolumeFileChunk) = .empty;
+	defer chunks.deinit(alloc);
+
+	for (volumes, 0..) |vol_data, vi| {
+		const fmt = detect_mod.detect_format(vol_data, 0);
+		const block_start = fmt.signature_offset + fmt.signature_len;
+		var iter = rar5_headers.walk_blocks(vol_data[block_start..]);
+
+		while (true) {
+			const maybe_block = iter.next() catch break;
+			const block = maybe_block orelse break;
+
+			switch (block) {
+				.file => |f| {
+					// Compute absolute offset of packed data in this volume
+					const total_header = 4 + f.header.crc_data_len;
+					const payload_start = block_start + f.header.header_start + total_header;
+					const data_size = f.header.data_size orelse 0;
+					const payload_end = payload_start + @as(usize, @intCast(data_size));
+
+					if (payload_end <= vol_data.len) {
+						chunks.append(alloc, .{
+							.volume_idx = vi,
+							.data_ptr = vol_data[payload_start..payload_end].ptr,
+							.data_len = @intCast(data_size),
+							.name = f.name,
+							.unpacked_size = f.unpacked_size,
+							.compression = f.compression,
+							.data_crc32 = f.data_crc32,
+							.has_crc32 = f.has_crc32,
+							.split_before = f.header.flags.split_before,
+							.split_after = f.header.flags.split_after,
+						}) catch {
+							return invalid_result(.rar50, "out of memory collecting file chunks");
+						};
+					}
+				},
+				.end_archive => break,
+				else => {},
+			}
+		}
+	}
+
+	// Step 3: Walk chunks, merge split files, verify CRCs
+	var file_count: u32 = 0;
+	var i: usize = 0;
+	while (i < chunks.items.len) {
+		const first = chunks.items[i];
+
+		// Skip split_before chunks (consumed by merge loop below)
+		if (first.split_before) {
+			i += 1;
+			continue;
+		}
+
+		file_count += 1;
+
+		if (!first.split_after) {
+			// Complete file in single volume — validate inline
+			if (first.data_len > 0 and first.has_crc32) {
+				const payload = first.data_ptr[0..first.data_len];
+
+				if (first.compression.method == 0) {
+					// Store method — CRC the raw data
+					const computed_crc = integrity.crc32(payload);
+					if (computed_crc != first.data_crc32.?) {
+						return .{
+							.is_valid = false,
+							.family = .rar50,
+							.has_encrypted_content = false,
+							.error_message = "payload CRC32 mismatch",
+							.block_count = total_block_count,
+							.file_count = file_count,
+						};
+					}
+				} else {
+					// Compressed — decompress then CRC
+					const decompressed = dispatch.decompressRar5(
+						alloc,
+						payload,
+						first.unpacked_size,
+						first.compression,
+					) catch {
+						return .{
+							.is_valid = false,
+							.family = .rar50,
+							.has_encrypted_content = false,
+							.error_message = "decompression failed during validation",
+							.block_count = total_block_count,
+							.file_count = file_count,
+						};
+					};
+					defer alloc.free(decompressed);
+
+					const computed_crc = integrity.crc32(decompressed);
+					if (computed_crc != first.data_crc32.?) {
+						return .{
+							.is_valid = false,
+							.family = .rar50,
+							.has_encrypted_content = false,
+							.error_message = "payload CRC32 mismatch",
+							.block_count = total_block_count,
+							.file_count = file_count,
+						};
+					}
+				}
+			}
+			i += 1;
+			continue;
+		}
+
+		// Split file — collect all continuation chunks
+		var total_packed: usize = first.data_len;
+		var j: usize = i + 1;
+		while (j < chunks.items.len) {
+			const cont = chunks.items[j];
+			if (!cont.split_before) break;
+			if (!std.mem.eql(u8, first.name, cont.name)) break;
+
+			total_packed += cont.data_len;
+			j += 1;
+			if (!cont.split_after) break;
+		}
+
+		// Verify CRC if present
+		if (first.has_crc32 and total_packed > 0) {
+			// Concatenate packed data from all chunks
+			const concat = alloc.alloc(u8, total_packed) catch {
+				return invalid_result(.rar50, "out of memory merging split file");
+			};
+			defer alloc.free(concat);
+
+			var offset: usize = 0;
+			// First chunk
+			@memcpy(concat[offset..][0..first.data_len], first.data_ptr[0..first.data_len]);
+			offset += first.data_len;
+			// Continuation chunks
+			var k: usize = i + 1;
+			while (k < j) : (k += 1) {
+				const cont = chunks.items[k];
+				@memcpy(concat[offset..][0..cont.data_len], cont.data_ptr[0..cont.data_len]);
+				offset += cont.data_len;
+			}
+
+			if (first.compression.method == 0) {
+				// Store method — CRC the concatenated raw data
+				const computed_crc = integrity.crc32(concat);
+				if (computed_crc != first.data_crc32.?) {
+					return .{
+						.is_valid = false,
+						.family = .rar50,
+						.has_encrypted_content = false,
+						.error_message = "payload CRC32 mismatch",
+						.block_count = total_block_count,
+						.file_count = file_count,
+					};
+				}
+			} else {
+				// Compressed — decompress concatenated packed data, then CRC
+				const decompressed = dispatch.decompressRar5(
+					alloc,
+					concat,
+					first.unpacked_size,
+					first.compression,
+				) catch {
+					return .{
+						.is_valid = false,
+						.family = .rar50,
+						.has_encrypted_content = false,
+						.error_message = "decompression failed during validation",
+						.block_count = total_block_count,
+						.file_count = file_count,
+					};
+				};
+				defer alloc.free(decompressed);
+
+				const computed_crc = integrity.crc32(decompressed);
+				if (computed_crc != first.data_crc32.?) {
+					return .{
+						.is_valid = false,
+						.family = .rar50,
+						.has_encrypted_content = false,
+						.error_message = "payload CRC32 mismatch",
+						.block_count = total_block_count,
+						.file_count = file_count,
+					};
+				}
+			}
+		}
+
+		i = j;
+		continue;
+	}
+
+	return .{
+		.is_valid = true,
+		.family = .rar50,
+		.has_encrypted_content = false,
+		.error_message = null,
+		.block_count = total_block_count,
+		.file_count = file_count,
+	};
+}
+
+// ============================================================================
 // Main entry point
 // ============================================================================
 
@@ -1296,4 +1553,131 @@ test "validate handles truncation at every position of a valid RAR5 archive" {
 		const result = validate(buf[0..len]);
 		_ = result; // must not crash
 	}
+}
+
+// ============================================================================
+// Multi-volume validation tests
+// ============================================================================
+
+test "validate_volumes: valid store file split across 2 volumes" {
+	const writer = @import("writer.zig");
+	const alloc = testing.allocator;
+
+	// Create a file large enough to split across 2 volumes
+	const file_data = "Hello, multi-volume world! This is a test of split file validation across volumes.";
+	const entries = [_]writer.FileEntry{.{
+		.name = "test.txt",
+		.data = file_data,
+		.mtime = 0x5C000000,
+		.is_directory = false,
+	}};
+
+	// Use small volume size to force splitting
+	var result = try writer.write_archive_volumes(alloc, &entries, .{ .volume_size = 128 });
+	defer result.deinit();
+
+	try testing.expect(result.count >= 2);
+
+	// Build slices array
+	const vol_slices = try alloc.alloc([]const u8, result.count);
+	defer alloc.free(vol_slices);
+	for (0..result.count) |i| {
+		vol_slices[i] = result.volumes[i];
+	}
+
+	const vr = validate_volumes(vol_slices);
+	try testing.expect(vr.is_valid);
+	try testing.expectEqual(@as(u32, 1), vr.file_count);
+}
+
+test "validate_volumes: CRC mismatch in split file" {
+	const writer = @import("writer.zig");
+	const alloc = testing.allocator;
+
+	const file_data = "Hello, multi-volume world! This is a test of split file validation across volumes.";
+	const entries = [_]writer.FileEntry{.{
+		.name = "test.txt",
+		.data = file_data,
+		.mtime = 0x5C000000,
+		.is_directory = false,
+	}};
+
+	var result = try writer.write_archive_volumes(alloc, &entries, .{ .volume_size = 128 });
+	defer result.deinit();
+
+	try testing.expect(result.count >= 2);
+
+	// Corrupt a byte in the data area of the second volume
+	const vol2 = result.volumes[1];
+	// Find a byte in the data area (after headers, near middle of volume)
+	const corrupt_pos = vol2.len / 2;
+	vol2[corrupt_pos] ^= 0xFF;
+
+	const vol_slices = try alloc.alloc([]const u8, result.count);
+	defer alloc.free(vol_slices);
+	for (0..result.count) |i| {
+		vol_slices[i] = result.volumes[i];
+	}
+
+	const vr = validate_volumes(vol_slices);
+	try testing.expect(!vr.is_valid);
+}
+
+test "validate_volumes: mixed split and non-split files" {
+	const writer = @import("writer.zig");
+	const alloc = testing.allocator;
+
+	// Two small files that fit in one volume + one large file that splits
+	const entries = [_]writer.FileEntry{
+		.{ .name = "small1.txt", .data = "Hi!", .mtime = 0, .is_directory = false },
+		.{ .name = "small2.txt", .data = "Hey!", .mtime = 0, .is_directory = false },
+		.{
+			.name = "big.txt",
+			.data = "This is a much larger file that should definitely be split across multiple volumes in the archive.",
+			.mtime = 0,
+			.is_directory = false,
+		},
+	};
+
+	// Volume size chosen so small files fit but big file splits
+	var result = try writer.write_archive_volumes(alloc, &entries, .{ .volume_size = 180 });
+	defer result.deinit();
+
+	try testing.expect(result.count >= 2);
+
+	const vol_slices = try alloc.alloc([]const u8, result.count);
+	defer alloc.free(vol_slices);
+	for (0..result.count) |i| {
+		vol_slices[i] = result.volumes[i];
+	}
+
+	const vr = validate_volumes(vol_slices);
+	try testing.expect(vr.is_valid);
+	try testing.expectEqual(@as(u32, 3), vr.file_count);
+}
+
+test "validate_volumes: single volume passthrough" {
+	const writer = @import("writer.zig");
+
+	const file_data = "Hello, single volume!";
+	const entries = [_]writer.FileEntry{.{
+		.name = "test.txt",
+		.data = file_data,
+		.mtime = 0x5C000000,
+		.is_directory = false,
+	}};
+
+	var buf: [4096]u8 = undefined;
+	const archive_len = try writer.write_archive(&entries, &buf);
+
+	const vol_slices = [_][]const u8{buf[0..archive_len]};
+	const vr = validate_volumes(&vol_slices);
+	try testing.expect(vr.is_valid);
+	try testing.expectEqual(@as(u32, 1), vr.file_count);
+}
+
+test "validate_volumes: empty volumes slice" {
+	const vol_slices = [_][]const u8{};
+	const vr = validate_volumes(&vol_slices);
+	try testing.expect(!vr.is_valid);
 }

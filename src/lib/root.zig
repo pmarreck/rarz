@@ -367,6 +367,60 @@ export fn rarz_validate(data_ptr: ?[*]const u8, len: usize) RarzValidationResult
 	};
 }
 
+export fn rarz_validate_volumes(
+	volumes_ptr: ?[*]const [*]const u8,
+	lengths_ptr: ?[*]const usize,
+	volume_count: u32,
+) RarzValidationResult {
+	const invalid_result = RarzValidationResult{
+		.is_valid = 0,
+		.family = 0,
+		.has_encrypted = 0,
+		.block_count = 0,
+		.file_count = 0,
+		.error_msg = "invalid data",
+	};
+
+	if (volume_count == 0) return invalid_result;
+	const vols = if (volumes_ptr) |v| v[0..volume_count] else return invalid_result;
+	const lens = if (lengths_ptr) |l| l[0..volume_count] else return invalid_result;
+
+	// Build slice of slices
+	const alloc = std.heap.page_allocator;
+	const vol_slices = alloc.alloc([]const u8, volume_count) catch {
+		setLastError("out of memory");
+		return invalid_result;
+	};
+	defer alloc.free(vol_slices);
+
+	for (0..volume_count) |i| {
+		vol_slices[i] = vols[i][0..lens[i]];
+	}
+
+	const result = policy.validate_volumes(vol_slices);
+
+	const family_code: i32 = if (result.family) |f| switch (f) {
+		.rar14 => @as(i32, 14),
+		.rar15 => @as(i32, 15),
+		.rar50 => @as(i32, 50),
+	} else 0;
+
+	const error_msg: ?[*:0]const u8 = if (result.error_message) |msg|
+		@ptrCast(msg.ptr)
+	else
+		null;
+
+	clearLastError();
+	return RarzValidationResult{
+		.is_valid = @intFromBool(result.is_valid),
+		.family = family_code,
+		.has_encrypted = @intFromBool(result.has_encrypted_content),
+		.block_count = result.block_count,
+		.file_count = result.file_count,
+		.error_msg = error_msg,
+	};
+}
+
 export fn rarz_extract_to_buffer(
 	archive: ?*const ArchiveHandle,
 	index: u32,

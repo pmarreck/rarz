@@ -661,41 +661,82 @@ static int cmd_test(const char *path) {
 		return 1;
 	}
 
-	int all_valid = 1;
-	for (int i = 0; i < vs.count; i++) {
-		size_t len = 0;
-		uint8_t *data = read_file(vs.paths[i], &len);
-		if (!data) { all_valid = 0; continue; }
+	printf("Testing archive: %s", path);
+	if (vs.count > 1) printf(" (%d volumes)", vs.count);
+	printf("\n");
 
-		if (i == 0) {
-			printf("Testing archive: %s", path);
-			if (vs.count > 1) printf(" (%d volumes)", vs.count);
-			printf("\n");
+	if (vs.count > 1) {
+		/* Multi-volume: load all volumes and validate together */
+		uint8_t **vol_bufs = calloc(vs.count, sizeof(uint8_t *));
+		size_t *vol_lens = calloc(vs.count, sizeof(size_t));
+		if (!vol_bufs || !vol_lens) {
+			fprintf(stderr, "error: out of memory\n");
+			free(vol_bufs); free(vol_lens);
+			free_volume_set(&vs);
+			return 1;
 		}
 
-		rarz_validation_result result = rarz_validate(data, len);
-
-		if (!result.is_valid) {
-			printf("Volume %d (%s): INVALID\n", i + 1, vs.paths[i]);
-			if (result.error_msg)
-				printf("  Error: %s\n", result.error_msg);
-			all_valid = 0;
+		int load_ok = 1;
+		for (int i = 0; i < vs.count; i++) {
+			vol_bufs[i] = read_file(vs.paths[i], &vol_lens[i]);
+			if (!vol_bufs[i]) { load_ok = 0; break; }
 		}
 
-		if (i == 0) {
+		int ret = 1;
+		if (load_ok) {
+			rarz_validation_result result = rarz_validate_volumes(
+				(const uint8_t **)vol_bufs, vol_lens, (uint32_t)vs.count);
+
 			printf("Format: %s\n", format_name(result.family));
 			if (result.has_encrypted) {
 				printf("Encrypted: yes\n");
 				printf("Note: encrypted content not verified (use --password for full check)\n");
 			}
+
+			if (!result.is_valid) {
+				printf("Result: INVALID\n");
+				if (result.error_msg)
+					printf("  Error: %s\n", result.error_msg);
+			}
+
+			printf("Validation: %s\n", result.is_valid ? "VALID" : "INVALID");
+			ret = result.is_valid ? 0 : 1;
 		}
 
-		free(data);
+		for (int i = 0; i < vs.count; i++) free(vol_bufs[i]);
+		free(vol_bufs);
+		free(vol_lens);
+		free_volume_set(&vs);
+		return ret;
 	}
 
-	printf("Validation: %s\n", all_valid ? "VALID" : "INVALID");
+	/* Single volume: existing path */
+	size_t len = 0;
+	uint8_t *data = read_file(vs.paths[0], &len);
+	if (!data) {
+		free_volume_set(&vs);
+		return 1;
+	}
+
+	rarz_validation_result result = rarz_validate(data, len);
+
+	printf("Format: %s\n", format_name(result.family));
+	if (result.has_encrypted) {
+		printf("Encrypted: yes\n");
+		printf("Note: encrypted content not verified (use --password for full check)\n");
+	}
+
+	if (!result.is_valid) {
+		if (result.error_msg)
+			printf("  Error: %s\n", result.error_msg);
+	}
+
+	printf("Validation: %s\n", result.is_valid ? "VALID" : "INVALID");
+	int ret = result.is_valid ? 0 : 1;
+
+	free(data);
 	free_volume_set(&vs);
-	return all_valid ? 0 : 1;
+	return ret;
 }
 
 /* ========================================================================== */

@@ -119,6 +119,14 @@ typedef struct {
 /** Validate archive from buffer. */
 rarz_validation_result rarz_validate(const uint8_t *data, size_t len);
 
+/** Validate multi-volume archive from memory buffers.
+ * All volume data pointers must remain valid for the duration of the call.
+ * Volumes must be in order (part1, part2, ...).
+ */
+rarz_validation_result rarz_validate_volumes(const uint8_t **volumes,
+                                             const size_t *lengths,
+                                             uint32_t volume_count);
+
 /* ========================================================================== */
 /* Extraction                                                                 */
 /* ========================================================================== */

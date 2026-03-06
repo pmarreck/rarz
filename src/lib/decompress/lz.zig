@@ -44,7 +44,9 @@ pub const Window = struct {
     /// - distance == 0 or invalid: @memset(0)
     /// - distance == 1 (RLE): @memset with repeated byte
     /// - distance >= length (non-overlapping): @memcpy
-    /// - overlapping or wrapping: byte-by-byte fallback
+    /// - overlapping, distance >= 16, no wrap: SIMD stride copy
+    /// - wrapping: split into pre-wrap + post-wrap @memcpy
+    /// - small overlapping or complex wrapping: byte-by-byte fallback
     pub fn copyMatch(self: *Window, distance: usize, length: usize) void {
         if (length == 0) return;
 
@@ -78,12 +80,64 @@ pub const Window = struct {
             return;
         }
 
-        // Fallback: byte-by-byte for overlapping or wrapping cases
+        // Overlapping with distance >= 16, no wrap: stride copy in distance-sized chunks
+        // Safe because each chunk reads from already-written data
+        if (distance >= 2 and distance < length and dst_no_wrap and src_no_wrap) {
+            const dst = self.buffer[dst_phys..];
+            const src = self.buffer[src_phys..];
+            var copied: usize = 0;
+            // Copy in chunks of `distance` size (the repeating unit)
+            while (copied + distance <= length) {
+                @memcpy(dst[copied..][0..distance], src[copied..][0..distance]);
+                copied += distance;
+            }
+            // Tail
+            if (copied < length) {
+                const remain = length - copied;
+                @memcpy(dst[copied..][0..remain], src[copied..][0..remain]);
+            }
+            self.write_pos += length;
+            self.total_written += length;
+            return;
+        }
+
+        // Wrapping case: split into segments that don't wrap
+        if (!dst_no_wrap or !src_no_wrap) {
+            if (distance >= length) {
+                // Non-overlapping but wrapping: split copy
+                self.splitCopy(dst_phys, src_phys, length);
+                self.write_pos += length;
+                self.total_written += length;
+                return;
+            }
+        }
+
+        // Fallback: byte-by-byte for complex overlapping + wrapping cases
         var src_pos = self.write_pos -% distance;
         for (0..length) |_| {
             const byte = self.buffer[src_pos & self.mask];
             self.putByte(byte);
             src_pos +%= 1;
+        }
+    }
+
+    /// Split a non-overlapping copy across the circular buffer boundary.
+    fn splitCopy(self: *Window, dst_phys: usize, src_phys: usize, length: usize) void {
+        const buf_len = self.buffer.len;
+        var dst = dst_phys;
+        var src = src_phys;
+        var remaining = length;
+
+        while (remaining > 0) {
+            const dst_avail = buf_len - dst;
+            const src_avail = buf_len - src;
+            const chunk = @min(remaining, @min(dst_avail, src_avail));
+
+            @memcpy(self.buffer[dst..][0..chunk], self.buffer[src..][0..chunk]);
+
+            dst = (dst + chunk) & self.mask;
+            src = (src + chunk) & self.mask;
+            remaining -= chunk;
         }
     }
 

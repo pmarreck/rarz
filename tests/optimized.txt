@@ -1,0 +1,190 @@
+Generating test corpus...
+Corpus: 6 files, 4156KB total
+
+==================================================================
+  COMPRESSION RATIO COMPARISON
+==================================================================
+Level           Original         rar        rarz     rar %    rarz %
+------------------------------------------------------------------
+Store (m0)          3.7M        3.7M        3.7M    100.0%    100.0%
+m1                  3.7M        363K        400K      9.6%     10.6%
+m2                  3.7M        363K        401K      9.6%     10.6%
+m3                  3.7M        360K        399K      9.5%     10.6%
+m4                  3.7M        359K        402K      9.5%     10.6%
+m5                  3.7M        359K        402K      9.5%     10.7%
+
+==================================================================
+  COMPRESSION SPEED: rar vs rarz
+==================================================================
+
+--- m0 ---
+Benchmark 1: rar -m0
+  Time (mean ± σ):      31.7 ms ±  55.7 ms    [User: 2.3 ms, System: 4.6 ms]
+  Range (min … max):     6.1 ms … 131.5 ms    5 runs
+ 
+  Warning: Statistical outliers were detected. Consider re-running this benchmark on a quiet system without any interferences from other programs. It might help to use the '--warmup' or '--prepare' options.
+ 
+Benchmark 2: rarz -m0
+  Time (mean ± σ):       4.4 ms ±   0.6 ms    [User: 1.6 ms, System: 1.9 ms]
+  Range (min … max):     3.8 ms …   5.3 ms    5 runs
+ 
+  Warning: Command took less than 5 ms to complete. Note that the results might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+Summary
+  rarz -m0 ran
+    7.21 ± 12.69 times faster than rar -m0
+
+--- m1 ---
+Benchmark 1: rar -m1
+  Time (mean ± σ):      17.4 ms ±   0.2 ms    [User: 45.7 ms, System: 23.9 ms]
+  Range (min … max):    17.3 ms …  17.7 ms    5 runs
+ 
+  Warning: Statistical outliers were detected. Consider re-running this benchmark on a quiet system without any interferences from other programs. It might help to use the '--warmup' or '--prepare' options.
+ 
+Benchmark 2: rarz -m1
+  Time (mean ± σ):      27.5 ms ±   1.6 ms    [User: 35.4 ms, System: 8.1 ms]
+  Range (min … max):    25.8 ms …  29.0 ms    5 runs
+ 
+Summary
+  rar -m1 ran
+    1.58 ± 0.09 times faster than rarz -m1
+
+--- m3 ---
+Benchmark 1: rar -m3
+  Time (mean ± σ):      24.1 ms ±   1.0 ms    [User: 74.2 ms, System: 23.4 ms]
+  Range (min … max):    23.0 ms …  25.5 ms    5 runs
+ 
+Benchmark 2: rarz -m3
+  Time (mean ± σ):      45.0 ms ±   2.4 ms    [User: 55.7 ms, System: 8.9 ms]
+  Range (min … max):    42.3 ms …  47.5 ms    5 runs
+ 
+Summary
+  rar -m3 ran
+    1.87 ± 0.12 times faster than rarz -m3
+
+--- m5 ---
+Benchmark 1: rar -m5
+  Time (mean ± σ):      37.7 ms ±   1.4 ms    [User: 131.7 ms, System: 31.7 ms]
+  Range (min … max):    36.4 ms …  39.8 ms    5 runs
+ 
+Benchmark 2: rarz -m5
+  Time (mean ± σ):     106.1 ms ±  11.5 ms    [User: 128.1 ms, System: 10.1 ms]
+  Range (min … max):    97.4 ms … 126.1 ms    5 runs
+ 
+Summary
+  rar -m5 ran
+    2.82 ± 0.32 times faster than rarz -m5
+
+==================================================================
+  EXTRACTION SPEED: unrar vs rarz
+==================================================================
+
+--- m0 (3.7M) ---
+Benchmark 1: unrar m0
+  Time (mean ± σ):       3.9 ms ±   0.3 ms    [User: 1.7 ms, System: 3.0 ms]
+  Range (min … max):     3.5 ms …   4.2 ms    5 runs
+ 
+  Warning: Command took less than 5 ms to complete. Note that the results might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+Benchmark 2: rarz m0
+  Time (mean ± σ):       2.7 ms ±   0.2 ms    [User: 0.8 ms, System: 1.6 ms]
+  Range (min … max):     2.2 ms …   2.8 ms    5 runs
+ 
+  Warning: Command took less than 5 ms to complete. Note that the results might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+Summary
+  rarz m0 ran
+    1.47 ± 0.18 times faster than unrar m0
+
+--- m1 (363K) ---
+Benchmark 1: unrar m1
+  Time (mean ± σ):       6.5 ms ±   0.2 ms    [User: 4.4 ms, System: 3.8 ms]
+  Range (min … max):     6.3 ms …   6.7 ms    5 runs
+ 
+Benchmark 2: rarz m1
+  Time (mean ± σ):       8.8 ms ±   0.3 ms    [User: 5.1 ms, System: 3.1 ms]
+  Range (min … max):     8.4 ms …   9.2 ms    5 runs
+ 
+Summary
+  unrar m1 ran
+    1.35 ± 0.06 times faster than rarz m1
+
+--- m3 (360K) ---
+Benchmark 1: unrar m3
+  Time (mean ± σ):       7.2 ms ±   1.1 ms    [User: 4.4 ms, System: 4.0 ms]
+  Range (min … max):     6.3 ms …   9.0 ms    5 runs
+ 
+Benchmark 2: rarz m3
+  Time (mean ± σ):       8.5 ms ±   1.0 ms    [User: 4.8 ms, System: 2.9 ms]
+  Range (min … max):     7.8 ms …  10.1 ms    5 runs
+ 
+Summary
+  unrar m3 ran
+    1.18 ± 0.22 times faster than rarz m3
+
+--- m5 (359K) ---
+Benchmark 1: unrar m5
+  Time (mean ± σ):       7.1 ms ±   0.7 ms    [User: 4.4 ms, System: 3.9 ms]
+  Range (min … max):     6.5 ms …   8.0 ms    5 runs
+ 
+Benchmark 2: rarz m5
+  Time (mean ± σ):      10.4 ms ±   2.8 ms    [User: 5.1 ms, System: 3.2 ms]
+  Range (min … max):     8.8 ms …  15.2 ms    5 runs
+ 
+  Warning: The first benchmarking run for this command was significantly slower than the rest (15.2 ms). This could be caused by (filesystem) caches that were not filled until after the first run. You are already using both the '--warmup' option as well as the '--prepare' option. Consider re-running the benchmark on a quiet system. Maybe it was a random outlier. Alternatively, consider increasing the warmup count.
+ 
+Summary
+  unrar m5 ran
+    1.46 ± 0.41 times faster than rarz m5
+
+==================================================================
+  PER-FILE ANALYSIS (rar m3 archive)
+==================================================================
+ Unpacked    Packed  Ratio  CRC32     Date        Method  Name
+ --------  --------  -----  --------  ----------  ------  ----
+    99563     10853   10%  DE31C6E6              m3      code_150k.c
+   229893      4172    1%  166C73A4              m3      text_200k.txt
+  2813894     81949    2%  BACD3DEF              m3      large_2m.txt
+   262144    262144  100%  D29CAE47              Store   random_256k.bin
+   229893      4172    1%  166C73A4              m3      dup1.txt
+   229893      4172    1%  166C73A4              m3      dup2.txt
+ --------  --------                               ----    
+  3865280    367462                                       6 files
+
+==================================================================
+  VALIDATION SPEED: rarz t
+==================================================================
+
+Benchmark 1: m0 (3.7M)
+  Time (mean ± σ):       3.2 ms ±   0.4 ms    [User: 1.4 ms, System: 1.3 ms]
+  Range (min … max):     2.5 ms …   3.5 ms    5 runs
+ 
+  Warning: Command took less than 5 ms to complete. Note that the results might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+Benchmark 2: m1 (363K)
+  Time (mean ± σ):       8.2 ms ±   0.5 ms    [User: 5.4 ms, System: 2.2 ms]
+  Range (min … max):     7.6 ms …   8.8 ms    5 runs
+ 
+Benchmark 3: m3 (360K)
+  Time (mean ± σ):       7.7 ms ±   0.2 ms    [User: 5.2 ms, System: 1.9 ms]
+  Range (min … max):     7.4 ms …   7.8 ms    5 runs
+ 
+  Warning: Statistical outliers were detected. Consider re-running this benchmark on a quiet system without any interferences from other programs. It might help to use the '--warmup' or '--prepare' options.
+ 
+Benchmark 4: m5 (359K)
+  Time (mean ± σ):       8.0 ms ±   0.5 ms    [User: 5.2 ms, System: 2.0 ms]
+  Range (min … max):     7.4 ms …   8.4 ms    5 runs
+ 
+Summary
+  m0 (3.7M) ran
+    2.41 ± 0.33 times faster than m3 (360K)
+    2.50 ± 0.37 times faster than m5 (359K)
+    2.58 ± 0.39 times faster than m1 (363K)
+
+Benchmark complete.
+
+Notes:
+  - rarz supports store (m0) and compression (m1-m5) for archive creation
+  - Extraction supports all compression levels (m0-m5)
+  - All archives verified against unrar for correctness
+  - Runs: 5, Warmup: 1 (override with BENCHMARK_RUNS / BENCHMARK_WARMUP)

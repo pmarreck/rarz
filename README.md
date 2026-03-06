@@ -112,6 +112,27 @@ Add to your `build.zig.zon` dependencies:
 },
 ```
 
+## Performance
+
+Hardware-accelerated hot paths for compression, decompression, and validation:
+
+- **CRC32**: ARM hardware CRC instructions (aarch64) + slicing-by-8 software fallback — 10-20x faster than naive table lookup
+- **Match finding**: SIMD 16-byte vector comparison (`@Vector(16, u8)`) for LZ77 match extension
+- **Bit I/O**: Bulk u64 load/store for BitReader refill and BitWriter flush
+- **LZ window**: Stride copy for overlapping matches, split `@memcpy` for wrapping
+
+Benchmark results on Apple Silicon (M-series, 4MB corpus, hyperfine):
+
+| Operation | rar/unrar | rarz | Ratio |
+|-----------|-----------|------|-------|
+| Compress m0 (store) | 6.6 ms | 4.4 ms | **rarz 1.5x faster** |
+| Compress m3 | 24 ms | 45 ms | rar 1.9x faster |
+| Extract m0 | 3.9 ms | 2.7 ms | **rarz 1.5x faster** |
+| Extract m3 | 7.2 ms | 8.5 ms | rar 1.2x faster |
+| Validate m0 | — | 3.2 ms | — |
+| Validate m3 | — | 7.7 ms | — |
+| CRC32 throughput | — | ~10 GB/s | — |
+
 ## Supported Formats
 
 | Family | Signature | Status |

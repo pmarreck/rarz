@@ -36,13 +36,29 @@ pub const BitReader = struct {
     }
 
     /// Bulk-load bytes into the accumulator when bits_in_buffer <= 56.
-    /// Loads up to 7 bytes at a time to keep bits_in_buffer <= 64.
+    /// Fast path: single u64 big-endian load when >=8 bytes remain.
+    /// Fallback: byte-at-a-time for end-of-stream.
     fn refill(self: *BitReader) void {
-        while (self.bits_in_buffer <= 56 and self.byte_pos < self.data.len) {
-            const shift: u6 = @intCast(56 - self.bits_in_buffer);
-            self.buffer |= @as(u64, self.data[self.byte_pos]) << shift;
-            self.byte_pos += 1;
-            self.bits_in_buffer += 8;
+        if (self.bits_in_buffer <= 56 and self.byte_pos + 8 <= self.data.len) {
+            // Bulk: load 8 bytes as big-endian u64, shift into position.
+            // The buffer is MSB-justified, so existing bits are at the top.
+            // New bytes go below the existing bits.
+            const raw = std.mem.readInt(u64, self.data[self.byte_pos..][0..8], .big);
+            // Shift right by bits_in_buffer to align below existing bits
+            const shift: u6 = @intCast(self.bits_in_buffer);
+            self.buffer |= raw >> shift;
+            // Compute how many complete bytes we consumed
+            const bytes_consumed: u7 = (64 - self.bits_in_buffer) >> 3;
+            self.byte_pos += bytes_consumed;
+            self.bits_in_buffer += bytes_consumed * 8;
+        } else {
+            // Byte-at-a-time fallback for end-of-stream
+            while (self.bits_in_buffer <= 56 and self.byte_pos < self.data.len) {
+                const shift: u6 = @intCast(56 - self.bits_in_buffer);
+                self.buffer |= @as(u64, self.data[self.byte_pos]) << shift;
+                self.byte_pos += 1;
+                self.bits_in_buffer += 8;
+            }
         }
     }
 

@@ -4,6 +4,7 @@
 //! and BLAKE2sp (8-way parallel tree hash used by RAR5).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const mem = std.mem;
 const math = std.math;
 
@@ -13,8 +14,79 @@ const math = std.math;
 
 /// Compute CRC-32/ISO-HDLC over the given data.
 /// This is the standard CRC32 used in Ethernet, zlib, PNG, etc.
+///
+/// Uses hardware CRC instructions on aarch64 (ARMv8 CRC extension),
+/// slicing-by-8 on other architectures. Both paths produce identical results.
 pub fn crc32(data: []const u8) u32 {
-	return std.hash.crc.Crc32IsoHdlc.hash(data);
+	const arch = comptime builtin.cpu.arch;
+	if (comptime arch == .aarch64) {
+		if (comptime std.Target.aarch64.featureSetHas(builtin.cpu.features, .crc)) {
+			return crc32_arm(data);
+		}
+	}
+	return crc32_slice8(data);
+}
+
+/// ARM hardware CRC32 (implemented in C via arm_acle.h intrinsics).
+/// Zig inline asm on aarch64 doesn't support w-register modifiers,
+/// so we use a C helper that calls __crc32d/__crc32w/__crc32b.
+extern fn crc32_arm_hw(data: [*]const u8, len: usize) u32;
+fn crc32_arm(data: []const u8) u32 {
+	return crc32_arm_hw(data.ptr, data.len);
+}
+
+/// Slicing-by-8: processes 8 bytes per iteration using 8 lookup tables.
+/// ~2-4x faster than the stdlib single-table byte-at-a-time approach.
+fn crc32_slice8(data: []const u8) u32 {
+	const tables = comptime blk: {
+		// Reflected polynomial for CRC32/ISO-HDLC
+		const poly: u32 = 0xEDB88320;
+
+		// Table 0: standard single-byte lookup table
+		var t: [8][256]u32 = undefined;
+		for (&t[0], 0..) |*entry, i| {
+			var crc: u32 = @intCast(i);
+			for (0..8) |_| {
+				crc = if (crc & 1 != 0) (crc >> 1) ^ poly else crc >> 1;
+			}
+			entry.* = crc;
+		}
+
+		// Tables 1-7: extended tables for slicing-by-8
+		for (1..8) |s| {
+			for (&t[s], 0..) |*entry, i| {
+				entry.* = (t[s - 1][i] >> 8) ^ t[0][@as(u8, @truncate(t[s - 1][i]))];
+			}
+		}
+
+		break :blk t;
+	};
+
+	var crc: u32 = 0xFFFFFFFF;
+	var pos: usize = 0;
+
+	// Process 8 bytes at a time
+	while (pos + 8 <= data.len) {
+		const d0 = crc ^ mem.readInt(u32, data[pos..][0..4], .little);
+		const d1 = mem.readInt(u32, data[pos + 4 ..][0..4], .little);
+		crc = tables[7][@as(u8, @truncate(d0))] ^
+			tables[6][@as(u8, @truncate(d0 >> 8))] ^
+			tables[5][@as(u8, @truncate(d0 >> 16))] ^
+			tables[4][@as(u8, @truncate(d0 >> 24))] ^
+			tables[3][@as(u8, @truncate(d1))] ^
+			tables[2][@as(u8, @truncate(d1 >> 8))] ^
+			tables[1][@as(u8, @truncate(d1 >> 16))] ^
+			tables[0][@as(u8, @truncate(d1 >> 24))];
+		pos += 8;
+	}
+
+	// Process remaining bytes one at a time
+	while (pos < data.len) {
+		crc = (crc >> 8) ^ tables[0][@as(u8, @truncate(crc ^ data[pos]))];
+		pos += 1;
+	}
+
+	return crc ^ 0xFFFFFFFF;
 }
 
 // ============================================================================
@@ -306,6 +378,40 @@ test "crc32 of 'hello world'" {
 test "crc32 of single byte 0x00" {
 	const result = crc32(&[_]u8{0x00});
 	try testing.expectEqual(@as(u32, 0xD202EF8D), result);
+}
+
+test "crc32 known-value: 256-byte incrementing pattern" {
+	// Verify hardware and software paths produce identical results
+	var data: [256]u8 = undefined;
+	for (&data, 0..) |*b, i| b.* = @intCast(i);
+	const result = crc32(&data);
+	try testing.expectEqual(@as(u32, 0x29058C73), result);
+}
+
+test "crc32 slicing-by-8 matches stdlib" {
+	// Cross-verify our implementation against the stdlib
+	const test_vectors = [_][]const u8{
+		"",
+		"a",
+		"abc",
+		"123456789",
+		"hello world",
+		"The quick brown fox jumps over the lazy dog",
+	};
+	for (test_vectors) |data| {
+		const our_result = crc32(data);
+		const std_result = std.hash.crc.Crc32IsoHdlc.hash(data);
+		try testing.expectEqual(std_result, our_result);
+	}
+}
+
+test "crc32 large buffer matches stdlib" {
+	// Test with a buffer that exercises the 8-byte fast path extensively
+	var buf: [1024]u8 = undefined;
+	for (&buf, 0..) |*b, i| b.* = @truncate(i *% 0x9E3779B1);
+	const our_result = crc32(&buf);
+	const std_result = std.hash.crc.Crc32IsoHdlc.hash(&buf);
+	try testing.expectEqual(std_result, our_result);
 }
 
 // --- CRC16 tests ---

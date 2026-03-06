@@ -129,10 +129,24 @@ pub const MatchFinder = struct {
     }
 
     /// Compare bytes at positions `a` and `b` in `data`, starting from `start`.
-    /// Uses u64 fast path (8 bytes at a time via XOR + CTZ) with byte-by-byte tail.
+    /// Uses SIMD 16-byte comparison, then u64 fast path, then byte-by-byte tail.
     /// Returns total matching length.
     fn extendMatch(data: []const u8, a: usize, b: usize, start: u32, max_len: u32) u32 {
         var common = start;
+
+        // SIMD fast path: compare 16 bytes at a time
+        // @Vector(16, u8) maps to SSE2 PCMPEQB+PMOVMSKB on x86, CMEQ on aarch64
+        while (common + 16 <= max_len) {
+            const va: @Vector(16, u8) = @as(*const [16]u8, @ptrCast(data.ptr + a + common)).*;
+            const vb: @Vector(16, u8) = @as(*const [16]u8, @ptrCast(data.ptr + b + common)).*;
+            const eq = va == vb;
+            const mask = ~@as(u16, @bitCast(eq));
+            if (mask != 0) {
+                return common + @as(u32, @ctz(mask));
+            }
+            common += 16;
+        }
+
         // u64 fast path: compare 8 bytes at a time
         while (common + 8 <= max_len) {
             const va = std.mem.readInt(u64, @as(*const [8]u8, @ptrCast(data.ptr + a + common)), .little);
@@ -143,6 +157,7 @@ pub const MatchFinder = struct {
             }
             common += 8;
         }
+
         // Byte-by-byte tail
         while (common < max_len and data[a + common] == data[b + common]) {
             common += 1;

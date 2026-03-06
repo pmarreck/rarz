@@ -50,14 +50,32 @@ pub const BitWriter = struct {
     }
 
     /// Flush complete bytes from the buffer to the output.
+    /// Fast path: single u64 big-endian store when >=8 bytes of output remain.
     fn flushBytes(self: *BitWriter) !void {
-        while (self.bits_in_buffer >= 8) {
-            if (self.byte_pos >= self.output.len) return error.BufferTooSmall;
-            // Extract top byte
-            self.output[self.byte_pos] = @intCast(self.buffer >> 56);
-            self.byte_pos += 1;
-            self.buffer <<= 8;
-            self.bits_in_buffer -= 8;
+        if (self.bits_in_buffer >= 8) {
+            const bytes_to_flush: u7 = self.bits_in_buffer >> 3;
+            if (bytes_to_flush > 0 and self.byte_pos + 8 <= self.output.len) {
+                // Bulk: store the entire buffer as big-endian u64, advance by complete bytes
+                std.mem.writeInt(u64, self.output[self.byte_pos..][0..8], self.buffer, .big);
+                self.byte_pos += bytes_to_flush;
+                // Shift out the flushed bytes
+                if (bytes_to_flush < 8) {
+                    const shift: u6 = @intCast(@as(u7, bytes_to_flush) * 8);
+                    self.buffer <<= shift;
+                } else {
+                    self.buffer = 0;
+                }
+                self.bits_in_buffer -= @as(u7, bytes_to_flush) * 8;
+            } else {
+                // Byte-at-a-time fallback for end-of-output
+                while (self.bits_in_buffer >= 8) {
+                    if (self.byte_pos >= self.output.len) return error.BufferTooSmall;
+                    self.output[self.byte_pos] = @intCast(self.buffer >> 56);
+                    self.byte_pos += 1;
+                    self.buffer <<= 8;
+                    self.bits_in_buffer -= 8;
+                }
+            }
         }
     }
 

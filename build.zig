@@ -18,6 +18,15 @@ pub fn build(b: *std.Build) void {
 			.optimize = optimize,
 		}),
 	});
+
+	// Add ARM hardware CRC32 helper (compiled with CRC extension)
+	if (target.result.cpu.arch == .aarch64) {
+		lib.root_module.addCSourceFile(.{
+			.file = b.path("src/lib/crc32_arm.c"),
+			.flags = &.{ "-march=armv8-a+crc", "-O3" },
+		});
+	}
+
 	b.installArtifact(lib);
 
 	// C executable that links the static library through the C FFI
@@ -60,7 +69,32 @@ pub fn build(b: *std.Build) void {
 			.optimize = optimize,
 		}),
 	});
+	// Add ARM CRC32 helper to test compilation too
+	if (target.result.cpu.arch == .aarch64) {
+		unit_tests.root_module.addCSourceFile(.{
+			.file = b.path("src/lib/crc32_arm.c"),
+			.flags = &.{ "-march=armv8-a+crc", "-O3" },
+		});
+	}
 	const run_unit_tests = b.addRunArtifact(unit_tests);
 	const test_step = b.step("test", "Run unit tests");
 	test_step.dependOn(&run_unit_tests.step);
+
+	// Microbenchmark executable
+	const microbench = b.addExecutable(.{
+		.name = "microbench",
+		.root_module = b.createModule(.{
+			.root_source_file = b.path("tests/microbench.zig"),
+			.target = target,
+			.optimize = .ReleaseFast,
+			.imports = &.{
+				.{ .name = "rarz", .module = lib.root_module },
+			},
+		}),
+	});
+	b.installArtifact(microbench);
+	const run_microbench = b.addRunArtifact(microbench);
+	run_microbench.step.dependOn(b.getInstallStep());
+	const bench_step = b.step("bench", "Run microbenchmarks");
+	bench_step.dependOn(&run_microbench.step);
 }

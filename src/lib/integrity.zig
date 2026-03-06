@@ -39,6 +39,7 @@ fn crc32_arm(data: []const u8) u32 {
 /// ~2-4x faster than the stdlib single-table byte-at-a-time approach.
 fn crc32_slice8(data: []const u8) u32 {
 	const tables = comptime blk: {
+		@setEvalBranchQuota(20000);
 		// Reflected polynomial for CRC32/ISO-HDLC
 		const poly: u32 = 0xEDB88320;
 

@@ -19,8 +19,11 @@ pub fn build(b: *std.Build) void {
 		}),
 	});
 
-	// Add ARM hardware CRC32 helper (compiled with CRC extension)
-	if (target.result.cpu.arch == .aarch64) {
+	// Add ARM hardware CRC32 helper (only when target CPU has CRC extension;
+	// baseline aarch64 cross-compilation targets don't, and -mcpu overrides -march)
+	if (target.result.cpu.arch == .aarch64 and
+		std.Target.aarch64.featureSetHas(target.result.cpu.features, .crc))
+	{
 		lib.root_module.addCSourceFile(.{
 			.file = b.path("src/lib/crc32_arm.c"),
 			.flags = &.{ "-march=armv8-a+crc", "-O3" },
@@ -70,7 +73,9 @@ pub fn build(b: *std.Build) void {
 		}),
 	});
 	// Add ARM CRC32 helper to test compilation too
-	if (target.result.cpu.arch == .aarch64) {
+	if (target.result.cpu.arch == .aarch64 and
+		std.Target.aarch64.featureSetHas(target.result.cpu.features, .crc))
+	{
 		unit_tests.root_module.addCSourceFile(.{
 			.file = b.path("src/lib/crc32_arm.c"),
 			.flags = &.{ "-march=armv8-a+crc", "-O3" },

@@ -494,6 +494,52 @@ test "validate_header_crc accepts correct CRC" {
 	try testing.expect(validate_header_crc(&data, header));
 }
 
+test "validate_header_crc matches real-world RAR4 file headers (CRC32-low16)" {
+	// REGRESSION: prior `validate_header_crc accepts correct CRC` test above
+	// is circular — it computes the CRC with rarz's own poly and asserts it
+	// matches itself, so it always passes regardless of which polynomial
+	// integrity.crc16 implements.
+	//
+	// This test bakes in the EXACT bytes from real RAR4 archives in the wild
+	// (`Corduroy.cbr` and `KITT's Voice Lines.rar` both share these bytes
+	// as their first 20 bytes). The stored HEAD_CRC (0x90CF) was emitted by
+	// whatever RAR encoder produced those files, so our verifier MUST agree.
+	//
+	// CRC-32 (ISO-HDLC, same poly as zlib/PNG/Ethernet) of the 11 header
+	// bytes that follow HEAD_CRC = 0x974290CF → low-16 = 0x90CF ✓
+	// CRC-16/ARC of the same bytes = 0x1C64 ✗
+	//
+	// A second data point — the FIRST FILE block of `Corduroy.cbr` (offset
+	// 20..62, 43 bytes total, stored HEAD_CRC=0x3CDC):
+	//   CRC-32-low16 of bytes [2..43] = 0x3CDC ✓
+	//   CRC-16/ARC = 0x2025 ✗
+	//
+	// So real-world RAR4 producers and the unrar reference store CRC-32-low16
+	// for HEAD_CRC, NOT CRC-16/ARC. integrity.crc16 (which this function
+	// delegates to) needs to compute the lower 16 bits of CRC-32, despite
+	// the historical naming.
+
+	// Synthesize the main-archive header alone (skip the marker; that's a
+	// separate block with its own CRC handled elsewhere).
+	const main_hdr = [_]u8{
+		0xCF, 0x90, // HEAD_CRC = 0x90CF
+		0x73,       // HEAD_TYPE = main
+		0x00, 0x00, // FLAGS
+		0x0D, 0x00, // HEAD_SIZE = 13
+		0x00, 0x00, // RESERVED1
+		0x00, 0x00, 0x00, 0x00, // RESERVED2
+	};
+	const header = BlockHeader{
+		.head_crc = 0x90CF,
+		.header_type = .main,
+		.flags = 0x0000,
+		.head_size = 13,
+		.data_size = null,
+		.header_offset = 0,
+	};
+	try testing.expect(validate_header_crc(&main_hdr, header));
+}
+
 test "validate_header_crc rejects corrupted CRC" {
 	// Build a 7-byte header with valid CRC, then corrupt a byte
 	var data: [7]u8 = undefined;

@@ -94,11 +94,23 @@ fn crc32_slice8(data: []const u8) u32 {
 // CRC16 — CRC-16/ARC (IBM) variant used by RAR legacy headers
 // ============================================================================
 
-/// Compute CRC-16/ARC over the given data.
-/// Polynomial 0x8005, init 0x0000, reflect in/out, no xor output.
-/// RAR legacy (v1.5-4.x) headers use this over header bytes after the CRC field.
+/// Compute the lower 16 bits of CRC-32 (ISO-HDLC, same poly as zlib/PNG/
+/// Ethernet) over the given data — this is what RAR legacy (v1.5-4.x)
+/// headers actually use for HEAD_CRC, despite the field being a uint16.
+///
+/// The kept name `crc16` reflects the size of the OUTPUT field (HEAD_CRC is
+/// stored as a uint16 in the header), not the underlying polynomial. Real-
+/// world RAR4 archives + the unrar reference all use CRC-32-low16, not
+/// CRC-16/ARC as previously documented here. Verified empirically against
+/// the main-archive header (HEAD_CRC=0x90CF over 11 bytes) and a file
+/// header (HEAD_CRC=0x3CDC over 41 bytes) of multiple production .cbr
+/// and .rar files. CRC-16/ARC of the same bytes gave 0x1C64 / 0x2025 —
+/// no match. Bug discovered + fixed 2026-04-27 after Peter spot-checked
+/// his Comic Book/RAR library through `validate` and got false-positive
+/// 'header CRC mismatch' on legitimate archives.
 pub fn crc16(data: []const u8) u16 {
-	return std.hash.crc.Crc16Arc.hash(data);
+	const full = std.hash.crc.Crc32IsoHdlc.hash(data);
+	return @truncate(full);
 }
 
 // ============================================================================
@@ -422,15 +434,18 @@ test "crc16 of empty data" {
 	try testing.expectEqual(@as(u16, 0x0000), result);
 }
 
-test "crc16 of '123456789' — CRC-16/ARC check value" {
+test "crc16 of '123456789' — CRC-32-low16 check value" {
+	// `crc16` is the lower 16 bits of CRC-32 (ISO-HDLC), which is what RAR4
+	// HEAD_CRC actually stores. Reference value: zlib.crc32("123456789")
+	// = 0xCBF43926 → low-16 = 0x3926.
 	const result = crc16("123456789");
-	try testing.expectEqual(@as(u16, 0xBB3D), result);
+	try testing.expectEqual(@as(u16, 0x3926), result);
 }
 
 test "crc16 of single byte 0x00" {
+	// CRC-32 of a single 0x00 byte = 0xD202EF8D → low-16 = 0xEF8D.
 	const result = crc16(&[_]u8{0x00});
-	// CRC-16/ARC of single zero byte
-	try testing.expectEqual(@as(u16, 0x0000), result);
+	try testing.expectEqual(@as(u16, 0xEF8D), result);
 }
 
 // --- BLAKE2sp tests ---

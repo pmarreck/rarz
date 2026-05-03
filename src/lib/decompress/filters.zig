@@ -21,26 +21,49 @@ pub const Filter = struct {
 
 /// Apply a filter to a data region in-place.
 /// `file_offset` is the cumulative file position (for E8/ARM address calculations).
-pub fn applyFilter(data: []u8, filter: Filter, file_offset: u64) void {
+///
+/// The DELTA filter requires a scratch buffer (it reorders + cumulative-subtracts
+/// across the whole region), so it can fail with OutOfMemory; the byte-pattern
+/// filters never allocate.
+pub fn applyFilter(data: []u8, filter: Filter, file_offset: u64, allocator: std.mem.Allocator) error{OutOfMemory}!void {
     switch (filter.filter_type) {
-        .delta => applyDelta(data, filter.channels),
+        .delta => try applyDelta(data, filter.channels, allocator),
         .e8 => applyE8E9(data, @intCast(@min(file_offset, std.math.maxInt(u32))), false),
         .e8e9 => applyE8E9(data, @intCast(@min(file_offset, std.math.maxInt(u32))), true),
         .arm => applyArm(data),
     }
 }
 
-/// Delta filter: multi-channel byte differencing.
-/// Reverses the compressor's delta encoding by accumulating:
-///   data[i] += data[i - channels]
-/// for each position from `channels` onward.
-pub fn applyDelta(data: []u8, channels: u8) void {
-    if (channels == 0) return;
+/// RAR5 delta filter: per-channel cumulative-subtract over de-interleaved input.
+///
+/// Wire format (matches unrar 7.20 reference, src/unpack50.cpp `ApplyFilter` /
+/// `FILTER_DELTA`): the compressed input is laid out as channel 0's full byte
+/// stream followed by channel 1's, etc. The reverse transform is, per channel,
+/// `dst[k*channels + ch] = -(src[ch_base + 0] + src[ch_base + 1] + … + src[ch_base + k])`,
+/// truncated to u8. Output replaces input in `data`.
+///
+/// Requires a scratch buffer because src and dst positions overlap (e.g. src[2]
+/// and dst[2] both live at offset 2 for channel 0), so we can't transform in place.
+pub fn applyDelta(data: []u8, channels: u8, allocator: std.mem.Allocator) error{OutOfMemory}!void {
+    if (channels == 0 or data.len == 0) return;
     const ch: usize = channels;
-    if (ch >= data.len) return;
-    for (ch..data.len) |i| {
-        data[i] +%= data[i - ch];
+
+    const dst = try allocator.alloc(u8, data.len);
+    defer allocator.free(dst);
+
+    var src_pos: usize = 0;
+    var cur_channel: usize = 0;
+    while (cur_channel < ch) : (cur_channel += 1) {
+        var prev: u8 = 0;
+        var dest_pos: usize = cur_channel;
+        while (dest_pos < data.len) : (dest_pos += ch) {
+            prev -%= data[src_pos];
+            dst[dest_pos] = prev;
+            src_pos += 1;
+        }
     }
+
+    @memcpy(data, dst);
 }
 
 /// E8/E8E9 filter: x86 CALL/JMP address translation reversal.
@@ -140,52 +163,48 @@ fn writeSignedLE32(bytes: *[4]u8, value: i32) void {
 
 const testing = std.testing;
 
-test "delta filter channels=1: differences become cumulative" {
-    // Input:  [0, 1, 1, 1, 1]
-    // After:  [0, 0+1=1, 1+1=2, 2+1=3, 3+1=4]
+test "delta filter channels=1: cumulative-subtract" {
+    // channels=1, single channel reads all bytes sequentially.
+    // dst[0] = -src[0] = -0 = 0
+    // dst[1] = -src[0] - src[1] = -1 = 255
+    // dst[2] = ... -1-1 = -2 = 254
+    // dst[3] = ... = -3 = 253
+    // dst[4] = ... = -4 = 252
     var data = [_]u8{ 0, 1, 1, 1, 1 };
-    applyDelta(&data, 1);
-    try testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 2, 3, 4 }, &data);
+    try applyDelta(&data, 1, testing.allocator);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0, 255, 254, 253, 252 }, &data);
 }
 
 test "delta filter channels=1: wrapping arithmetic" {
-    // 250 + 10 = 260 -> wraps to 4 (mod 256)
+    // dst[0] = -250 mod 256 = 6
+    // dst[1] = -250 - 10 mod 256 = 252
     var data = [_]u8{ 250, 10 };
-    applyDelta(&data, 1);
-    try testing.expectEqualSlices(u8, &[_]u8{ 250, 4 }, &data);
+    try applyDelta(&data, 1, testing.allocator);
+    try testing.expectEqualSlices(u8, &[_]u8{ 6, 252 }, &data);
 }
 
-test "delta filter channels=3 (RGB interleaved)" {
-    // 3 channels: R, G, B
-    // Input:  [10, 20, 30, 5, 5, 5, 3, 3, 3]
-    // After channel 0 (R): data[3] += data[0] -> 5+10=15, data[6] += data[3] -> 3+15=18
-    // After channel 1 (G): data[4] += data[1] -> 5+20=25, data[7] += data[4] -> 3+25=28
-    // After channel 2 (B): data[5] += data[2] -> 5+30=35, data[8] += data[5] -> 3+35=38
-    // But delta filter processes left-to-right, not channel-by-channel
-    // So: for i in 3..9: data[i] += data[i-3]
-    //   data[3] = 5+10 = 15
-    //   data[4] = 5+20 = 25
-    //   data[5] = 5+30 = 35
-    //   data[6] = 3+15 = 18
-    //   data[7] = 3+25 = 28
-    //   data[8] = 3+35 = 38
+test "delta filter channels=3 (de-interleaved)" {
+    // Input layout (per unrar): channel 0 bytes first, then channel 1, then channel 2.
+    //   src = [10, 20, 30 | 5, 5, 5 | 3, 3, 3]
+    // Each channel cumulative-subtracts and writes to interleaved positions:
+    //   channel 0 -> dst[0, 3, 6]: [-10, -30, -60] = [246, 226, 196]
+    //   channel 1 -> dst[1, 4, 7]: [-5, -10, -15]  = [251, 246, 241]
+    //   channel 2 -> dst[2, 5, 8]: [-3, -6, -9]    = [253, 250, 247]
     var data = [_]u8{ 10, 20, 30, 5, 5, 5, 3, 3, 3 };
-    applyDelta(&data, 3);
-    try testing.expectEqualSlices(u8, &[_]u8{ 10, 20, 30, 15, 25, 35, 18, 28, 38 }, &data);
+    try applyDelta(&data, 3, testing.allocator);
+    try testing.expectEqualSlices(u8, &[_]u8{ 246, 251, 253, 226, 246, 250, 196, 241, 247 }, &data);
 }
 
 test "delta filter channels=0: no-op" {
     var data = [_]u8{ 1, 2, 3 };
     const original = data;
-    applyDelta(&data, 0);
+    try applyDelta(&data, 0, testing.allocator);
     try testing.expectEqualSlices(u8, &original, &data);
 }
 
-test "delta filter: data shorter than channels is no-op" {
-    var data = [_]u8{ 1, 2 };
-    const original = data;
-    applyDelta(&data, 5);
-    try testing.expectEqualSlices(u8, &original, &data);
+test "delta filter empty data: no-op" {
+    var empty: [0]u8 = .{};
+    try applyDelta(&empty, 5, testing.allocator);
 }
 
 test "E8 filter: forward absolute address becomes relative" {
@@ -329,7 +348,7 @@ test "ARM filter: negative offset wrapping" {
 }
 
 test "applyFilter dispatches to correct filter type" {
-    // Test delta via applyFilter
+    // Test delta via applyFilter (channels=1: simple cumulative-subtract)
     var data1 = [_]u8{ 0, 1, 1, 1 };
     const f1 = Filter{
         .filter_type = .delta,
@@ -337,8 +356,8 @@ test "applyFilter dispatches to correct filter type" {
         .block_length = 4,
         .channels = 1,
     };
-    applyFilter(&data1, f1, 0);
-    try testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 2, 3 }, &data1);
+    try applyFilter(&data1, f1, 0, testing.allocator);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0, 255, 254, 253 }, &data1);
 
     // Test E8 via applyFilter
     var data2 = [_]u8{ 0xE8, 0x00, 0x10, 0x00, 0x00, 0x90 };
@@ -348,7 +367,7 @@ test "applyFilter dispatches to correct filter type" {
         .block_length = 6,
         .channels = 0,
     };
-    applyFilter(&data2, f2, 0x10000);
+    try applyFilter(&data2, f2, 0x10000, testing.allocator);
     const addr = readSignedLE32(data2[1..5]);
     try testing.expectEqual(@as(i32, 0xFFF), addr);
 }

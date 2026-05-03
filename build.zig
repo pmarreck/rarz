@@ -102,4 +102,21 @@ pub fn build(b: *std.Build) void {
 	run_microbench.step.dependOn(b.getInstallStep());
 	const bench_step = b.step("bench", "Run microbenchmarks");
 	bench_step.dependOn(&run_microbench.step);
+
+	// Diagnostic harness for CRC investigation (built only via `zig build diagnose`)
+	const diag = b.addExecutable(.{
+		.name = "diagnose_crc",
+		.root_module = b.createModule(.{
+			.root_source_file = b.path("tests/diagnose_crc.zig"),
+			.target = target,
+			.optimize = optimize,
+			.imports = &.{
+				.{ .name = "rarz", .module = lib.root_module },
+			},
+		}),
+	});
+	diag.root_module.link_libc = true;
+	const diag_install = b.addInstallArtifact(diag, .{});
+	const diag_step = b.step("diagnose", "Build diagnose_crc helper");
+	diag_step.dependOn(&diag_install.step);
 }

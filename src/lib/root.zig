@@ -22,7 +22,7 @@ pub const rar5_headers = @import("rar5_headers.zig");
 pub const reader = @import("reader.zig");
 pub const policy = @import("policy.zig");
 pub const writer = @import("writer.zig");
-const dispatch = @import("decompress/dispatch.zig");
+pub const dispatch = @import("decompress/dispatch.zig");
 
 // ============================================================================
 // Multi-volume types

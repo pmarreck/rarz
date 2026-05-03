@@ -36,7 +36,7 @@ fi
 
 echo "=== Interop Gate A: rarz extract vs unrar extract (byte-for-byte) ==="
 
-for f in "$FIXTURES"/rar5_m*.rar "$FIXTURES"/single_compressed.rar; do
+for f in "$FIXTURES"/rar5_m*.rar "$FIXTURES"/single_compressed.rar "$FIXTURES"/rar5_decomp_regression.rar; do
 	[ -f "$f" ] || continue
 	name=$(basename "$f")
 

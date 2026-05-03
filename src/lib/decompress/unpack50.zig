@@ -284,28 +284,32 @@ pub fn readTables(state: *Unpack50State) !void {
 // ============================================================================
 
 /// Parse a filter descriptor from the bitstream (called when symbol 256 is decoded).
+///
+/// RAR5 filter wire format (matches unrar 7.20 reference, src/unpack50.cpp `ReadFilter`):
+///   1. block_start  — ReadFilterData (2-bit byte_count prefix + N*8 bits, little-endian byte order)
+///   2. block_length — ReadFilterData
+///   3. filter_type  — 3 bits
+///   4. channels     — 5 bits, only when filter_type == DELTA
 fn parseFilterDescriptor(state: *Unpack50State) !void {
     const br = &state.br;
+
+    // Block start offset (relative to current write position)
+    const block_start_delta = try readFilterSize(br);
+    const block_start = @as(usize, @intCast(state.window.write_pos)) +% block_start_delta;
+
+    // Block length
+    const block_length = try readFilterSize(br);
+    if (block_length == 0) return error.InvalidData;
 
     // Filter type: 3 bits
     const ftype_raw = try br.readBits(3);
     const filter_type: filters.FilterType = @enumFromInt(@as(u3, @intCast(ftype_raw)));
 
-    // Channels (for delta filter only)
+    // Channels (delta filter only): 5 bits, value+1 (1..32)
     var channels: u8 = 1;
     if (filter_type == .delta) {
         channels = @intCast((try br.readBits(5)) + 1);
     }
-
-    // Block start offset: variable-length encoding
-    // Read the block start as a variable-width field
-    const block_start_delta = try readFilterSize(br);
-    const block_start = @as(usize, @intCast(state.window.write_pos)) +% block_start_delta;
-
-    // Block length: variable-length encoding
-    const block_length = try readFilterSize(br);
-    if (block_length == 0) return error.InvalidData;
-
     try state.pending_filters.append(state.allocator, .{
         .filter_type = filter_type,
         .block_start = block_start,
@@ -315,20 +319,20 @@ fn parseFilterDescriptor(state: *Unpack50State) !void {
 }
 
 /// Read a variable-width size value used in filter descriptors.
-/// The encoding uses a 2-bit prefix to indicate the number of bytes:
-///   00: read 6 more bits
-///   01: read 10 more bits (actually 4+6 split or 10 direct)
-///   10: read 16 more bits
-///   11: read 24 more bits (actually 16+8 or 24 direct, used for large values)
+///
+/// Encoding (per unrar 7.20 reference, `Unpack::ReadFilterData`):
+///   - 2-bit prefix: byte_count = prefix + 1  (so 1..4 bytes)
+///   - byte_count bytes follow, each 8 bits
+///   - bytes assemble little-endian: byte 0 -> bits 0..7, byte 1 -> 8..15, ...
 fn readFilterSize(br: *BitReader) !usize {
-    const prefix = try br.readBits(2);
-    return switch (prefix) {
-        0 => @as(usize, try br.readBits(6)),
-        1 => @as(usize, try br.readBits(10)),
-        2 => @as(usize, try br.readBits(16)),
-        3 => @as(usize, try br.readBits(24)),
-        else => unreachable,
-    };
+    const byte_count: u3 = @intCast((try br.readBits(2)) + 1);
+    var value: usize = 0;
+    var i: u3 = 0;
+    while (i < byte_count) : (i += 1) {
+        const b: usize = try br.readBits(8);
+        value += b << @intCast(@as(u6, i) * 8);
+    }
+    return value;
 }
 
 // ============================================================================
@@ -437,7 +441,6 @@ fn decodeBlock(state: *Unpack50State, unpacked_size: u64) !bool {
             const length_slot: u32 = symbol - 262;
             var length = try decodeLengthSlot(br, length_slot);
             const distance = try decodeDistance(br, &state.dd, &state.ldd);
-
             // Distance-dependent length adjustment:
             // Longer distances get +1 to +3 added to the length.
             if (distance > 0x100) {
@@ -488,18 +491,17 @@ pub fn decompress(
     while (more_blocks and state.written_size < unpacked_size) {
         more_blocks = try decodeBlock(&state, unpacked_size);
     }
-
-    // Apply any pending filters to the window data
-    // (In a full implementation, filters would be applied at specific output positions.
-    //  For now, apply all pending filters to their respective regions.)
+    // Apply any pending filters to the window data.
+    // (Note: unrar applies filters during streaming output via UnpWriteBuf.
+    // We apply them at the end on the window — equivalent for files <= window size,
+    // which covers all current consumers.)
     for (state.pending_filters.items) |filter| {
-        // Get the filter's data region from the window
         if (filter.block_length > 0 and filter.block_start + filter.block_length <= state.window.write_pos) {
             const start = filter.block_start & state.window.mask;
             // Only apply if the region doesn't wrap around the circular buffer
             if (start + filter.block_length <= state.window.buffer.len) {
                 const region = state.window.buffer[start .. start + filter.block_length];
-                filters.applyFilter(region, filter, @intCast(filter.block_start));
+                try filters.applyFilter(region, filter, @intCast(filter.block_start), allocator);
             }
         }
     }
@@ -867,36 +869,44 @@ test "decompression with repeated match (symbol 257)" {
     }
 }
 
-test "filter descriptor parsing: readFilterSize" {
-    // Prefix 0: 6-bit value
+test "filter descriptor parsing: readFilterSize (per unrar 7.20 ReadFilterData)" {
+    // Encoding: 2-bit byte_count prefix (= prefix+1 bytes), then byte_count bytes
+    // assembled little-endian (low byte first in the bitstream).
+
+    // Cleanest: build the bytes deliberately.
+    // Prefix 0, value=0x42 (1 byte): 2-bit prefix 00, then 8-bit 0x42.
+    //   stream bits = 00 0100 0010 (10 bits), padded to byte stream = 0x10, 0x80
     {
-        // bits: 00 111111 = prefix 0, value 63
-        var data = [_]u8{0x3F, 0x00};
+        var data = [_]u8{ 0x10, 0x80 };
         var br = BitReader.init(&data);
         const size = try readFilterSize(&br);
-        try testing.expectEqual(@as(usize, 63), size);
+        try testing.expectEqual(@as(usize, 0x42), size);
     }
-    // Prefix 1: 10-bit value
+
+    // Prefix 1, value=0x1234 (2 bytes, little-endian: byte0=0x34, byte1=0x12).
+    //   stream bits = 01 00110100 00010010 (18 bits)
+    //   byte 0 = 0b01_001101 = 0x4D
+    //   byte 1 = 0b00_000100 = 0x04
+    //   byte 2 (top 2 bits) = 0b10_000000 = 0x80
     {
-        // bits: 01 0000000001 -> prefix 1, value 1
-        // byte 0 (bits 0-7): 0,1,0,0,0,0,0,0 = 0x40
-        // byte 1 (bits 8-11): 0,0,0,1 + padding = 0x10
-        var data = [_]u8{ 0x40, 0x10 };
+        var data = [_]u8{ 0x4D, 0x04, 0x80 };
         var br = BitReader.init(&data);
         const size = try readFilterSize(&br);
-        try testing.expectEqual(@as(usize, 1), size);
+        try testing.expectEqual(@as(usize, 0x1234), size);
     }
-    // Prefix 3: 24-bit value
+
+    // Prefix 3, value=0x00010203 (4 bytes, little-endian: 03, 02, 01, 00).
+    //   stream bits = 11 00000011 00000010 00000001 00000000 (34 bits)
+    //   byte 0 = 0b11_000000 = 0xC0
+    //   byte 1 = 0b11_000000 = 0xC0
+    //   byte 2 = 0b10_000000 = 0x80
+    //   byte 3 = 0b01_000000 = 0x40
+    //   byte 4 (top 2 bits) = 0b00_000000 = 0x00
     {
-        // bits: 11 000000000000000000000001 -> prefix 3, value 1
-        // byte 0 (bits 0-7): 1,1,0,0,0,0,0,0 = 0xC0
-        // byte 1 (bits 8-15): all 0 = 0x00
-        // byte 2 (bits 16-23): all 0 = 0x00
-        // byte 3 (bits 24-25): 0,1 + padding = 0x40
-        var data = [_]u8{ 0xC0, 0x00, 0x00, 0x40 };
+        var data = [_]u8{ 0xC0, 0xC0, 0x80, 0x40, 0x00 };
         var br = BitReader.init(&data);
         const size = try readFilterSize(&br);
-        try testing.expectEqual(@as(usize, 1), size);
+        try testing.expectEqual(@as(usize, 0x00010203), size);
     }
 }
 

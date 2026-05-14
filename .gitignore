@@ -9,3 +9,4 @@ zig-pkg/
 result
 .DS_Store
 inbox/
+.direnv/

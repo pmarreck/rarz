@@ -5,6 +5,7 @@ ZIG_RECENT_API_CHANGES_2025.md
 zig-out/
 zig-cache/
 .zig-cache/
+zig-pkg/
 result
 .DS_Store
 inbox/

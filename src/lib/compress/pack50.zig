@@ -219,7 +219,9 @@ pub fn compressBlock(
     const data_bytes = try bw.flush();
 
     // Step 5: Wrap in a RAR5 block header
-    return try wrapBlockHeader(allocator, output[0..data_bytes], data_total_bits, is_last_block);
+    const wrapped = try wrapBlockHeader(allocator, output[0..data_bytes], data_total_bits, is_last_block);
+    allocator.free(output);
+    return wrapped;
 }
 
 /// Write the 20 code-length code lengths (CL table).

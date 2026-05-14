@@ -4,9 +4,13 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    zig-overlay = {
+      url = "github:mitchellh/zig-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
+  outputs = { self, nixpkgs, flake-utils, zig-overlay }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs {
@@ -14,6 +18,7 @@
           config.allowUnfreePredicate = pkg:
             builtins.elem (nixpkgs.lib.getName pkg) [ "rar" "unrar" ];
         };
+        zig = zig-overlay.packages.${system}."0.16.0";
 
         pname = "rarz";
         version = "0.1.0";
@@ -49,7 +54,7 @@
           inherit pname version;
           src = self;
 
-          nativeBuildInputs = [ pkgs.zig ]
+          nativeBuildInputs = [ zig ]
             ++ pkgs.lib.optionals isDarwin [
               pkgs.darwin.cctools
               pkgs.apple-sdk
@@ -79,7 +84,7 @@
           inherit version;
           src = self;
 
-          nativeBuildInputs = [ pkgs.zig ]
+          nativeBuildInputs = [ zig ]
             ++ pkgs.lib.optionals isDarwin [
               pkgs.darwin.cctools
               pkgs.apple-sdk

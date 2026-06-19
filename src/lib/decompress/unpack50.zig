@@ -303,7 +303,7 @@ fn parseFilterDescriptor(state: *Unpack50State) !void {
 
     // Filter type: 3 bits
     const ftype_raw = try br.readBits(3);
-    const filter_type: filters.FilterType = @enumFromInt(@as(u3, @intCast(ftype_raw)));
+    const filter_type: filters.FilterType = std.enums.fromInt(filters.FilterType, @as(u3, @intCast(ftype_raw))) orelse return error.InvalidData;
 
     // Channels (delta filter only): 5 bits, value+1 (1..32)
     var channels: u8 = 1;

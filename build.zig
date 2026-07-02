@@ -81,6 +81,10 @@ pub fn build(b: *std.Build) void {
 			.flags = &.{ "-march=armv8-a+crc", "-O3" },
 		});
 	}
+	// Embed official-rar multi-volume fixtures for the spanning-payload CRC
+	// regression test (paths outside src/lib/ cannot be @embedFile-d directly).
+	unit_tests.root_module.addAnonymousImport("rar5_vol_m3_part01", .{ .root_source_file = b.path("tests/fixtures/rar5_vol_m3.part01.rar") });
+	unit_tests.root_module.addAnonymousImport("rar5_vol_m3_part02", .{ .root_source_file = b.path("tests/fixtures/rar5_vol_m3.part02.rar") });
 	const run_unit_tests = b.addRunArtifact(unit_tests);
 	const test_step = b.step("test", "Run unit tests");
 	test_step.dependOn(&run_unit_tests.step);

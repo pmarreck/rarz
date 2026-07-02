@@ -1028,6 +1028,11 @@ fn collectRar5FilesUnified(alloc: std.mem.Allocator, volumes: []const VolumeData
 
 		var total_packed: u64 = data_size;
 
+		// RAR5 stores the authoritative full-file hash in the LAST part (where the
+		// file completes, split_after == false). Track it so the merged file reports
+		// the true full-file CRC, not the first part's per-segment value.
+		var last_fb = first.fb;
+
 		// If this file continues to next volume(s), find continuations
 		if (first.fb.header.flags.split_after) {
 			var j: usize = i + 1;
@@ -1045,6 +1050,7 @@ fn collectRar5FilesUnified(alloc: std.mem.Allocator, volumes: []const VolumeData
 					.length = @intCast(cont_data_size),
 				});
 				total_packed += cont_data_size;
+				last_fb = cont.fb;
 
 				j += 1;
 				if (!cont.fb.header.flags.split_after) break;
@@ -1055,11 +1061,11 @@ fn collectRar5FilesUnified(alloc: std.mem.Allocator, volumes: []const VolumeData
 			.name = first.fb.name,
 			.unpacked_size = first.fb.unpacked_size,
 			.compression = first.fb.compression,
-			.data_crc32 = first.fb.data_crc32,
+			.data_crc32 = last_fb.data_crc32,
 			.mtime = first.fb.mtime,
 			.is_directory = first.fb.is_directory,
 			.host_os = first.fb.host_os,
-			.has_crc32 = first.fb.has_crc32,
+			.has_crc32 = last_fb.has_crc32,
 			.is_encrypted = rar5_headers.extra_has_encryption(first.fb.extra_data),
 			.total_packed_size = total_packed,
 			.packed_chunks = try chunks.toOwnedSlice(alloc),

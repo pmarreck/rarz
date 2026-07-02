@@ -565,8 +565,17 @@ pub fn validate_volumes(volumes: []const []const u8) ValidationResult {
 			if (!cont.split_after) break;
 		}
 
-		// Verify CRC if present
-		if (first.has_crc32 and total_packed > 0) {
+		// RAR5 stores the authoritative full-file hash in the LAST volume part —
+		// the one where the file completes (split_after == false). Earlier parts
+		// carry a different (per-segment) CRC, so validating against the first
+		// part's CRC produces a false "payload CRC32 mismatch". unRAR does the
+		// same: extract.cpp gates the check on `!Arc.FileHead.SplitAfter` and
+		// compares against the current (last) FileHead.FileHash. chunks.items[j-1]
+		// is that last part.
+		const last = chunks.items[j - 1];
+
+		// Verify CRC if present (use the last part's hash — see above)
+		if (last.has_crc32 and total_packed > 0) {
 			// Concatenate packed data from all chunks
 			const concat = alloc.alloc(u8, total_packed) catch {
 				return invalid_result(.rar50, "out of memory merging split file");
@@ -588,7 +597,7 @@ pub fn validate_volumes(volumes: []const []const u8) ValidationResult {
 			if (first.compression.method == 0) {
 				// Store method — CRC the concatenated raw data
 				const computed_crc = integrity.crc32(concat);
-				if (computed_crc != first.data_crc32.?) {
+				if (computed_crc != last.data_crc32.?) {
 					return .{
 						.is_valid = false,
 						.family = .rar50,
@@ -618,7 +627,7 @@ pub fn validate_volumes(volumes: []const []const u8) ValidationResult {
 				defer alloc.free(decompressed);
 
 				const computed_crc = integrity.crc32(decompressed);
-				if (computed_crc != first.data_crc32.?) {
+				if (computed_crc != last.data_crc32.?) {
 					return .{
 						.is_valid = false,
 						.family = .rar50,
@@ -1793,4 +1802,21 @@ test "validate does not panic on invalid RAR5 filter type (fuzz regression)" {
     // Pre-fix: "invalid enum value" panic. Post-fix: a clean (invalid) verdict.
     const result = validate(&crasher);
     try testing.expect(!result.is_valid);
+}
+test "validate_volumes: official rar m3 multi-volume fixture validates (spanning-payload CRC regression)" {
+	// MFIC independence: these volumes were produced by the OFFICIAL `rar` CLI,
+	// NOT rarz's own writer (the other validate_volumes tests round-trip through
+	// writer.zig, so they cannot catch a systematic divergence from real RAR5).
+	// External oracle `unrar t` reports "All OK" and rarz extraction is
+	// byte-identical to unrar. Therefore the verify path MUST report VALID.
+	//
+	// Regression for the false "payload CRC32 mismatch" on volume-spanning
+	// payloads: large.txt is m3-compressed and split across both volumes. RAR5
+	// stores the authoritative full-file CRC in the LAST part; rarz previously
+	// compared against the FIRST part's (per-segment) CRC and rejected valid data.
+	const part1: []const u8 = @embedFile("rar5_vol_m3_part01");
+	const part2: []const u8 = @embedFile("rar5_vol_m3_part02");
+	const vols = [_][]const u8{ part1, part2 };
+	const vr = validate_volumes(&vols);
+	try testing.expect(vr.is_valid);
 }

@@ -48,6 +48,7 @@ const UnifiedFile = struct {
 	is_directory: bool,
 	host_os: u64,
 	has_crc32: bool,
+	is_encrypted: bool,
 	total_packed_size: u64,
 	packed_chunks: []PackedChunk,
 };
@@ -256,7 +257,7 @@ export fn rarz_file_info(archive: ?*const ArchiveHandle, index: u32, out: ?*Rarz
 			.mtime = uf.mtime orelse 0,
 			.method = uf.compression.method,
 			.is_directory = @intFromBool(uf.is_directory),
-			.is_encrypted = 0,
+			.is_encrypted = @intFromBool(uf.is_encrypted),
 			.host_os = @intCast(uf.host_os & 0xFF),
 			.split_before = 0,
 			.split_after = 0,
@@ -280,7 +281,7 @@ export fn rarz_file_info(archive: ?*const ArchiveHandle, index: u32, out: ?*Rarz
 			.mtime = f.mtime orelse 0,
 			.method = f.compression.method,
 			.is_directory = @intFromBool(f.is_directory),
-			.is_encrypted = 0, // TODO: detect from crypt blocks
+			.is_encrypted = @intFromBool(rar5_headers.extra_has_encryption(f.extra_data)),
 			.host_os = @intCast(f.host_os & 0xFF),
 			.split_before = @intFromBool(f.header.flags.split_before),
 			.split_after = @intFromBool(f.header.flags.split_after),
@@ -1059,6 +1060,7 @@ fn collectRar5FilesUnified(alloc: std.mem.Allocator, volumes: []const VolumeData
 			.is_directory = first.fb.is_directory,
 			.host_os = first.fb.host_os,
 			.has_crc32 = first.fb.has_crc32,
+			.is_encrypted = rar5_headers.extra_has_encryption(first.fb.extra_data),
 			.total_packed_size = total_packed,
 			.packed_chunks = try chunks.toOwnedSlice(alloc),
 		});

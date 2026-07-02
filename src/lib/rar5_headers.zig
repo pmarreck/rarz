@@ -103,6 +103,7 @@ pub const ParseError = error{
 // Extra record type constants
 pub const EXTRA_FILE_HASH: u64 = 0x02;
 pub const HASH_TYPE_BLAKE2SP: u64 = 0x00;
+pub const EXTRA_FILE_ENCRYPTION: u64 = 0x01;
 
 /// Maximum allowed header size: 2 MiB.
 const MAX_HEADER_SIZE: u64 = 2 * 1024 * 1024;
@@ -319,6 +320,60 @@ pub fn extract_blake2sp_hash(extra_records: []const ExtraRecord) ?[32]u8 {
 			var result: [32]u8 = undefined;
 			@memcpy(&result, hash_bytes);
 			return result;
+		}
+	}
+	return null;
+}
+
+/// Returns true if the file's extra area contains a file-encryption record
+/// (RAR5 extra record type 0x01), indicating the file's data is encrypted.
+/// Non-allocating: walks the raw extra bytes directly.
+pub fn extra_has_encryption(extra_data: ?[]const u8) bool {
+	const data = extra_data orelse return false;
+	var r = reader_mod.Reader.init(data);
+	while (r.remaining() > 0) {
+		const field_size = r.read_vint() catch break;
+		if (field_size == 0) break;
+		const before_type = r.position();
+		const field_type = r.read_vint() catch break;
+		const type_vint_len = r.position() - before_type;
+		if (field_type == EXTRA_FILE_ENCRYPTION) return true;
+		const data_len = field_size - type_vint_len;
+		_ = r.read_bytes(@intCast(data_len)) catch break;
+	}
+	return false;
+}
+
+/// Extract a BLAKE2sp file hash directly from raw extra-area bytes, without
+/// allocating an intermediate ExtraRecord list. Returns the 32-byte hash if a
+/// HASH extra record (type 0x02) with BLAKE2sp hash_type (0x00) is present.
+pub fn extract_blake2sp_hash_raw(extra_data: ?[]const u8) ?[32]u8 {
+	const data = extra_data orelse return null;
+	var r = reader_mod.Reader.init(data);
+	while (r.remaining() > 0) {
+		const field_size = r.read_vint() catch break;
+		if (field_size == 0) break;
+		const before_type = r.position();
+		const field_type = r.read_vint() catch break;
+		const type_vint_len = r.position() - before_type;
+		const data_len = field_size - type_vint_len;
+		if (field_type == EXTRA_FILE_HASH) {
+			// HASH record body: hash_type vint + 32-byte hash
+			const rec_start = r.position();
+			const hash_type = r.read_vint() catch break;
+			if (hash_type == HASH_TYPE_BLAKE2SP) {
+				const hash_bytes = r.read_bytes(32) catch break;
+				var result: [32]u8 = undefined;
+				@memcpy(&result, hash_bytes);
+				return result;
+			}
+			// Not BLAKE2sp — skip the rest of this record's data.
+			const consumed = r.position() - rec_start;
+			if (data_len > consumed) {
+				_ = r.read_bytes(@intCast(data_len - consumed)) catch break;
+			}
+		} else {
+			_ = r.read_bytes(@intCast(data_len)) catch break;
 		}
 	}
 	return null;
@@ -833,6 +888,93 @@ test "extract_blake2sp_hash skips non-BLAKE2sp hash types" {
 
 	const result = extract_blake2sp_hash(records);
 	try testing.expect(result == null);
+}
+
+test "extra_has_encryption detects type 0x01 record" {
+	// Build an extra area with an encryption record: type=0x01, some data bytes.
+	var extra: [64]u8 = undefined;
+	var epos: usize = 0;
+
+	// Record: field_size = 1 (type vint) + 3 (data) = 4
+	epos += encode_vint(4, extra[epos..]); // field_size
+	epos += encode_vint(0x01, extra[epos..]); // field_type = ENCRYPTION
+	extra[epos] = 0xAA;
+	epos += 1;
+	extra[epos] = 0xBB;
+	epos += 1;
+	extra[epos] = 0xCC;
+	epos += 1;
+
+	try testing.expect(extra_has_encryption(extra[0..epos]));
+}
+
+test "extra_has_encryption is false without encryption record" {
+	// Build an extra area with only a HASH record (type 0x02).
+	var extra: [64]u8 = undefined;
+	var epos: usize = 0;
+
+	epos += encode_vint(2, extra[epos..]); // field_size
+	epos += encode_vint(0x02, extra[epos..]); // field_type = HASH
+	extra[epos] = 0xCC;
+	epos += 1;
+
+	try testing.expect(!extra_has_encryption(extra[0..epos]));
+}
+
+test "extra_has_encryption is false for null/empty extra" {
+	try testing.expect(!extra_has_encryption(null));
+	try testing.expect(!extra_has_encryption(&[_]u8{}));
+}
+
+test "extract_blake2sp_hash_raw returns hash from raw extra bytes" {
+	var extra: [64]u8 = undefined;
+	var epos: usize = 0;
+
+	var expected_hash: [32]u8 = undefined;
+	for (&expected_hash, 0..) |*b, i| b.* = @intCast(i);
+
+	// Record: field_size = 1 (type) + 1 (hash_type) + 32 (hash) = 34
+	epos += encode_vint(34, extra[epos..]); // field_size
+	epos += encode_vint(0x02, extra[epos..]); // field_type = HASH
+	epos += encode_vint(0x00, extra[epos..]); // hash_type = BLAKE2sp
+	@memcpy(extra[epos..][0..32], &expected_hash);
+	epos += 32;
+
+	const result = extract_blake2sp_hash_raw(extra[0..epos]);
+	try testing.expect(result != null);
+	try testing.expectEqualSlices(u8, &expected_hash, &result.?);
+}
+
+test "extract_blake2sp_hash_raw returns null without HASH record" {
+	var extra: [64]u8 = undefined;
+	var epos: usize = 0;
+	// Only an encryption record (type 0x01).
+	epos += encode_vint(2, extra[epos..]); // field_size
+	epos += encode_vint(0x01, extra[epos..]); // field_type = ENCRYPTION
+	extra[epos] = 0xCC;
+	epos += 1;
+
+	try testing.expect(extract_blake2sp_hash_raw(extra[0..epos]) == null);
+	try testing.expect(extract_blake2sp_hash_raw(null) == null);
+}
+
+test "extract_blake2sp_hash_raw matches allocating extract_blake2sp_hash" {
+	var extra: [64]u8 = undefined;
+	var epos: usize = 0;
+	var expected_hash: [32]u8 = undefined;
+	@memset(&expected_hash, 0x5A);
+	epos += encode_vint(34, extra[epos..]);
+	epos += encode_vint(0x02, extra[epos..]);
+	epos += encode_vint(0x00, extra[epos..]);
+	@memcpy(extra[epos..][0..32], &expected_hash);
+	epos += 32;
+
+	const records = try parse_extra_records(extra[0..epos], testing.allocator);
+	defer testing.allocator.free(records);
+	const ref = extract_blake2sp_hash(records);
+	const raw = extract_blake2sp_hash_raw(extra[0..epos]);
+	try testing.expect(ref != null and raw != null);
+	try testing.expectEqualSlices(u8, &ref.?, &raw.?);
 }
 
 test "walk_blocks iterates through blocks" {

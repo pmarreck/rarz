@@ -904,6 +904,11 @@ fn write_volumes_from_payloads(
 		const vol_num = vol_count;
 		const vol_buf_size = @as(usize, @intCast(config.volume_size)) + 65536; // extra for header overhead
 		var vol_buf = try allocator.alloc(u8, vol_buf_size);
+		// Per-iteration ownership: this errdefer is scoped to the loop body, so it
+		// fires only if THIS iteration errors out (e.g. the vol_list growth or
+		// final_buf allocation below fails). On the success path vol_buf is freed
+		// explicitly before the iteration ends, discharging the errdefer.
+		errdefer allocator.free(vol_buf);
 
 		var pos: usize = 0;
 		pos = write_signature(vol_buf, pos);
@@ -1794,4 +1799,27 @@ test "write_archive_volumes: round-trip reassemble data from chunks" {
 	// Reassembled data should match original
 	try testing.expectEqual(file_data.len, reassembled_len);
 	try testing.expectEqualSlices(u8, file_data, reassembled[0..reassembled_len]);
+}
+
+test "write_volumes_from_payloads: no leak when allocation fails mid-iteration" {
+	// Two files, small volume size => multivolume loop runs several iterations,
+	// each allocating a per-iteration `vol_buf` plus a shrink-to-fit `final_buf`.
+	// checkAllAllocationFailures injects an OOM at every allocation index; if the
+	// error path forgets to free `vol_buf`, it is reported as a leak.
+	const data_a = "alpha alpha alpha alpha alpha alpha";
+	const data_b = "bravo bravo bravo bravo bravo bravo";
+	const payloads = [_]FilePayload{
+		.{ .entry = .{ .name = "a.txt", .data = data_a, .mtime = 0, .is_directory = false }, .data = data_a, .method = 0, .is_compressed = false },
+		.{ .entry = .{ .name = "b.txt", .data = data_b, .mtime = 0, .is_directory = false }, .data = data_b, .method = 0, .is_compressed = false },
+	};
+	const config = VolumeConfig{ .volume_size = 105 };
+
+	const Helper = struct {
+		fn run(alloc: std.mem.Allocator, p: []const FilePayload, cfg: VolumeConfig) !void {
+			var result = try write_volumes_from_payloads(alloc, p, cfg);
+			result.deinit();
+		}
+	};
+
+	try testing.checkAllAllocationFailures(testing.allocator, Helper.run, .{ &payloads, config });
 }

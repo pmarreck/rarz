@@ -72,7 +72,9 @@ pub const Window = struct {
             return;
         }
 
-        if (distance >= length and dst_no_wrap and src_no_wrap) {
+        if (distance >= length and dst_no_wrap and src_no_wrap and
+            (dst_phys + length <= src_phys or src_phys + length <= dst_phys))
+        {
             // Non-overlapping: bulk copy
             @memcpy(self.buffer[dst_phys..][0..length], self.buffer[src_phys..][0..length]);
             self.write_pos += length;

@@ -360,7 +360,7 @@ fn decodeBlock(state: *Unpack50State, unpacked_size: u64) !bool {
     // Step 2: Read 8-bit block flags
     const flags: u8 = @intCast(try br.readBits(8));
     const block_bit_size: u4 = @intCast((flags & 7) + 1); // 1-8 valid bits in last byte
-    const byte_count: u2 = @intCast(((flags >> 3) & 3) + 1); // 1-3 bytes for size
+    const byte_count: u8 = @intCast(((flags >> 3) & 3) + 1); // u8 not u2: value can be 4 (rejected next line); u2 overflowed before the guard
     if (byte_count == 4) return error.InvalidData; // ByteCount 4 is reserved/invalid
     const is_last_block = (flags & 0x40) != 0;
     const table_present = (flags & 0x80) != 0;

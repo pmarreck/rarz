@@ -1736,7 +1736,7 @@ test "validate_volumes: empty volumes slice" {
 // 4 of 8 values defined, so @enumFromInt on a 4..7 value panicked ("invalid enum
 // value") in parseFilterDescriptor. validate fuzzing surfaced it (bolter bit-flip
 // of a valid RAR). Fixed with a checked std.meta.intToEnum. Fixture:
-// tests/fixtures/fuzz_filter_type_invalid.rar (766 bytes) inlined for a self-
+// tests/fixtures/invalid/fuzz_filter_type_invalid.rar (766 bytes) inlined for a self-
 // contained regression that runs in `zig build test`.
 test "validate does not panic on invalid RAR5 filter type (fuzz regression)" {
     const crasher = [_]u8{

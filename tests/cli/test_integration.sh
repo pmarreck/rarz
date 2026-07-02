@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -u
 
 RARZ="zig-out/bin/rarz"
 FIXTURES="tests/fixtures"
@@ -7,7 +7,7 @@ errors=0
 
 fail() {
 	echo "FAIL: $1"
-	((errors++))
+	errors=$((errors + 1))
 }
 
 # Ensure fixtures exist

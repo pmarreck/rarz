@@ -1,25 +1,35 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# Master test runner. Runs the ENTIRE suite (zig unit tests + CLI tests) and
+# accumulates a nonzero exit code from any failing sub-suite.
+#
+# NOTE: CLI suites are run *inside the nix devshell* (`nix develop -c`) because
+# interop tests invoke `unrar`/`rar`, which exist only in the devshell. Running
+# them bare silently fails every interop assertion on a clean machine.
+#
+# Per Peter's test rules: `set -u` only — NEVER `set -e`/pipefail. errexit
+# aborts on the first error-path command, defeating error-path testing, and
+# masks accumulated failures. The pass/fail accounting below is explicit.
+set -u
 
 errors=0
 
 echo "=== Zig unit tests ==="
 if ! nix develop -c zig build test; then
-    ((errors += 1))
+    errors=$((errors + 1))
 fi
 
 if [ -d tests/cli ]; then
     echo "=== Build CLI for CLI tests ==="
     if ! nix develop -c zig build; then
-        ((errors += 1))
+        errors=$((errors + 1))
     fi
 
-    echo "=== CLI tests ==="
+    echo "=== CLI tests (in nix devshell — provides unrar/rar) ==="
     for t in tests/cli/test_*.sh; do
         [ -f "$t" ] || continue
         echo "  running $t"
-        if ! bash "$t"; then
-            ((errors += 1))
+        if ! nix develop -c bash "$t"; then
+            errors=$((errors + 1))
         fi
     done
 fi

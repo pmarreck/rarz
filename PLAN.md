@@ -1,5 +1,21 @@
 # PLAN
 
+## Recent Fixes (2026-07-02 EST — dedicated-owner onboarding)
+- [x] Harness: `./test` now runs CLI suites in-env (`nix develop -c` for unrar/rar);
+  stripped forbidden `set -euo pipefail` (→ `set -u`) and the `((errors++))` errexit
+  footgun (→ `errors=$((errors + 1))`) across all suites. Revealed 2 hidden failures.
+- [x] Fixtures: moved `fuzz_filter_type_invalid.rar` → `tests/fixtures/invalid/` (Interop
+  Gate A treats `tests/fixtures/` as all-valid).
+- [x] **Multi-volume verify bug**: `rarz t` reported false "payload CRC32 mismatch" on
+  valid split-file archives. RAR5 stores the full-file CRC in the LAST volume part
+  (split_after==false), not the first; `validate_volumes` + `collectRar5FilesUnified`
+  now use the last part's CRC. Hermetic regression test embeds the official-rar m3
+  fixtures. Master `./test` green in-env; agrees with unrar oracle.
+- [ ] Follow-up: `tests/diagnose_crc.zig` (`zig build diagnose`) does not compile under
+  Zig 0.16 (removed `std.heap.GeneralPurposeAllocator`, `std.process.argsWithAllocator`).
+  Modernize when next needed (diagnostic-only, out of the CRC-fix scope).
+
+
 ## Phase 0: Specification and Design
 - [x] Create initial RAR format specification draft (`RAR_SPECIFICATION.md`) (2026-02-19 EST)
 - [x] Add architecture constraints: Zig in-memory core + C FFI + C drop-in CLI (`rarz`) (2026-02-19 EST)

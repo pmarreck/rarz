@@ -1,0 +1,5 @@
+# Dirtree: Stateful directory trees in the CLI for humans and LLMs. https://github.com/pmarreck/dirtree
+ver=1.2
+annotate=[
+	tests/fixtures/invalid = intentionally-invalid fixtures (kept out of all-valid Interop Gate A scans)
+]

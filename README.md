@@ -1,7 +1,7 @@
 # rarz
 
 [![CI](https://github.com/pmarreck/rarz/actions/workflows/ci.yml/badge.svg)](https://github.com/pmarreck/rarz/actions/workflows/ci.yml)
-[![built with garnix](https://img.shields.io/endpoint.svg?url=https://garnix.io/api/badges/pmarreck/rarz)](https://garnix.io/repo/pmarreck/rarz)
+[![built with garnix](https://img.shields.io/endpoint.svg?url=https%3A%2F%2Fgarnix.io%2Fapi%2Fbadges%2Fpmarreck%2Frarz%3Fbranch%3Dyolo)](https://garnix.io/repo/pmarreck/rarz)
 
 A clean-room RAR archive toolkit: parser, validator, extractor, and writer.
 

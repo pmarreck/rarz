@@ -11,9 +11,9 @@
   (split_after==false), not the first; `validate_volumes` + `collectRar5FilesUnified`
   now use the last part's CRC. Hermetic regression test embeds the official-rar m3
   fixtures. Master `./test` green in-env; agrees with unrar oracle.
-- [ ] Follow-up: `tests/diagnose_crc.zig` (`zig build diagnose`) does not compile under
-  Zig 0.16 (removed `std.heap.GeneralPurposeAllocator`, `std.process.argsWithAllocator`).
-  Modernize when next needed (diagnostic-only, out of the CRC-fix scope).
+- [x] `tests/diagnose_crc.zig` modernized for Zig 0.16 (Juicy Main + `std.Io`);
+  its compilation is now gated on `zig build test` so CI enforces 0.16 compat
+  and it can't silently rot again. (2026-07-03 EST)
 
 
 ## Phase 0: Specification and Design

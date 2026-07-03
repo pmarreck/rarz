@@ -107,7 +107,9 @@ pub fn build(b: *std.Build) void {
 	const bench_step = b.step("bench", "Run microbenchmarks");
 	bench_step.dependOn(&run_microbench.step);
 
-	// Diagnostic harness for CRC investigation (built only via `zig build diagnose`)
+	// Diagnostic harness for CRC investigation. Run via `zig build diagnose`;
+	// its *compilation* is also gated on `zig build test` (see below) so CI
+	// keeps it building — it silently rotted once under a Zig API bump.
 	const diag = b.addExecutable(.{
 		.name = "diagnose_crc",
 		.root_module = b.createModule(.{
@@ -123,4 +125,7 @@ pub fn build(b: *std.Build) void {
 	const diag_install = b.addInstallArtifact(diag, .{});
 	const diag_step = b.step("diagnose", "Build diagnose_crc helper");
 	diag_step.dependOn(&diag_install.step);
+	// Compile (not install) the diagnostic as part of `zig build test` so CI
+	// enforces its Zig 0.16 compatibility and it can't silently rot again.
+	test_step.dependOn(&diag.step);
 }

@@ -1,7 +1,8 @@
 // Diagnostic harness for the payload CRC32 false positive.
 // Walks an archive's RAR5 file blocks, prints stored vs computed CRC for each,
-// and identifies which entry fails. Build with `zig build` after wiring this
-// in build.zig — but we'll just `zig run` it directly.
+// and identifies which entry fails. Build+run: `zig build diagnose` then
+// `zig-out/bin/diagnose_crc <archive.rar> [--extract <idx> <out.rar>]`.
+// (Its compilation is also gated on `zig build test` to keep it 0.16-green.)
 
 const std = @import("std");
 const rarz = @import("rarz");
@@ -10,12 +11,11 @@ const integrity = rarz.integrity;
 const rar5_headers = rarz.rar5_headers;
 const dispatch = rarz.dispatch;
 
-pub fn main() !void {
-	var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-	defer _ = gpa.deinit();
-	const alloc = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+	const io = init.io;
+	const alloc = init.gpa;
 
-	var args = try std.process.argsWithAllocator(alloc);
+	var args = try init.minimal.args.iterateAllocator(alloc);
 	defer args.deinit();
 	_ = args.next(); // exe name
 	const path = args.next() orelse {
@@ -37,12 +37,10 @@ pub fn main() !void {
 		}
 	}
 
-	const file = try std.fs.cwd().openFile(path, .{});
-	defer file.close();
-	const stat = try file.stat();
-	const data = try alloc.alloc(u8, stat.size);
+	// 0.16: read the whole file by path (.unlimited avoids the .limited(size)
+	// StreamTooLong footgun when size == file length).
+	const data = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .unlimited);
 	defer alloc.free(data);
-	_ = try file.readAll(data);
 
 	const fmt = detect.detect_format(data, 0);
 	std.debug.print("family={?} sig_offset={} sig_len={}\n", .{ fmt.family, fmt.signature_offset, fmt.signature_len });
@@ -188,9 +186,9 @@ pub fn main() !void {
 		}
 
 		const out_path = extract_out.?;
-		const out_file = try std.fs.cwd().createFile(out_path, .{});
-		defer out_file.close();
-		try out_file.writeAll(out.items);
+		const out_file = try std.Io.Dir.cwd().createFile(io, out_path, .{});
+		defer out_file.close(io);
+		try out_file.writeStreamingAll(io, out.items);
 		std.debug.print("\nWrote {} bytes to {s}\n", .{ out.items.len, out_path });
 	}
 }

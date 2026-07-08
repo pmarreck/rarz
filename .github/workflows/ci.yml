@@ -88,3 +88,14 @@ jobs:
 
       - name: Test
         run: zig build test
+
+  nix:
+    name: Nix flake checks (x86_64-linux, sandboxed)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: DeterminateSystems/nix-installer-action@main
+      - name: nix build flake checks (replaces Garnix; shutting down 2026-07-15)
+        run: nix build '.#checks.x86_64-linux.default' -L
+      - name: nix build flake package
+        run: nix build '.#packages.x86_64-linux.default' -L

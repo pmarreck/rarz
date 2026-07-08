@@ -1,5 +1,16 @@
 # PLAN
 
+## CI migration off Garnix (2026-07-08 EST — Garnix shutting down 2026-07-15)
+- [x] Garnix is shutting down 2026-07-15 (joining Shopify, open-sourcing; ALL user
+  data + build artifacts deleted that day). The fleet-wide "All Garnix checks"
+  aggregate wedge since ~07-01 was the wind-down degradation — not an account or
+  repo bug. Confirmed via blog.garnix.io/blog/shutting-down/.
+- [x] Replaced Garnix's nix-sandbox verification with a GitHub Actions `nix` job
+  (DeterminateSystems/nix-installer-action; `nix build .#checks.x86_64-linux.default`
+  + `.#packages.x86_64-linux.default`). Omitted magic-nix-cache (archived/deprecated).
+  Native 4-platform zig CI unchanged; flake path is CI-verified again.
+- [x] Removed the dead Garnix badge from README. (2026-07-08 EST)
+
 ## Recent Fixes (2026-07-02 EST — dedicated-owner onboarding)
 - [x] Harness: `./test` now runs CLI suites in-env (`nix develop -c` for unrar/rar);
   stripped forbidden `set -euo pipefail` (→ `set -u`) and the `((errors++))` errexit

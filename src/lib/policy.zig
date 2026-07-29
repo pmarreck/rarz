@@ -296,12 +296,41 @@ fn validate_rar5_payload(data: []const u8, sig_offset: usize, sig_len: u8) Valid
 				// Skip split files — payload CRC covers the full file, not chunks
 				if (f.header.flags.split_before or f.header.flags.split_after) continue;
 
+				// PRECISION OVER FORGIVENESS: an entry claiming N > 0 unpacked
+				// bytes must declare packed bytes we can actually read, or its
+				// stored checksum is unverifiable. Previously a missing/zero
+				// data size meant every check below was skipped and the archive
+				// was still reported VALID — "nothing to check" silently became
+				// "nothing wrong". That is how rarz blessed its own corrupt
+				// output (headers with packed_size == 0) while unrar reported
+				// "checksum error" on the same file. Being unable to verify is
+				// a FAILURE, not a pass.
+				//
+				// unpacked_size == 0 is the legitimate empty-file/directory
+				// case and is intentionally still allowed through.
+				if (f.unpacked_size > 0) {
+					const declared = f.header.data_size orelse 0;
+					if (declared == 0) {
+						structural.is_valid = false;
+						structural.error_message = "file header declares unpacked data but no packed data size; payload cannot be verified";
+						return structural;
+					}
+				}
+
 				if (f.compression.method == 0) {
 					// Store-method file — verify raw payload directly
 					if (f.header.data_size) |ds| {
 						const total_header = 4 + f.header.crc_data_len;
 						const payload_start = block_start + f.header.header_start + total_header;
 						const payload_end = payload_start + @as(usize, @intCast(ds));
+						// PRECISION: a payload declared past the end of the
+						// archive means the file is truncated. Skipping it (the
+						// old behaviour) reported a truncated archive as VALID.
+						if (payload_end > data.len) {
+							structural.is_valid = false;
+							structural.error_message = "declared payload extends beyond end of archive (truncated)";
+							return structural;
+						}
 						if (payload_end <= data.len) {
 							const payload = data[payload_start..payload_end];
 
@@ -333,6 +362,14 @@ fn validate_rar5_payload(data: []const u8, sig_offset: usize, sig_len: u8) Valid
 						const total_header = 4 + f.header.crc_data_len;
 						const payload_start = block_start + f.header.header_start + total_header;
 						const payload_end = payload_start + @as(usize, @intCast(ds));
+						// PRECISION: a payload declared past the end of the
+						// archive means the file is truncated. Skipping it (the
+						// old behaviour) reported a truncated archive as VALID.
+						if (payload_end > data.len) {
+							structural.is_valid = false;
+							structural.error_message = "declared payload extends beyond end of archive (truncated)";
+							return structural;
+						}
 						if (payload_end <= data.len) {
 							const packed_data = data[payload_start..payload_end];
 							const alloc = std.heap.page_allocator;
@@ -932,7 +969,15 @@ test "validate counts blocks and files correctly" {
 		var body: [128]u8 = undefined;
 		var bpos: usize = 0;
 		bpos += encode_vint(0, body[bpos..]); // file_flags = 0
-		bpos += encode_vint(100, body[bpos..]); // unpacked_size
+		// unpacked_size = 0 (legitimately empty file). This fixture exists to
+		// test BLOCK/FILE COUNTING, not payload verification. It previously
+		// claimed 100 unpacked bytes while building the block with header flags
+		// = 0, i.e. no data area and no payload at all — a contradictory
+		// archive that real RAR5 cannot represent and that unrar rejects.
+		// Validation now (correctly) refuses to call that VALID, so the fixture
+		// states what it actually contains. Do not "restore" a nonzero size
+		// here without also emitting a data area and payload bytes.
+		bpos += encode_vint(0, body[bpos..]); // unpacked_size
 		bpos += encode_vint(0x20, body[bpos..]); // attributes
 		bpos += encode_vint(0, body[bpos..]); // compression_info (store)
 		bpos += encode_vint(0, body[bpos..]); // host_os
@@ -947,7 +992,7 @@ test "validate counts blocks and files correctly" {
 		var body: [128]u8 = undefined;
 		var bpos: usize = 0;
 		bpos += encode_vint(0, body[bpos..]); // file_flags = 0
-		bpos += encode_vint(200, body[bpos..]); // unpacked_size
+		bpos += encode_vint(0, body[bpos..]); // unpacked_size (see note on file 1)
 		bpos += encode_vint(0x20, body[bpos..]); // attributes
 		bpos += encode_vint(0, body[bpos..]); // compression_info (store)
 		bpos += encode_vint(0, body[bpos..]); // host_os

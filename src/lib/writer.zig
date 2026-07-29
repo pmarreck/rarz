@@ -1873,3 +1873,37 @@ test "write_archive_compressed: MULTI-file round-trip (parallel compression path
 	}
 }
 
+
+test "policy.validate: a compressed entry with packed_size==0 must NOT be VALID" {
+	// PRECISION OVER FORGIVENESS (Mecha Validate trust signal).
+	//
+	// A file header can claim unpacked_size > 0 AND carry a stored CRC32 while
+	// declaring packed_size == 0. That archive is malformed: there are no bytes
+	// to decompress, so the stored checksum can never be corroborated. rarz used
+	// to report such an archive as VALID, because a zero-length payload made the
+	// verifier skip the CRC check entirely — "nothing to check" was treated as
+	// "nothing wrong".
+	//
+	// This is the exact shape the C-hosted Thread.spawn UB emitted (every file
+	// written with packed_size == 0), and rarz blessed its own corrupt output
+	// while unrar reported "checksum error". Being unable to verify must be a
+	// FAILURE, never a pass.
+	const payload = "x" ** 100;
+	const entry = FileEntry{
+		.name = "claims-data.txt",
+		.data = payload, // unpacked_size = 100, and a CRC32 is stored
+		.mtime = 0x5C000000,
+		.is_directory = false,
+	};
+
+	var buf: [4096]u8 = undefined;
+	var pos: usize = 0;
+	pos = write_signature(&buf, pos);
+	pos = write_main_block(&buf, pos);
+	// Deliberately write ZERO compressed bytes for a 100-byte file.
+	pos = write_file_block_precompressed(&buf, pos, entry, &[_]u8{}, 3);
+	pos = write_end_block(&buf, pos);
+
+	const result = policy.validate(buf[0..pos]);
+	try testing.expect(!result.is_valid);
+}

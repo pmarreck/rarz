@@ -1,5 +1,89 @@
 # PLAN
 
+## ACTIVE QUEUE (2026-07-29 — thelio-nixos, git-only, Mecha Validate release push)
+
+Context: new main dev machine (thelio-nixos = mechatron-prime, our own CI); jj
+retired, **git only**; Garnix dead. Downstream driver: **Mecha Validate**
+(`../validate_gui` → `../validate` → rarz) is heading to release, so RAR
+coverage must be *precise* (never forgiving) with *actionable* error detail.
+
+### 0. Machine/branch reconciliation
+- [x] Local was 11 commits behind `origin/yolo` with a stale duplicate of
+  already-landed work in the tree. Verified every local source change was 100%
+  present upstream, backed up the full diff, discarded the duplicates, and
+  fast-forwarded to `6304b55`. Preserved the 2 genuinely-unique changes:
+  Einstein's ReleaseSafe floor + the `ZIG_RECENT_API_CHANGES.md` symlink fix
+  (origin still pointed at the dead `/Users/pmarreck/Documents-CloudManaged`
+  Mac path). Backups: scratchpad `backup/`. (2026-07-29 EDT)
+
+### 1. Get the suite honestly green (BLOCKS everything else) — DONE
+- [x] True RED baseline established on this machine: **5 failing suites**
+  (test_commands, test_directories, test_output_flag, test_volume_create,
+  test_volume_validate). (2026-07-29 EDT)
+- [x] **Root cause A — real product bug, C-hosted UB.** Everything rarz
+  *created* with 2+ files was silently corrupt (`unrar t` = "checksum error",
+  `rarz x` = "file has no data size", yet `rarz t` said VALID). Boundary was
+  exactly `compressible_count >= 2` → the parallel-compression path.
+  `std.Thread.spawn` was selecting Zig's raw-`clone` Linux impl, which reads
+  `linux.tls.area_desc` — initialized only by `std.start`, which NEVER RUNS
+  because `main()` is C (our dogfooding architecture). Alignment stayed 0 →
+  ReleaseSafe panics at `assert(isValidAlignGeneric)`; ReleaseFast compiled the
+  assert out → UB → all compression results null → `results[i].data.?`
+  null-unwrap → `packed_size == 0`. Fix: `.link_libc = true` on the **library**
+  module (exe already had it), selecting the pthread-backed impl that needs no
+  Zig TLS bootstrap. Latent on macOS (always pthread-backed) — surfaced only on
+  moving to Linux. (2026-07-29 EDT)
+- [x] **Root cause B — environmental + rules violation.** The 2 volume suites
+  shelled out to `python3`, absent from the devshell, silently writing EMPTY
+  input files → nothing to split → "expected at least 2 volumes, got 1".
+  Replaced with an `awk` `repeat_str` helper (byte-identical output). Peter's
+  brief forbids Python; a test dep that isn't in the flake is invisible rot.
+  (2026-07-29 EDT)
+- [x] Master `./test` in-env: **ALL TESTS PASSED**, exit 0, ~59s. (2026-07-29 EDT)
+- [x] ReleaseSafe floor committed (Einstein's ask; Peter item #7).
+
+### 2. ReleaseSafe UB triage (Peter item #7) — DONE (this round)
+- [x] Extended the floor beyond Einstein's `flake.nix`/CI change to the master
+  `./test`, covering BOTH the Zig unit tests and **the C-hosted CLI binary** —
+  the FFI boundary is exactly where the UB above lived, and ReleaseSafe turned
+  silent archive corruption into a loud panic at the true fault site.
+- [x] Full suite is green under ReleaseSafe with no further panics; the
+  `link_libc` defect above was the one real UB finding. Re-triage whenever new
+  parallel/FFI code lands.
+
+### 3. Inbox: RAR4 payload CRC32 false positive (2026-05-03, from validate)
+- [ ] Real-world 17.5 MB RAR4 (`unrar t` = All OK) fails rarz with "payload
+  CRC32 mismatch". **This is exactly the precision/trust bug class that matters
+  for the Mecha Validate release.** Reproduce with a committed fixture first.
+  Suspects listed in the note: polynomial variant, byte range (compressed vs
+  decompressed), endianness, init/final-XOR. NOTE: the RAR5 multi-volume
+  analogue of this was already fixed (CRC lives in the LAST part) — check
+  whether RAR4 has a related "which header holds the authoritative CRC" issue.
+
+### 4. Mecha Validate release polish (Peter item #9) — precision + error detail
+- [ ] Audit RAR coverage for *precision over forgiveness*: no silently-skipped
+  chunks, no "valid" verdicts on unverified data. (Prior finding: a
+  `payload_end <= vol_data.len` guard silently DROPPED chunks — that class of
+  thing must fail loudly, not pass quietly.)
+- [ ] Upgrade error reporting for the `validate` consumer: structured, detailed
+  messages carrying **byte offset / block type / entry name / expected-vs-actual**,
+  not bare strings like "payload CRC32 mismatch". Design the API with validate's
+  needs in mind (coordinate via LLMsend if the shape is unclear).
+
+### 5. Inbox: streaming verification API (2026-07-10, from validate-archive-streaming)
+- [ ] `validate` wants a sibling to `policy.validate(data)` that does not
+  require the whole archive as `[]const u8` (it has a seekable `FileSource`).
+  Deliverable per the note: either a narrow implementation + tests, OR a
+  concise design with the smallest first API and concrete blockers. Start by
+  tracing which parse/decompress paths genuinely need random access.
+  Keep `policy.validate(data)` compatible.
+
+### 6. Housekeeping
+- [ ] Mechatron Prime CI: `MECHATRON_PRIME_CI.md` is untracked; wire rarz onto
+  the Thelio runner (`mechatron-ci` skill owns targets/webhook/badge) now that
+  Garnix is gone.
+- [ ] Trash/process the 3 inbox notes once each is handled.
+
 ## CI migration off Garnix (2026-07-08 EST — Garnix shutting down 2026-07-15)
 - [x] Garnix is shutting down 2026-07-15 (joining Shopify, open-sourcing; ALL user
   data + build artifacts deleted that day). The fleet-wide "All Garnix checks"

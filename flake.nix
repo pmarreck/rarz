@@ -99,7 +99,20 @@
             mkdir -p $ZIG_GLOBAL_CACHE_DIR
             cp -r ${zigDeps}/* $ZIG_GLOBAL_CACHE_DIR/
             chmod -R u+w $ZIG_GLOBAL_CACHE_DIR
-            timeout 600 zig build test || { echo "Tests failed"; exit 1; }
+            # FLEET FLOOR — tests run ReleaseSafe (fleet finding 2026-07-01).
+            # ReleaseFast compiles OUT the runtime safety checks (integer
+            # overflow, bounds, illegal cast), so a green ReleaseFast suite
+            # cannot observe UB — it passes *because* the check that would have
+            # failed it is gone. rarz itself was the motivating case: three
+            # real crashers sat behind a fully green ReleaseFast suite.
+            #
+            # Enforced HERE, not as a per-module `.optimize` in build.zig: Zig
+            # honours per-module optimize, so pinning only the test module
+            # would leave imported library code at ReleaseFast. The command
+            # line flips the entire test compilation at once.
+            #
+            # Shipped artifact and benchmarks stay ReleaseFast.
+            timeout 600 zig build test -Doptimize=ReleaseSafe || { echo "Tests failed"; exit 1; }
           '';
 
           installPhase = ''

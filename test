@@ -11,16 +11,29 @@
 # masks accumulated failures. The pass/fail accounting below is explicit.
 set -u
 
+# FLEET FLOOR — everything under test is built ReleaseSafe (fleet finding
+# 2026-07-01), matching flake.nix/CI. ReleaseFast compiles OUT the runtime
+# safety checks, so a green ReleaseFast suite cannot observe UB; it passes
+# *because* the check that would have failed it is gone.
+#
+# This applies to the CLI binary too, not just the Zig unit tests. The
+# C-hosted binary is where the FFI boundary actually runs, and it is exactly
+# where UB hid: a `std.Thread.spawn` failure left compression results null,
+# which ReleaseFast turned into a silent null-unwrap emitting corrupt archives
+# (packed_size == 0), while ReleaseSafe panics loudly at the real fault.
+# Shipped artifacts and benchmarks stay ReleaseFast.
+OPT="-Doptimize=ReleaseSafe"
+
 errors=0
 
-echo "=== Zig unit tests ==="
-if ! nix develop -c zig build test; then
+echo "=== Zig unit tests (ReleaseSafe) ==="
+if ! nix develop -c zig build test "$OPT"; then
     errors=$((errors + 1))
 fi
 
 if [ -d tests/cli ]; then
-    echo "=== Build CLI for CLI tests ==="
-    if ! nix develop -c zig build; then
+    echo "=== Build CLI for CLI tests (ReleaseSafe) ==="
+    if ! nix develop -c zig build "$OPT"; then
         errors=$((errors + 1))
     fi
 

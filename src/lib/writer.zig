@@ -1823,3 +1823,53 @@ test "write_volumes_from_payloads: no leak when allocation fails mid-iteration" 
 
 	try testing.checkAllAllocationFailures(testing.allocator, Helper.run, .{ &payloads, config });
 }
+
+test "write_archive_compressed: MULTI-file round-trip (parallel compression path)" {
+	// Regression: every other compressed-writer test uses a SINGLE entry, which
+	// takes the inline-compression branch. With 2+ compressible entries
+	// write_archive_compressed switches to the threaded path
+	// (`compressible_count >= 2`), and that path was emitting files with
+	// packed_size == 0 — producing archives that unrar rejects with "checksum
+	// error" and that rarz itself cannot extract ("file has no data size").
+	const f1 = "The quick brown fox jumps over the lazy dog. The quick brown fox!";
+	const f2 = "Pack my box with five dozen liquor jugs. Pack my box with jugs!";
+	const entries = [_]FileEntry{
+		.{ .name = "one.txt", .data = f1, .mtime = 0x5C000000, .is_directory = false },
+		.{ .name = "two.txt", .data = f2, .mtime = 0x5C000000, .is_directory = false },
+	};
+
+	var buf: [16384]u8 = undefined;
+	const archive_len = try write_archive_compressed(testing.allocator, &entries, &buf, 3);
+
+	const format = detect.detect_format(buf[0..archive_len], 0);
+	const block_data = buf[format.signature_offset + format.signature_len .. archive_len];
+	var iter = rar5_headers.walk_blocks(block_data);
+	_ = try iter.next(); // main
+
+	const expected = [_][]const u8{ f1, f2 };
+	for (expected) |want| {
+		const block = (try iter.next()) orelse return error.EndOfData;
+		switch (block) {
+			.file => |f| {
+				const total_header = 4 + f.header.crc_data_len;
+				const payload_start = f.header.header_start + total_header;
+				const ds = f.header.data_size orelse return error.EndOfData;
+				// The actual defect: a compressed entry must carry real packed bytes.
+				try testing.expect(ds > 0);
+				const packed_data = block_data[payload_start .. payload_start + @as(usize, @intCast(ds))];
+
+				const dispatch = @import("decompress/dispatch.zig");
+				const decompressed = try dispatch.decompressRar5(
+					testing.allocator,
+					packed_data,
+					f.unpacked_size,
+					f.compression,
+				);
+				defer testing.allocator.free(decompressed);
+				try testing.expectEqualSlices(u8, want, decompressed);
+			},
+			else => return error.EndOfData,
+		}
+	}
+}
+

@@ -16,6 +16,19 @@ pub fn build(b: *std.Build) void {
 			.root_source_file = b.path("src/lib/root.zig"),
 			.target = target,
 			.optimize = optimize,
+			// REQUIRED for the C-hosted architecture, not a convenience.
+			// `main()` is C, so Zig's `std.start` never runs. Without libc,
+			// `std.Thread.spawn` selects the raw-`clone` Linux implementation,
+			// which reads `linux.tls.area_desc` — a descriptor that only
+			// `std.start` initializes. In a C-hosted process it stays zeroed,
+			// so spawn hits `assert(isValidAlignGeneric(...))` with alignment
+			// 0. In ReleaseSafe that panics; in ReleaseFast the assert is
+			// compiled out and it becomes UB, leaving every parallel
+			// compression result null and silently emitting archives with
+			// packed_size == 0. Linking libc selects the pthread-backed
+			// implementation, which needs no Zig-side TLS bootstrap.
+			// (Latent on macOS, which is always pthread-backed.)
+			.link_libc = true,
 		}),
 	});
 

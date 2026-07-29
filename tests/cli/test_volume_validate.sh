@@ -12,11 +12,18 @@ fail() {
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT
 
+# Repeat a string n times followed by a newline (awk, not python3 — python is not
+# in the devshell, and these tests silently produced EMPTY input files when it was
+# missing, so `rarz a -v2k` had nothing to split and "expected >=2 volumes" failed).
+repeat_str() {
+	awk -v s="$1" -v n="$2" 'BEGIN { r = ""; for (i = 0; i < n; i++) r = r s; print r }'
+}
+
 # Create test input files
 mkdir -p "$tmpdir/data"
-python3 -c "print('File content for volume validation testing. ' * 80)" > "$tmpdir/data/file1.txt"
-python3 -c "print('Another test file with different content. ' * 80)" > "$tmpdir/data/file2.txt"
-python3 -c "print('X' * 5000)" > "$tmpdir/data/big.txt"
+repeat_str 'File content for volume validation testing. ' 80 > "$tmpdir/data/file1.txt"
+repeat_str 'Another test file with different content. ' 80 > "$tmpdir/data/file2.txt"
+repeat_str 'X' 5000 > "$tmpdir/data/big.txt"
 
 # ========================================================================
 # Test 1: Multi-volume store archive validates as VALID

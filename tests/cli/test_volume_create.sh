@@ -12,15 +12,22 @@ fail() {
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT
 
+# Repeat a string n times followed by a newline (awk, not python3 — python is not
+# in the devshell, and these tests silently produced EMPTY input files when it was
+# missing, so `rarz a -v2k` had nothing to split and "expected >=2 volumes" failed).
+repeat_str() {
+	awk -v s="$1" -v n="$2" 'BEGIN { r = ""; for (i = 0; i < n; i++) r = r s; print r }'
+}
+
 # Create test input files of varying sizes
 mkdir -p "$tmpdir/data"
 # ~2KB per file, 5 files = ~10KB of data
 for i in $(seq 1 5); do
-	python3 -c "print('File $i content is here and has some data. ' * 50)" > "$tmpdir/data/file$i.txt"
+	repeat_str "File $i content is here and has some data. " 50 > "$tmpdir/data/file$i.txt"
 done
 
 # Create a larger file for split testing
-python3 -c "print('X' * 5000)" > "$tmpdir/data/big.txt"
+repeat_str 'X' 5000 > "$tmpdir/data/big.txt"
 
 # ========================================================================
 # Test 1: Creates correct number of volume files

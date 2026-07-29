@@ -204,6 +204,7 @@ fn validate_rar5_structural(data: []const u8, sig_offset: usize, sig_len: u8) Va
 	var block_count: u32 = 0;
 	var file_count: u32 = 0;
 	var has_encrypted: bool = false;
+	var saw_end_of_archive: bool = false;
 
 	while (true) {
 		const maybe_block = iter.next() catch {
@@ -253,13 +254,33 @@ fn validate_rar5_structural(data: []const u8, sig_offset: usize, sig_len: u8) Va
 			.service => {
 				// services are also counted in block_count but not file_count
 			},
-			.end_archive => break, // stop after END block (volumes may have trailing padding)
+			.end_archive => {
+				saw_end_of_archive = true;
+				break; // stop after END block (volumes may have trailing padding)
+			},
 			else => {},
 		}
 	}
 
 	if (block_count == 0) {
 		return invalid_result(.rar50, "no blocks found");
+	}
+
+	// PRECISION: a RAR5 archive terminates with an end-of-archive block. Running
+	// out of data without one means the archive was cut short. The block walk
+	// alone cannot see this: a truncation that removes whole trailing blocks
+	// leaves every surviving block individually well-formed, so the iterator
+	// reports a clean end and validation used to return VALID. unrar reports
+	// "Unexpected end of archive" for exactly this input.
+	if (!saw_end_of_archive) {
+		return .{
+			.is_valid = false,
+			.family = .rar50,
+			.has_encrypted_content = has_encrypted,
+			.error_message = "archive ends without an end-of-archive block (truncated)",
+			.block_count = block_count,
+			.file_count = file_count,
+		};
 	}
 
 	return .{

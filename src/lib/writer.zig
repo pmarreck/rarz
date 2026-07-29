@@ -1907,3 +1907,31 @@ test "policy.validate: a compressed entry with packed_size==0 must NOT be VALID"
 	const result = policy.validate(buf[0..pos]);
 	try testing.expect(!result.is_valid);
 }
+
+test "policy.validate: truncated archive must NOT be VALID" {
+	// PRECISION: unrar reports "Unexpected end of archive" on a truncated RAR5;
+	// rarz reported VALID because the block walk swallowed the parse error
+	// (`iter.next() catch break`), so losing the tail of an archive silently
+	// ended validation early and everything seen so far was blessed.
+	const entry = FileEntry{
+		.name = "payload.txt",
+		.data = "the quick brown fox jumps over the lazy dog" ** 4,
+		.mtime = 0x5C000000,
+		.is_directory = false,
+	};
+	var buf: [4096]u8 = undefined;
+	const full_len = try write_archive(&[_]FileEntry{entry}, &buf);
+
+	// Sanity: the intact archive is valid.
+	try testing.expect(policy.validate(buf[0..full_len]).is_valid);
+
+	// Cut into the trailing blocks. Every proper truncation must be rejected.
+	var cut: usize = 1;
+	while (cut <= 12) : (cut += 1) {
+		const r = policy.validate(buf[0 .. full_len - cut]);
+		if (r.is_valid) {
+			std.debug.print("truncating {d} byte(s) still reported VALID\n", .{cut});
+			return error.TruncatedArchiveReportedValid;
+		}
+	}
+}

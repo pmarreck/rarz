@@ -51,24 +51,40 @@ coverage must be *precise* (never forgiving) with *actionable* error detail.
   `link_libc` defect above was the one real UB finding. Re-triage whenever new
   parallel/FFI code lands.
 
-### 3. Inbox: RAR4 payload CRC32 false positive (2026-05-03, from validate)
-- [ ] Real-world 17.5 MB RAR4 (`unrar t` = All OK) fails rarz with "payload
-  CRC32 mismatch". **This is exactly the precision/trust bug class that matters
-  for the Mecha Validate release.** Reproduce with a committed fixture first.
-  Suspects listed in the note: polynomial variant, byte range (compressed vs
-  decompressed), endianness, init/final-XOR. NOTE: the RAR5 multi-volume
-  analogue of this was already fixed (CRC lives in the LAST part) — check
-  whether RAR4 has a related "which header holds the authoritative CRC" issue.
+### 3. Inbox: payload CRC32 false positive (2026-05-03, from validate) — RESOLVED
+- [x] Already fixed. The note called it RAR4, but its own hex dump is the RAR5
+  signature (`52 61 72 21 1A 07 01 00`; RAR4 is 7 bytes ending `07 00`). The
+  fix shipped with committed fixture `rar5_decomp_regression.rar` and
+  `tests/cli/test_regression_payload_crc.sh`, which passes. Note can be
+  processed. (2026-07-29 EDT)
 
 ### 4. Mecha Validate release polish (Peter item #9) — precision + error detail
-- [ ] Audit RAR coverage for *precision over forgiveness*: no silently-skipped
-  chunks, no "valid" verdicts on unverified data. (Prior finding: a
-  `payload_end <= vol_data.len` guard silently DROPPED chunks — that class of
-  thing must fail loudly, not pass quietly.)
-- [ ] Upgrade error reporting for the `validate` consumer: structured, detailed
-  messages carrying **byte offset / block type / entry name / expected-vs-actual**,
-  not bare strings like "payload CRC32 mismatch". Design the API with validate's
-  needs in mind (coordinate via LLMsend if the shape is unclear).
+- [x] **Precision pass 1 — unverifiable payloads.** `validate_rar5_payload` had
+  two paths where "nothing to check" silently became "nothing wrong":
+  (a) an entry claiming `unpacked_size > 0` with no declared packed data size
+  skipped every check and still returned VALID — the exact shape the
+  Thread.spawn UB emitted, i.e. rarz blessed its own corrupt output while unrar
+  reported "checksum error"; (b) a payload declared past the end of the archive
+  was skipped, so a truncated file passed. Both now fail. (2026-07-29 EDT)
+- [x] **Precision pass 2 — truncation.** Cutting 40 bytes off a committed
+  fixture: rarz said VALID, unrar said "Unexpected end of archive". Whole
+  trailing blocks vanishing leaves survivors well-formed, so the iterator's
+  clean-EOF path could not tell "finished" from "data ran out". Now requires an
+  end-of-archive block. rarz agrees with the oracle. (2026-07-29 EDT)
+- [ ] **Precision pass 3 — audit the remaining silent-skip paths.** Sweep for
+  the same shape elsewhere: `catch break` / `catch continue` / `orelse continue`
+  in validation, `parse_extra_records ... catch { continue; }` (a malformed
+  extra record currently skips BLAKE2sp verification silently), and the
+  multi-volume collector's `if (payload_end <= vol_data.len)` chunk-drop guard.
+  Each is a candidate false-green. Failing test first for each.
+- [ ] **Structured error detail for the `validate` consumer.** Today
+  `error_message` is a bare static string. Validate wants location + specifics:
+  byte offset, block type, entry name, expected-vs-actual. Design note: entry
+  names and offsets can be reported WITHOUT allocation by slicing the caller's
+  input buffer + storing integer offsets, so `ValidationResult` can gain
+  optional detail fields cheaply. This changes `rarz_validation_result` in
+  `include/rarz.h`, so it is an ABI change — coordinate with validate before
+  landing (LLMsend) rather than breaking a consumer mid-release.
 
 ### 5. Inbox: streaming verification API (2026-07-10, from validate-archive-streaming)
 - [ ] `validate` wants a sibling to `policy.validate(data)` that does not

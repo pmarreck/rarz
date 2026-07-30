@@ -63,6 +63,7 @@ fn validate_rar4_structural(data: []const u8, sig_offset: usize) ValidationResul
 	var block_count: u32 = 0;
 	var file_count: u32 = 0;
 	var has_encrypted: bool = false;
+	var saw_end_of_archive: bool = false;
 
 	while (true) {
 		// Record position before parsing so we know where this block starts
@@ -127,12 +128,27 @@ fn validate_rar4_structural(data: []const u8, sig_offset: usize) ValidationResul
 				const fflags = rar4_headers.parse_file_flags(f.block.flags);
 				if (fflags.password) has_encrypted = true;
 			},
+			.end_archive => saw_end_of_archive = true,
 			else => {},
 		}
 	}
 
 	if (block_count == 0) {
 		return invalid_result(.rar15, "no blocks found");
+	}
+
+	// PRECISION: same clean-EOF blind spot the RAR5 path had. Losing whole
+	// trailing blocks leaves every surviving block well-formed, so the iterator
+	// reports a clean end and a truncated archive was reported VALID.
+	if (!saw_end_of_archive) {
+		return .{
+			.is_valid = false,
+			.family = .rar15,
+			.has_encrypted_content = has_encrypted,
+			.error_message = "archive ends without an end-of-archive block (truncated)",
+			.block_count = block_count,
+			.file_count = file_count,
+		};
 	}
 
 	return .{
@@ -1885,4 +1901,24 @@ test "validate_volumes: official rar m3 multi-volume fixture validates (spanning
 	const vols = [_][]const u8{ part1, part2 };
 	const vr = validate_volumes(&vols);
 	try testing.expect(vr.is_valid);
+}
+
+test "validate: truncated RAR4 archive must NOT be VALID" {
+	// The RAR5 path was fixed to require an end-of-archive block; RAR4 has the
+	// same clean-EOF blind spot. A truncation that removes whole trailing blocks
+	// leaves every surviving block well-formed, so the iterator reports a clean
+	// end and validation used to return VALID on a damaged archive.
+	var archive: [128]u8 = undefined;
+	var pos: usize = 0;
+	@memcpy(archive[pos..][0..7], &detect_mod.RAR15_SIG);
+	pos += 7;
+	pos += build_rar4_block(archive[pos..], 0x73, 0x0000, &.{}); // main
+	const before_end = pos;
+	pos += build_rar4_block(archive[pos..], 0x7B, 0x0000, &.{}); // end_archive
+
+	// Sanity: intact archive is valid.
+	try testing.expect(validate(archive[0..pos]).is_valid);
+
+	// The end block is gone entirely — that is a truncated archive.
+	try testing.expect(!validate(archive[0..before_end]).is_valid);
 }

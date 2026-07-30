@@ -181,20 +181,56 @@ fn validate_rar4_payload(data: []const u8, sig_offset: usize) ValidationResult {
 
 		switch (block) {
 			.file => |f| {
-				// Only verify store-method files (method == 0)
-				if (f.method == 0 and f.packed_size > 0) {
-					// The packed data follows the header
-					const header_end = f.block.header_offset + f.block.head_size;
-					const payload_start = sig_offset + header_end;
-					const payload_end = payload_start + f.packed_size;
-					if (payload_end <= data.len) {
-						const payload = data[payload_start..payload_end];
-						const computed_crc = integrity.crc32(payload);
-						if (computed_crc != f.file_crc) {
-							structural.is_valid = false;
-							structural.error_message = "payload CRC32 mismatch";
-							return structural;
-						}
+				const fflags = rar4_headers.parse_file_flags(f.block.flags);
+				// Split files: the CRC covers the whole file, not this chunk.
+				if (fflags.split_before or fflags.split_after) continue;
+				if (f.packed_size == 0) continue; // directory / empty entry
+
+				const header_end = f.block.header_offset + f.block.head_size;
+				const payload_start = sig_offset + header_end;
+				const payload_end = payload_start + f.packed_size;
+
+				// PRECISION: a payload declared past the end of the archive
+				// means the file is truncated. Skipping it reported VALID.
+				if (payload_end > data.len) {
+					structural.is_valid = false;
+					structural.error_message = "declared payload extends beyond end of archive (truncated)";
+					return structural;
+				}
+				const payload = data[payload_start..payload_end];
+
+				if (f.method == 0) {
+					// Store — CRC the raw bytes.
+					if (integrity.crc32(payload) != f.file_crc) {
+						structural.is_valid = false;
+						structural.error_message = "payload CRC32 mismatch";
+						return structural;
+					}
+				} else {
+					// Compressed — decompress, then CRC. This branch did not
+					// exist: validation only handled method == 0, so compressed
+					// RAR4 archives received NO payload verification at all and
+					// were reported VALID however damaged they were (0/6 against
+					// the unrar oracle, versus 6/6 for store-method).
+					const alloc = std.heap.page_allocator;
+					const decompressed = dispatch.decompressRar4(
+						alloc,
+						payload,
+						f.unpacked_size,
+						f.unpack_version,
+						f.method,
+						f.block.flags,
+					) catch {
+						structural.is_valid = false;
+						structural.error_message = "decompression failed during validation";
+						return structural;
+					};
+					defer alloc.free(decompressed);
+
+					if (integrity.crc32(decompressed) != f.file_crc) {
+						structural.is_valid = false;
+						structural.error_message = "payload CRC32 mismatch";
+						return structural;
 					}
 				}
 			},
@@ -1921,4 +1957,23 @@ test "validate: truncated RAR4 archive must NOT be VALID" {
 
 	// The end block is gone entirely — that is a truncated archive.
 	try testing.expect(!validate(archive[0..before_end]).is_valid);
+}
+
+test "validate: corrupted COMPRESSED RAR4 payload must be detected" {
+	// validate_rar4_payload only verified `f.method == 0` (store), so compressed
+	// RAR4 archives got ZERO payload verification and were reported VALID no
+	// matter how damaged they were: 0/6 against the unrar oracle, versus 6/6 for
+	// store-method. The v29 decoder had to be corrected first (976d34b) — wiring
+	// this up beforehand flagged the pristine fixture INVALID.
+	const pristine: []const u8 = @embedFile("rar4_m3");
+
+	// Intact archive stays VALID (unrar: All OK). Guards against "fixing" the
+	// false-green by making every compressed RAR4 fail instead.
+	try testing.expect(validate(pristine).is_valid);
+
+	const buf = try testing.allocator.alloc(u8, pristine.len);
+	defer testing.allocator.free(buf);
+	@memcpy(buf, pristine);
+	buf[pristine.len / 2] ^= 0xFF; // corrupt inside the compressed payload
+	try testing.expect(!validate(buf).is_valid);
 }

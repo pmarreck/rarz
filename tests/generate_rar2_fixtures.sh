@@ -85,7 +85,9 @@ gen() {
 	magic=$(head -c 7 "$work/$out" | od -An -tx1 | tr -d ' \n')
 	[ "$magic" = "526172211a0700" ] || die "$out is not RAR4-family (magic $magic)"
 	local dest="$FIXTURES/$out"
-	case "$out" in rar2_v20_store.rar) ;; *) mkdir -p "$FIXTURES/known_gaps"; dest="$FIXTURES/known_gaps/$out" ;; esac
+	# Only solid remains unsupported (see PLAN.md 4f); everything else is
+	# verified byte-identical to unrar and belongs in the all-valid gate.
+	case "$out" in rar2_v20_solid.rar) mkdir -p "$FIXTURES/known_gaps"; dest="$FIXTURES/known_gaps/$out" ;; esac
 	cp "$work/$out" "$dest"
 	echo "  wrote $dest ($(wc -c < "$dest") bytes)"
 }

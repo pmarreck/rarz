@@ -15,8 +15,11 @@ const MC20: u16 = 298;
 const DC20: u16 = 48;
 /// Repeat-length alphabet: 28 slots
 const RC20: u16 = 28;
-/// Code-length alphabet for reading tables: 20 symbols
-const BC20: u16 = 20;
+/// Code-length alphabet for reading tables: 19 symbols.
+/// NOT 20 — reference compress.hpp says `BC20 = 19` (v29's BC30 is 20). Reading
+/// a 20th 4-bit length consumed 4 bits too many on EVERY table read, so the
+/// bitstream was desynchronised before a single symbol was decoded.
+const BC20: u16 = 19;
 
 /// Number of audio channels (max 4, indexed 0-3)
 const MAX_AUDIO_CHANNELS: u8 = 4;
@@ -244,7 +247,12 @@ const Unpack20State = struct {
     dd: DecodeTable, // distance (48 symbols)
     rd: DecodeTable, // repeat length (28 symbols)
     md: [MAX_AUDIO_CHANNELS]DecodeTable, // per-channel audio tables
-    prev_distances: [4]u32,
+    /// Reference `OldDist` — a CIRCULAR buffer of the last four match distances,
+    /// with `old_dist_ptr` as the write cursor. v20 does NOT rotate-to-front the
+    /// way v29 does; it indexes backwards from the cursor, and EVERY match
+    /// (new, rep and short alike) pushes its distance.
+    old_dist: [4]u32,
+    old_dist_ptr: u32,
     last_distance: u32,
     last_length: u32,
     written_size: u64,
@@ -268,7 +276,8 @@ const Unpack20State = struct {
             .dd = .{},
             .rd = .{},
             .md = [_]DecodeTable{.{}} ** MAX_AUDIO_CHANNELS,
-            .prev_distances = [_]u32{ 0, 0, 0, 0 },
+            .old_dist = [_]u32{ 0, 0, 0, 0 },
+            .old_dist_ptr = 0,
             .last_distance = 0,
             .last_length = 0,
             .written_size = 0,
@@ -503,19 +512,29 @@ fn unpackLzBlock(state: *Unpack20State) !void {
                 // No previous match to repeat; treat as no-op or error.
                 continue;
             }
+            // Reference routes this through CopyString20 too, so it ALSO pushes
+            // the distance and advances the cursor. Omitting the push here left
+            // the circular buffer out of step with the encoder's, so every later
+            // rep match read a stale slot.
+            state.old_dist[state.old_dist_ptr] = state.last_distance;
+            state.old_dist_ptr = (state.old_dist_ptr +% 1) & 3;
             state.window.copyMatch(state.last_distance, state.last_length);
             state.written_size += state.last_length;
         } else if (sym >= 257 and sym <= 260) {
             // Old-distance repeat with new length
             const dist_idx: u32 = sym - 257;
 
-            // Rotate previous distances: move [dist_idx] to front
-            const dist = state.prev_distances[dist_idx];
-            var k: u32 = dist_idx;
-            while (k > 0) : (k -= 1) {
-                state.prev_distances[k] = state.prev_distances[k - 1];
-            }
-            state.prev_distances[0] = dist;
+            // Reference: OldDist[(OldDistPtr - (Number-256)) & 3], i.e. count
+            // BACK from the write cursor. dist_idx here is (sym - 257), so the
+            // reference's (Number-256) is dist_idx + 1.
+            //
+            // This used to rotate the selected distance to the front of a
+            // 4-entry array (the v29 scheme). v20 does not rotate at all — it
+            // reads out of a circular buffer and lets the subsequent match push
+            // advance the cursor. With rotation the buffer contents diverged
+            // after the first rep match, so every later rep match resolved to a
+            // stale distance (observed: 31 where the reference used 59).
+            const dist = state.old_dist[(state.old_dist_ptr -% (dist_idx + 1)) & 3];
 
             // Read new length from RD table
             var length = try decodeLength(br, &state.rd);
@@ -535,6 +554,10 @@ fn unpackLzBlock(state: *Unpack20State) !void {
                 }
             }
 
+            // A rep match pushes its distance back in as well — the reference
+            // reaches CopyString20 here exactly as the new-match path does.
+            state.old_dist[state.old_dist_ptr] = dist;
+            state.old_dist_ptr = (state.old_dist_ptr +% 1) & 3;
             state.last_distance = dist;
             state.last_length = length;
             state.window.copyMatch(dist, length);
@@ -550,10 +573,8 @@ fn unpackLzBlock(state: *Unpack20State) !void {
             if (sd_bits > 0) dist += try br.readBits(sd_bits);
 
             // Shift previous distances, put new at front
-            state.prev_distances[3] = state.prev_distances[2];
-            state.prev_distances[2] = state.prev_distances[1];
-            state.prev_distances[1] = state.prev_distances[0];
-            state.prev_distances[0] = dist;
+            state.old_dist[state.old_dist_ptr] = dist;
+            state.old_dist_ptr = (state.old_dist_ptr +% 1) & 3;
 
             state.last_distance = dist;
             state.last_length = 2;
@@ -594,10 +615,8 @@ fn unpackLzBlock(state: *Unpack20State) !void {
             }
 
             // Shift previous distances
-            state.prev_distances[3] = state.prev_distances[2];
-            state.prev_distances[2] = state.prev_distances[1];
-            state.prev_distances[1] = state.prev_distances[0];
-            state.prev_distances[0] = dist;
+            state.old_dist[state.old_dist_ptr] = dist;
+            state.old_dist_ptr = (state.old_dist_ptr +% 1) & 3;
 
             state.last_distance = dist;
             state.last_length = length;
@@ -910,4 +929,35 @@ test "unpack20: real RAR 2.90 store archive decodes byte-identically" {
     const data: []const u8 = @embedFile("rar2_v20_store");
     const result = policy.validate(data);
     try std.testing.expect(result.is_valid);
+}
+
+test "unpack20: minimal real v20 COMPRESSED archive decodes" {
+    // 61 bytes of 'a' + newline, compressed to 20 bytes by the original RAR
+    // 2.90 and verified "All OK" by unrar. Smallest reproduction of the v20
+    // compressed-decode failure; see PLAN.md 4d.
+    const rar4 = @import("../rar4_headers.zig");
+    const archive: []const u8 = @embedFile("rar2_v20_min");
+
+    var iter = rar4.BlockIterator{ .data = archive, .pos = 0 };
+    while (try iter.next()) |block| switch (block) {
+        .file => |f| {
+            if (f.method == 0) continue;
+            const start = f.block.header_offset + f.block.head_size;
+            const payload = archive[start .. start + @as(usize, @intCast(f.packed_size))];
+            const out = decompress(
+                std.testing.allocator,
+                payload,
+                f.unpacked_size,
+                16, // v20 dictionary bits
+            ) catch |err| {
+                std.debug.print("[v20] decode failed: {t} (packed={d} unpacked={d})\n", .{ err, f.packed_size, f.unpacked_size });
+                return err;
+            };
+            defer std.testing.allocator.free(out);
+            try std.testing.expectEqual(@as(usize, @intCast(f.unpacked_size)), out.len);
+            for (out[0 .. out.len - 1]) |c| try std.testing.expectEqual(@as(u8, 'a'), c);
+            try std.testing.expectEqual(@as(u8, '\n'), out[out.len - 1]);
+        },
+        else => {},
+    };
 }

@@ -111,6 +111,9 @@ pub fn build(b: *std.Build) void {
 	// RAR 2.90-produced v20 archives. RAR 2.x does NOT always write an
 	// end-of-archive block, which our truncation rule wrongly required.
 	unit_tests.root_module.addAnonymousImport("rar2_v20_store", .{ .root_source_file = b.path("tests/fixtures/rar2_v20_store.rar") });
+	// Minimal v20 COMPRESSED archive: 61 bytes of text -> 20 packed. Small
+	// enough to trace bit-by-bit against unpack20.cpp.
+	unit_tests.root_module.addAnonymousImport("rar2_v20_min", .{ .root_source_file = b.path("tests/fixtures/rar2_v20_min.rar") });
 	const run_unit_tests = b.addRunArtifact(unit_tests);
 	const test_step = b.step("test", "Run unit tests");
 	test_step.dependOn(&run_unit_tests.step);

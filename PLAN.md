@@ -147,7 +147,7 @@ Work items, in order:
   (`02a4f4a`); a real third-party RAR4 now extracts with a tree and contents
   byte-identical to unrar.
 
-### 4d. 🔴 RAR 2.x (v20) decoder is broken on real archives — NEW, 2026-07-30
+### 4d. ✅ RAR 2.x (v20) decoder — FIXED 2026-07-30
 
 First-ever differential test of `unpack20` against real archives. Corpus built
 with the ORIGINAL RAR 2.90 (2001) under wine — modern rar always emits v29, so
@@ -175,10 +175,21 @@ never once decoded a real archive, so the tests agreed with the decoder.
   payload-past-EOF and block-parse checks (verified: cutting a v20 fixture short
   still reports INVALID, matching unrar). The synthetic test that encoded the
   over-strict rule was replaced with one that truncates a real archive.
-- [ ] **Fix `unpack20` against the corpus**, same method that fixed unpack29:
-  shrink to the smallest failing archive, diff against `unpack20.cpp`, one
-  divergence at a time. Expect table/base-constant errors of the same family.
-- [ ] The five compressed v20 fixtures live in `tests/fixtures/known_gaps/` so
+- [x] **`unpack20` fixed.** All six non-solid v20 archives now extract
+  byte-identical to unrar (0 missing, 0 wrong) and validate VALID. Five
+  defects, found by diffing against an instrumented build of the reference
+  decoder rather than by reading code: (1) `BC20` was 20, but the format
+  says **19** — a 20th 4-bit length was read on EVERY table load, costing
+  4 bits and desynchronising the stream before a single symbol decoded;
+  (2) all decode tables were derived, and wrong (pairs vs fours, short
+  distances {0,1,2,3,4,8,16,32}, distances by formula where the real
+  DBits saturates at 16); (3) both distance-dependent length bonuses
+  missing, including v20's own three-tier rep cascade; (4) readTables
+  consumed one flag bit instead of two and ignored the keep-old-table
+  flag, so the 4-bit delta had no base; (5) old distances used v29's
+  rotate-to-front instead of v20's CIRCULAR buffer, and two of the four
+  match paths never pushed at all, so the cursor drifted out of step.
+  Fixtures promoted out of known_gaps/ into the all-valid Interop Gate.
   Interop Gate A (which treats `tests/fixtures/` as "must be VALID") stays
   green. **Move them up into `tests/fixtures/` the moment the decoder works** —
   that is the acceptance test.

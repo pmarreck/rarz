@@ -200,6 +200,34 @@ never once decoded a real archive, so the tests agreed with the decoder.
 than a false verdict in either direction — that is what makes an incomplete 1.0
 honest rather than untrustworthy.
 
+### 4f. Solid archives — unsupported, separate from the v20 decoder work
+
+Distinct defect, found 2026-07-30 while measuring v20. In a **solid** archive
+every file is compressed as one continuous stream: the LZ window and the Huffman
+tables carry over from one file to the next. rarz decodes each file
+independently, so a solid archive fails wholesale.
+
+Evidence — `rar2_v20_solid.rar` vs the same content non-solid:
+
+| file | in `rar2_v20_m3` | in `rar2_v20_solid` |
+|---|---|---|
+| `noise.bin` (stored) | ok | **fails** |
+| `sub/nested.txt` (stored) | ok | **fails** |
+| everything else | fails/wrong | fails |
+
+Files that decode fine when non-solid fail when solid, which is the signature:
+it is not the v20 decoder, it is the missing cross-file continuation.
+
+- [ ] Decide 1.0 scope. Solid is common in the wild (it is how multi-file RAR
+  archives are usually built for ratio), so "unsupported" is a real coverage
+  hole — but it needs the decoder to carry window + table state across entries,
+  which touches the extraction API, not just one decoder.
+- [ ] Until implemented, solid entries must report **could-not-verify**, never a
+  false verdict. Check that a solid archive does not currently produce a
+  confident wrong answer anywhere.
+- [ ] Applies to RAR5 solid as well — verify whether the RAR5 path has the same
+  hole (untested).
+
 #### POST-1.0: older-format enhancement track
 - [ ] **v15 (RAR 1.5).** No corpus and no coverage today. RARLAB no longer hosts
   a 1.5-era binary (`rar15.exe`, `rar200.exe` -> 404). `rar250.exe` (RAR 2.50,

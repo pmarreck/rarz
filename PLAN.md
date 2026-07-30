@@ -166,14 +166,30 @@ structured-result design pending with validate: three distinct outcomes
   recognition: delta, E8/E9, RGB, audio, x86 itanium).
 - [ ] Until then, report filter-limited entries as unverified rather than
   invalid, once the result API supports it.
-- [ ] **Structured error detail for the `validate` consumer.** Today
-  `error_message` is a bare static string. Validate wants location + specifics:
-  byte offset, block type, entry name, expected-vs-actual. Design note: entry
-  names and offsets can be reported WITHOUT allocation by slicing the caller's
-  input buffer + storing integer offsets, so `ValidationResult` can gain
-  optional detail fields cheaply. This changes `rarz_validation_result` in
-  `include/rarz.h`, so it is an ABI change — coordinate with validate before
-  landing (LLMsend) rather than breaking a consumer mid-release.
+- [ ] **Structured error detail for the `validate` consumer.** ANSWERED by
+  validate 2026-07-30 — design is unblocked, just needs implementing:
+  - **No ABI constraint from validate.** It does NOT consume the C FFI; it
+    imports the Zig module directly and reads `result.is_valid` /
+    `result.error_message` by name, recompiling on each pin bump. So the Zig
+    `ValidationResult` can be reshaped freely. Append-at-end in
+    `include/rarz.h` is still the courteous choice for our own C CLI and any
+    other C consumers, but that is our call alone.
+  - **Keep the borrowed `error_entry_name` + `_len`** (not NUL-terminated).
+    validate formats its verdict synchronously while the archive buffer is
+    still mapped, then copies — so a slice into the caller's buffer is free.
+  - **`error_code` is the stable contract**; `error_message` stays free-form
+    English fallback. validate has a 50-locale i18n system and switches on the
+    code. Proposed enum accepted (NO_SIGNATURE / BLOCK_PARSE / HEADER_CRC /
+    PAYLOAD_CRC32 / PAYLOAD_BLAKE2SP / TRUNCATED / UNVERIFIABLE_PAYLOAD /
+    DECOMPRESS_FAILED / ENCRYPTED / UNSUPPORTED), plus `error_offset` and
+    `expected`/`actual` scalars.
+  - Add a **could-not-verify** outcome alongside valid/invalid (see 4c) — the
+    VM-filter case proves a boolean verdict is wrong.
+  - Ping validate with the SHA when it lands; they bump the pin and reconcile
+    fixtures (they expect previously-VALID-but-damaged archives to start
+    failing, and will reclassify them as labeled-corrupt controls).
+  - Streaming verification (2026-07-10) is explicitly LOWER priority than this
+    for the current release — first release is media/photo/RAW focused.
 
 ### 5. Inbox: streaming verification API (2026-07-10, from validate-archive-streaming)
 - [ ] `validate` wants a sibling to `policy.validate(data)` that does not

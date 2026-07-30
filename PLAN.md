@@ -110,18 +110,45 @@ written against the same understanding that produced the decoders (no
 independent oracle), so they cannot catch a misread field layout.
 
 Work items, in order:
-- [ ] Build a RAR4 corpus with an external oracle. `rar` 7.20 cannot create
-  RAR4 (`-ma4` gone), so source real archives (4 exist on this machine) and/or
-  find an older `rar`. Ask Peter before committing a downloaded third-party
-  archive as a fixture (provenance/licensing); a hand-built minimal RAR4 writer
-  is the license-clean alternative.
-- [ ] Fix the RAR4 file-header field parsing (name, unpacked size, mtime),
-  differential-tested against `unrar l` output.
-- [ ] Wire compressed RAR4 payload verification (decompress + CRC), mirroring
-  the RAR5 path — only after the corpus exists, so false positives are
-  detectable before they reach users.
-- [ ] Add a mutation gate: for each corpus archive, corrupting a payload byte
-  must flip rarz to INVALID (this is the check that just scored 0/5).
+- [x] **RAR4 corpus built** (`tests/generate_rar4_fixtures.sh`). Peter's idea
+  resolved the provenance problem cleanly: drive the *official* rar to produce
+  the archives, but fill them with our OWN deterministic content — real
+  producer, no third-party payload. RAR 7.x dropped `-ma4`, so the generator
+  reaches back to nixpkgs `nixos-23.11` (rar 6.21) as a one-time offline step;
+  the fixtures are committed so neither the suite nor CI depends on it.
+  Payloads use `random --seed` at three entropy levels, incl. a
+  `--normalized` one that is *partially* compressible. (2026-07-30 EDT)
+- [x] **RAR4 header parsing fixed** (`06b6e86`): ADD_SIZE was double-read
+  (ADD_SIZE *is* PACK_SIZE for file blocks) shifting every field by 4 bytes, and
+  `header_offset` was always 0 (recorded relative to the block, used as an
+  archive offset). Now matches `unrar l` exactly on names/sizes/dates/CRCs;
+  extraction of the store fixture is byte-identical to unrar; store-method
+  corruption detection went 0/5 → 5/5. (2026-07-30 EDT)
+- [ ] 🔴 **RAR4 v29 decoder is broken on real archives — silent data
+  corruption.** Attempted to wire compressed-RAR4 payload verification; it
+  flagged the *pristine* official fixture INVALID ("decompression failed"), so
+  the wiring was reverted rather than ship false positives on every compressed
+  RAR4. Root cause is the decoder itself. Evidence from `rarz x` on
+  `rar4_m3.rar` vs unrar:
+  | payload | entropy | result |
+  |---|---|---|
+  | `text.txt` | highly compressible | decompression FAILED |
+  | `mixed.bin` | partially compressible | **silently DIFFERS from unrar** |
+  | `noise.bin` | incompressible (stored) | identical |
+  The middle case is the worst: rarz hands back **wrong file contents with no
+  error**. Note this is only visible because the corpus spans entropy levels —
+  testing only "runs of one character" or pure noise would have missed it.
+  The 49 unit tests in unpack29/20/15 pass, so they are not exercising real
+  official-encoder output (same producer==checker weakness as the synthetic
+  header fixtures). Fix the decoder against the corpus, THEN re-wire
+  verification and add the mutation gate.
+- [ ] Add a mutation gate once the decoder is fixed: for each corpus archive,
+  corrupting a payload byte must flip rarz to INVALID. Currently 6/12
+  (store-method 6/6, compressed 0/6).
+- [ ] Until then compressed RAR4 remains a known false-green (reported VALID,
+  unverified). The honest fix is an "unverified" state rather than a VALID/
+  INVALID binary — which is exactly what the structured-error ABI question to
+  validate is about.
 - [ ] **Structured error detail for the `validate` consumer.** Today
   `error_message` is a bare static string. Validate wants location + specifics:
   byte offset, block type, entry name, expected-vs-actual. Design note: entry

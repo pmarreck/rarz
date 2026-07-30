@@ -240,8 +240,92 @@ pub fn applyFilter(
             }
             return true;
         },
-        // Not implemented yet: itanium, rgb. Returning false keeps their data
-        // flagged unverifiable rather than silently unfiltered.
+        .rgb => {
+            // Bitmap predictor: three interleaved colour channels, each
+            // predicted from the pixel to the left, the pixel above, and the
+            // pixel above-left, choosing whichever the Paeth-style comparison
+            // favours. Afterwards the red and blue channels have green added
+            // back (they were stored as differences from it).
+            const width_reg = init_r[0];
+            if (width_reg < 3) return false;
+            const width: usize = width_reg - 3;
+            const pos_r: usize = init_r[1];
+            if (data_size < 3 or width > data_size or pos_r > 2) return false;
+
+            @memcpy(scratch[0..data_size], data);
+            var src_pos: usize = 0;
+            const rgb_channels: usize = 3;
+            var cur_channel: usize = 0;
+            while (cur_channel < rgb_channels) : (cur_channel += 1) {
+                var prev_byte: u32 = 0;
+                var i: usize = cur_channel;
+                while (i < data_size) : (i += rgb_channels) {
+                    var predicted: u32 = undefined;
+                    if (i >= width + 3) {
+                        const upper_byte: u32 = data[i - width];
+                        const upper_left_byte: u32 = data[i - width - 3];
+                        predicted = prev_byte +% upper_byte -% upper_left_byte;
+                        const pa = absDiff(predicted, prev_byte);
+                        const pb = absDiff(predicted, upper_byte);
+                        const pc = absDiff(predicted, upper_left_byte);
+                        if (pa <= pb and pa <= pc) {
+                            predicted = prev_byte;
+                        } else if (pb <= pc) {
+                            predicted = upper_byte;
+                        } else {
+                            predicted = upper_left_byte;
+                        }
+                    } else {
+                        predicted = prev_byte;
+                    }
+                    const v: u8 = @truncate((predicted -% scratch[src_pos]) & 0xff);
+                    src_pos += 1;
+                    data[i] = v;
+                    prev_byte = v;
+                }
+            }
+            // Re-add green to red and blue.
+            if (data_size >= 2) {
+                var i: usize = pos_r;
+                const border = data_size - 2;
+                while (i < border) : (i += 3) {
+                    const g = data[i + 1];
+                    data[i] = data[i] +% g;
+                    data[i + 2] = data[i + 2] +% g;
+                }
+            }
+            return true;
+        },
+        .itanium => {
+            // IA-64 instruction bundles are 16 bytes holding three 41-bit slots
+            // plus a 5-bit template. For slots whose opcode is a branch (op
+            // type 5), the 20-bit target was converted to absolute; convert it
+            // back. Operates in place.
+            if (data_size < 21) return false;
+            var file_offset: u32 = init_r[6] >> 4;
+
+            const masks = [16]u8{ 4, 4, 6, 6, 0, 0, 7, 7, 4, 4, 0, 0, 4, 4, 0, 0 };
+            var cur_pos: usize = 0;
+            while (cur_pos < data_size - 21) : ({
+                cur_pos += 16;
+                file_offset +%= 1;
+            }) {
+                const block = data[cur_pos..];
+                const template: i32 = @as(i32, block[0] & 0x1f) - 0x10;
+                if (template < 0) continue;
+                const cmd_mask = masks[@as(usize, @intCast(template))];
+                if (cmd_mask == 0) continue;
+                for (0..3) |i| {
+                    if (cmd_mask & (@as(u8, 1) << @intCast(i)) == 0) continue;
+                    const start_pos: usize = i * 41 + 5;
+                    const op_type = itaniumGetBits(block, start_pos + 37, 4);
+                    if (op_type != 5) continue;
+                    const offset = itaniumGetBits(block, start_pos + 13, 20);
+                    itaniumSetBits(block, (offset -% file_offset) & 0xfffff, start_pos + 13, 20);
+                }
+            }
+            return true;
+        },
         else => return false,
     }
 }
@@ -252,6 +336,43 @@ const E8_FILE_SIZE: u32 = 0x1000000;
 /// Reference cap on delta channels (`MAX3_UNPACK_CHANNELS`).
 const MAX_CHANNELS: usize = 1024;
 
+
+/// |a - b| on the wrapped 32-bit values the RGB predictor compares, matching
+/// the reference's `abs((int)(Predicted - X))`.
+fn absDiff(a: u32, b: u32) u32 {
+    const d: i32 = @bitCast(a -% b);
+    return @abs(d);
+}
+
+/// Read `bit_count` bits at `bit_pos` from an IA-64 bundle (reference
+/// `FilterItanium_GetBits`): a little-endian 32-bit window shifted into place.
+fn itaniumGetBits(data: []const u8, bit_pos: usize, bit_count: u5) u32 {
+    const in_addr = bit_pos / 8;
+    const in_bit: u5 = @intCast(bit_pos & 7);
+    var bit_field: u32 = data[in_addr];
+    bit_field |= @as(u32, data[in_addr + 1]) << 8;
+    bit_field |= @as(u32, data[in_addr + 2]) << 16;
+    bit_field |= @as(u32, data[in_addr + 3]) << 24;
+    bit_field >>= in_bit;
+    if (bit_count >= 32) return bit_field;
+    return bit_field & ((@as(u32, 1) << bit_count) - 1);
+}
+
+/// Write `bit_count` bits at `bit_pos` (reference `FilterItanium_SetBits`).
+fn itaniumSetBits(data: []u8, value: u32, bit_pos: usize, bit_count: u5) void {
+    const in_addr = bit_pos / 8;
+    const in_bit: u5 = @intCast(bit_pos & 7);
+    var and_mask: u32 = if (bit_count >= 32) 0xffffffff else (@as(u32, 1) << bit_count) - 1;
+    and_mask = ~(and_mask << in_bit);
+    var bit_field: u32 = value << in_bit;
+
+    for (0..4) |i| {
+        data[in_addr + i] &= @truncate(and_mask);
+        data[in_addr + i] |= @truncate(bit_field);
+        and_mask = (and_mask >> 8) | 0xff000000;
+        bit_field >>= 8;
+    }
+}
 // ============================================================================
 // Tests
 // ============================================================================

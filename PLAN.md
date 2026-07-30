@@ -182,10 +182,35 @@ never once decoded a real archive, so the tests agreed with the decoder.
   Interop Gate A (which treats `tests/fixtures/` as "must be VALID") stays
   green. **Move them up into `tests/fixtures/` the moment the decoder works** —
   that is the acceptance test.
-- [ ] **v15 (RAR 1.5) has NO corpus and NO coverage at all.** RARLAB no longer
-  hosts a RAR 1.5 binary (`rar15.exe`, `rar200.exe` -> 404); `rar250.exe` (DOS,
-  16-bit) exists but needs dosbox, which is not installed. Decide whether v15 is
-  worth supporting or should be explicitly declared unsupported.
+### 4e. Format coverage — the 1.0 line (Peter, 2026-07-30)
+
+1.0 does not have to cover everything. The boundary:
+
+| Format | Decoder | Corpus | 1.0? |
+|---|---|---|---|
+| RAR5 (v50) | ✅ verified | ✅ | **in** |
+| RAR4 v29 + filters (delta/audio/e8) | ✅ verified byte-identical | ✅ | **in** |
+| RAR4 v29 filters: itanium, rgb | ❌ unimplemented | — | **in** (small, same file) |
+| RAR2 v20 | ❌ broken on real data | ✅ 6 archives | **in — last item** |
+| RAR1.5 v15 | ❌ untested | ❌ none obtainable | **POST-1.0** |
+| Encryption (RAR4/RAR5) | detection only | — | POST-1.0 |
+| RAR2 v26 (multimedia) | untested | partial (`-mm` fixture is v20) | POST-1.0 |
+
+**Stop after v20.** Anything not decodable must report *could-not-verify* rather
+than a false verdict in either direction — that is what makes an incomplete 1.0
+honest rather than untrustworthy.
+
+#### POST-1.0: older-format enhancement track
+- [ ] **v15 (RAR 1.5).** No corpus and no coverage today. RARLAB no longer hosts
+  a 1.5-era binary (`rar15.exe`, `rar200.exe` -> 404). `rar250.exe` (RAR 2.50,
+  DOS) is still hosted and *might* emit v15 for some inputs, but it is a 16-bit
+  DOS binary needing dosbox (not installed; wine cannot run 16-bit on x86-64).
+  Other routes: an old Linux `rar` build, or sourcing genuine v15 archives from
+  the wild and using them read-only as an oracle corpus. Until then v15 must
+  report could-not-verify, never a guess.
+- [ ] **v26 multimedia compression.** RAR 2.9's `-mm` produced v20 in our
+  fixture; genuine v26 streams need a different producer/input to trigger.
+- [ ] **Encryption** (AES + PBKDF2, `--password`) — already sketched in Phase 3.
 
 ### 4c. Remaining RAR4 gap: RarVM filter subsystem — RESOLVED for delta/audio/e8
 

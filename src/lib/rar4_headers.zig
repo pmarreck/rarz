@@ -154,7 +154,18 @@ pub fn parse_file_flags(raw: u16) FileFlags {
 /// The reader should be positioned right after the base header (and data_size
 /// if LONG_BLOCK was set). The block parameter is the already-parsed base header.
 pub fn parse_file_header(r: *Reader, block: BlockHeader) ParseError!FileHeader {
-	const packed_size_low: u32 = r.read_u32_le() catch return error.EndOfData;
+	// In RAR4 a file block's ADD_SIZE field IS PACK_SIZE — it is not a separate
+	// field that follows it. parse_block_header already consumed ADD_SIZE when
+	// LONG_BLOCK was set (which file blocks always set), so reading another u32
+	// here shifted EVERY subsequent field by 4 bytes: unpacked_size picked up
+	// host_os+CRC bytes (~2^32 garbage), the CRC came from the mtime slot (so
+	// every entry reported the same value), name_size was wrong (empty names)
+	// and mtime decoded to month 00. Take the packed size from the base header
+	// when it is there, and only read a field when it is not.
+	const packed_size_low: u32 = if (block.data_size) |ds|
+		@truncate(ds)
+	else
+		r.read_u32_le() catch return error.EndOfData;
 	const unpacked_size_low: u32 = r.read_u32_le() catch return error.EndOfData;
 	const host_os = r.read_u8() catch return error.EndOfData;
 	const file_crc = r.read_u32_le() catch return error.EndOfData;
@@ -231,7 +242,15 @@ pub const BlockIterator = struct {
 		if (self.data.len - self.pos < 7) return null;
 
 		var r = Reader.init(self.data[self.pos..]);
-		const block = try parse_block_header(&r);
+		var block = try parse_block_header(&r);
+		// parse_block_header records r.position(), and this Reader starts AT the
+		// block, so that offset is always 0 — it is relative to the block, not to
+		// the archive. Every consumer treats header_offset as an archive offset:
+		// payload_start = header_offset + head_size located payloads as though
+		// every block began at 0 (extraction returned right-sized, wrong-content
+		// files), and validate_header_crc checksummed the first block's bytes for
+		// every block. Rebase it onto the archive here.
+		block.header_offset += self.pos;
 
 		const result: ArchiveBlock = switch (block.header_type) {
 			.mark => .{ .mark = block },
@@ -385,16 +404,23 @@ test "parse_file_flags extracts bits correctly" {
 
 test "parse_file_header reads all fields" {
 	// Build a complete file header (without LHD_LARGE) after the base block.
-	// File-specific fields: packed_size_low(4) + unpacked_size_low(4) + host_os(1)
-	//   + file_crc(4) + mtime(4) + unpack_version(1) + method(1) + name_size(2)
+	// NOTE: the packed size is NOT one of these fields. For a RAR4 file block
+	// the base header's ADD_SIZE field IS PACK_SIZE, and parse_block_header
+	// consumes it (LONG_BLOCK is set below), so it arrives via block.data_size.
+	// This fixture used to write a packed_size here as well, double-counting it
+	// — which is precisely the layout error the parser had, so the fixture
+	// agreed with the bug and could never catch it. The official-tool fixture
+	// in `parse_file_header: real RAR4 fixture matches unrar ground truth` is
+	// the arbiter for this layout.
+	// File-specific fields: unpacked_size_low(4) + host_os(1) + file_crc(4)
+	//   + mtime(4) + unpack_version(1) + method(1) + name_size(2)
 	//   + attributes(4) + filename
-	// Total file-specific = 25 + name_size bytes
+	// Total file-specific = 21 + name_size bytes
 	const filename = "test.txt";
-	const file_fields_len = 25 + filename.len;
+	const file_fields_len = 21 + filename.len;
 	var data: [file_fields_len]u8 = undefined;
 
 	var off: usize = 0;
-	write_u32_le(&data, off, 1024); off += 4; // packed_size_low
 	write_u32_le(&data, off, 2048); off += 4; // unpacked_size_low
 	data[off] = 0x03; off += 1; // host_os (Unix)
 	write_u32_le(&data, off, 0xDEADBEEF); off += 4; // file_crc
@@ -645,7 +671,7 @@ test "block iterator advances correctly for >4GB file (large flag)" {
 	const flags: u16 = LONG_BLOCK | LHD_LARGE; // 0x8100
 	const base_header_size: u16 = 7;
 	const data_size_field: usize = 4; // LONG_BLOCK adds 4 bytes to base
-	const file_fields: usize = 25; // standard file-specific fields
+	const file_fields: usize = 21; // standard file-specific fields (packed size arrives via ADD_SIZE)
 	const large_ext: usize = 8; // packed_high + unpacked_high
 	const head_size: u16 = base_header_size + @as(u16, @intCast(data_size_field)) + @as(u16, @intCast(file_fields)) + @as(u16, @intCast(large_ext)) + @as(u16, @intCast(filename.len));
 
@@ -662,8 +688,11 @@ test "block iterator advances correctly for >4GB file (large flag)" {
 	const packed_size_low: u32 = 0x0000_0100;
 	write_u32_le(&data, off, packed_size_low); off += 4;
 
-	// File-specific fields
-	write_u32_le(&data, off, packed_size_low); off += 4; // packed_size_low (same as data_size)
+	// File-specific fields.
+	// NOTE: no packed_size_low here — as the comment above says, ADD_SIZE (the
+	// LONG_BLOCK field just written) IS the low 32 bits of the packed size.
+	// This fixture used to write it a second time, double-counting it and
+	// encoding the very field-offset bug the parser had.
 	write_u32_le(&data, off, 0x0000_0200); off += 4; // unpacked_size_low
 	data[off] = 0x00; off += 1; // host_os
 	write_u32_le(&data, off, 0x12345678); off += 4; // file_crc
@@ -738,3 +767,48 @@ test "method normalization subtracts 0x30" {
 	const fh2 = try parse_file_header(&r2, block);
 	try testing.expectEqual(@as(u8, 3), fh2.method); // 0x33 - 0x30 = 3
 }
+
+test "parse_file_header: real RAR4 fixture matches unrar ground truth" {
+	// Differential against an INDEPENDENT producer (official rar 6.21) and an
+	// independent reader (unrar 7.20). `unrar l tests/fixtures/rar4_store.rar`
+	// reports exactly:
+	//     text.txt   6972
+	//     noise.bin  4096
+	//     mixed.bin  6144
+	// rarz reported garbage for all three (empty names, ~2^32 unpacked sizes,
+	// month-00 dates, and the SAME CRC for every entry) while still calling the
+	// archive VALID. Root cause: in RAR4 a file block's ADD_SIZE field IS
+	// PACK_SIZE. parse_block_header already consumes it for LONG_BLOCK, and
+	// parse_file_header then read a packed size again, shifting every following
+	// field by 4 bytes.
+	const data: []const u8 = @embedFile("rar4_store");
+	const Expected = struct { name: []const u8, size: u64 };
+	const expected = [_]Expected{
+		.{ .name = "text.txt", .size = 6972 },
+		.{ .name = "noise.bin", .size = 4096 },
+		.{ .name = "mixed.bin", .size = 6144 },
+	};
+
+	// RAR4 blocks start at the 7-byte signature.
+	var iter = BlockIterator{ .data = data, .pos = 0 };
+	var seen: usize = 0;
+	var crcs: [3]u32 = .{ 0, 0, 0 };
+	while (try iter.next()) |block| {
+		switch (block) {
+			.file => |f| {
+				if (seen >= expected.len) break;
+				try testing.expectEqualStrings(expected[seen].name, f.file_name);
+				try testing.expectEqual(expected[seen].size, f.unpacked_size);
+				crcs[seen] = f.file_crc;
+				seen += 1;
+			},
+			else => {},
+		}
+	}
+	try testing.expectEqual(@as(usize, 3), seen);
+	// Three different payloads cannot share one CRC32; identical values were the
+	// tell that the CRC field was being read from the wrong offset.
+	try testing.expect(crcs[0] != crcs[1]);
+	try testing.expect(crcs[1] != crcs[2]);
+}
+

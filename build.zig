@@ -98,6 +98,12 @@ pub fn build(b: *std.Build) void {
 	// regression test (paths outside src/lib/ cannot be @embedFile-d directly).
 	unit_tests.root_module.addAnonymousImport("rar5_vol_m3_part01", .{ .root_source_file = b.path("tests/fixtures/rar5_vol_m3.part01.rar") });
 	unit_tests.root_module.addAnonymousImport("rar5_vol_m3_part02", .{ .root_source_file = b.path("tests/fixtures/rar5_vol_m3.part02.rar") });
+	// RAR4 corpus, produced by the official rar 6.21 (see
+	// tests/generate_rar4_fixtures.sh). An independent producer is the whole
+	// point: fixtures built from our own understanding of the RAR4 layout would
+	// have encoded the same field-offset bug they exist to catch.
+	unit_tests.root_module.addAnonymousImport("rar4_store", .{ .root_source_file = b.path("tests/fixtures/rar4_store.rar") });
+	unit_tests.root_module.addAnonymousImport("rar4_m3", .{ .root_source_file = b.path("tests/fixtures/rar4_m3.rar") });
 	const run_unit_tests = b.addRunArtifact(unit_tests);
 	const test_step = b.step("test", "Run unit tests");
 	test_step.dependOn(&run_unit_tests.step);

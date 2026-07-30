@@ -71,12 +71,57 @@ coverage must be *precise* (never forgiving) with *actionable* error detail.
   trailing blocks vanishing leaves survivors well-formed, so the iterator's
   clean-EOF path could not tell "finished" from "data ran out". Now requires an
   end-of-archive block. rarz agrees with the oracle. (2026-07-29 EDT)
-- [ ] **Precision pass 3 — audit the remaining silent-skip paths.** Sweep for
-  the same shape elsewhere: `catch break` / `catch continue` / `orelse continue`
-  in validation, `parse_extra_records ... catch { continue; }` (a malformed
-  extra record currently skips BLAKE2sp verification silently), and the
-  multi-volume collector's `if (payload_end <= vol_data.len)` chunk-drop guard.
-  Each is a candidate false-green. Failing test first for each.
+- [x] **Precision pass 3a — RAR4 truncation.** Same clean-EOF blind spot as
+  RAR5; fixed in `00be71e`. Found by noticing a 30-truncation differential
+  sweep was *vacuous for RAR4* — every fixture is RAR5. (2026-07-29 EDT)
+- [ ] **Precision pass 3b — remaining silent-skip paths.** Still to sweep:
+  `parse_extra_records ... catch { continue; }` (malformed extra record silently
+  skips BLAKE2sp verification), the multi-volume collector's
+  `if (payload_end <= vol_data.len)` chunk-drop guard, and the second-walk
+  `iter.next() catch break` in `validate_rar5_payload` / `validate_rar4_payload`.
+  Failing test first for each.
+
+### 4b. 🔴 RELEASE BLOCKER — RAR4 support is materially broken (found 2026-07-30)
+
+Evidence, against a real 12 KB RAR4 (`unrar l` = RAR 1.5, 3 entries), plus a
+29 MB one; both `unrar t` = All OK:
+
+- **0% corruption detection.** Flipped one byte at 5 offsets in the payload
+  region: `unrar t` reported an error on all 5; **rarz reported VALID on all 5.**
+  For an integrity tool this is the worst possible failure direction, on a
+  format that is everywhere in the wild.
+- **The parser produces garbage metadata** yet still says VALID:
+  | unrar (truth) | rarz |
+  |---|---|
+  | `Data/ACES - Casino Data Extension.esm`, 72179 B | empty name, unpacked `2611447042` |
+  | `Data/ACES - Readme.txt`, 20354 B | empty name, unpacked `4294739714` (≈2^32, smells like u32 underflow) |
+  | dates 2008 / 2011 | `1980-00-04` (month 00 — invalid) |
+  Packed sizes DO match, so block walking is roughly right; the file-header
+  field layout (name, unpacked size, mtime) is being misread.
+- **Root cause of the missed corruption:** `validate_rar4_payload` only verifies
+  `f.method == 0` (store). Compressed RAR4 payloads are never checked at all —
+  even though `unpack29/20/15` are real implementations (933/1160/821 lines,
+  49 unit tests), so the decoders exist and are simply not wired into
+  validation.
+
+Why it went unnoticed: **there is not one RAR4 fixture in the corpus** — all 13
+are RAR5 — and no CLI test touches RAR4. The decoders' 49 unit tests were
+written against the same understanding that produced the decoders (no
+independent oracle), so they cannot catch a misread field layout.
+
+Work items, in order:
+- [ ] Build a RAR4 corpus with an external oracle. `rar` 7.20 cannot create
+  RAR4 (`-ma4` gone), so source real archives (4 exist on this machine) and/or
+  find an older `rar`. Ask Peter before committing a downloaded third-party
+  archive as a fixture (provenance/licensing); a hand-built minimal RAR4 writer
+  is the license-clean alternative.
+- [ ] Fix the RAR4 file-header field parsing (name, unpacked size, mtime),
+  differential-tested against `unrar l` output.
+- [ ] Wire compressed RAR4 payload verification (decompress + CRC), mirroring
+  the RAR5 path — only after the corpus exists, so false positives are
+  detectable before they reach users.
+- [ ] Add a mutation gate: for each corpus archive, corrupting a payload byte
+  must flip rarz to INVALID (this is the check that just scored 0/5).
 - [ ] **Structured error detail for the `validate` consumer.** Today
   `error_message` is a bare static string. Validate wants location + specifics:
   byte offset, block type, entry name, expected-vs-actual. Design note: entry

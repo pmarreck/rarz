@@ -21,61 +21,58 @@ const BC: usize = 20; // Code-length alphabet (used for reading tables)
 
 const TOTAL_CODE_LENGTHS: usize = MC + DC + LDC + RC;
 
-/// Short distances for symbols 263..270 (2-byte short matches)
-const SHORT_DISTANCES = [8]u32{ 0, 1, 2, 3, 4, 5, 6, 7 };
+/// Base distances for the 2-byte short-match symbols 263..270.
+/// Reference (unrar unpack30.cpp):
+///     SDDecode[] = {0,4,8,16,32,64,128,192}
+///     SDBits[]   = {2,2,3, 4, 5, 6,  6,  6}
+///     Distance = SDDecode[n] + 1 + (extra bits per SDBits[n])
+///
+/// This was previously {0,1,2,3,4,5,6,7} with NO extra bits read at all, so
+/// every short match copied from the wrong offset AND left the bitstream
+/// desynchronised. Symptom: output with the right overall structure but
+/// 2-byte fragments spliced in from the wrong places.
+const SHORT_DISTANCES = [8]u32{ 0, 4, 8, 16, 32, 64, 128, 192 };
+
+/// Extra distance bits for symbols 263..270 (reference `SDBits`).
+const SHORT_DISTANCE_BITS = [8]u5{ 2, 2, 3, 4, 5, 6, 6, 6 };
 
 // ============================================================================
 // Length Decoding Tables
 // ============================================================================
 
-/// Length base values for RC table slots.
-/// Slot 0..7: length = slot + 2 (no extra bits)
-/// Slot 8+: exponentially increasing with extra bits
-const LENGTH_BASES = blk: {
-    var bases: [RC]u32 = undefined;
-    // Slots 0-7: base = slot + 2
-    for (0..8) |i| {
-        bases[i] = @intCast(i + 2);
-    }
-    // Slots 8+: increasing with extra bits
-    // Pattern: pairs of slots share the same number of extra bits
-    // extra_bits = (slot - 8) / 2 + 1
-    // base values grow accordingly
-    var base: u32 = 10;
-    var i: usize = 8;
-    var extra: u5 = 1;
-    while (i < RC) {
-        bases[i] = base;
-        base += @as(u32, 1) << extra;
-        i += 1;
-        if (i < RC) {
-            bases[i] = base;
-            base += @as(u32, 1) << extra;
-            i += 1;
-        }
-        extra += 1;
-    }
-    break :blk bases;
+/// The reference `LDecode` table, RAW — no constant folded in.
+///
+/// The same table is used with TWO different bases depending on the path, so
+/// folding one in is wrong for the other (unrar unpack30.cpp):
+///     new match (symbol >= 271):        Length = LDecode[n] + 3 + extra
+///     rep-distance match (259..262):    Length = LDecode[n] + 2 + extra
+/// Callers add their own constant; see LENGTH_MATCH_BASE / LENGTH_REP_BASE.
+///
+/// Written out literally rather than derived. The previous derivation grouped
+/// slots into PAIRS sharing an extra-bit width, but the real table groups them
+/// in FOURS (see LENGTH_EXTRA_BITS), so bases diverged from slot 11 onward
+/// (16 vs 18, worsening after) and long matches decoded too long — a 101-byte
+/// run of 'a' emitted 101 'a' and dropped the trailing newline.
+const LENGTH_BASES = [RC]u32{
+    0,   1,   2,   3,   4,   5,   6,   7,
+    8,   10,  12,  14,  16,  20,  24,  28,
+    32,  40,  48,  56,  64,  80,  96,  112,
+    128, 160, 192, 224,
 };
 
-/// Extra bits for RC table length slots.
-const LENGTH_EXTRA_BITS = blk: {
-    var bits: [RC]u5 = undefined;
-    for (0..8) |i| {
-        bits[i] = 0;
-    }
-    var i: usize = 8;
-    var extra: u5 = 1;
-    while (i < RC) {
-        bits[i] = extra;
-        i += 1;
-        if (i < RC) {
-            bits[i] = extra;
-            i += 1;
-        }
-        extra += 1;
-    }
-    break :blk bits;
+/// Added to LENGTH_BASES on the new-match path (symbol >= 271).
+const LENGTH_MATCH_BASE: u32 = 3;
+/// Added to LENGTH_BASES on the rep-distance path (symbols 259..262).
+const LENGTH_REP_BASE: u32 = 2;
+
+/// Extra bits per RC slot. Reference: unrar unpack30.cpp
+///     LBits[] = {0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5}
+/// Note the groups of FOUR after the first eight zero-width slots.
+const LENGTH_EXTRA_BITS = [RC]u5{
+    0, 0, 0, 0, 0, 0, 0, 0,
+    1, 1, 1, 1, 2, 2, 2, 2,
+    3, 3, 3, 3, 4, 4, 4, 4,
+    5, 5, 5, 5,
 };
 
 // ============================================================================
@@ -117,6 +114,11 @@ pub const Unpack29State = struct {
     written_size: u64,
     block_mode: BlockMode,
     tables_loaded: bool,
+    /// Previous block's code lengths (unrar's `UnpOldTable`). v29 encodes each
+    /// block's lengths as a 4-bit DELTA against this, so it must persist across
+    /// readTables() calls. A block may also ask to keep it (BitField & 0x4000);
+    /// when that bit is clear the table is reset to zero.
+    old_table: [TOTAL_CODE_LENGTHS]u8,
     // PPM state
     ppm_model: ?PpmModel,
     allocator: std.mem.Allocator,
@@ -146,6 +148,7 @@ pub const Unpack29State = struct {
             .written_size = 0,
             .block_mode = .lz,
             .tables_loaded = false,
+            .old_table = [_]u8{0} ** TOTAL_CODE_LENGTHS,
             .ppm_model = null,
             .allocator = allocator,
             .mc_allocated = false,
@@ -185,10 +188,21 @@ pub const Unpack29State = struct {
         // Step 1: Align to byte boundary
         self.br.alignByte();
 
-        // Step 2: Read mode bit
-        const mode_bit = try self.br.readBits(1);
-        if (mode_bit == 1) {
-            // PPM mode
+        // Step 2: TWO flag bits, read by peeking 16 and consuming 2.
+        // Reference (unrar unpack30.cpp ReadTables30):
+        //     uint BitField = Inp.fgetbits();          // peek, does not consume
+        //     if (BitField & 0x8000) -> PPM
+        //     if (!(BitField & 0x4000)) memset(UnpOldTable, 0, ...)
+        //     Inp.faddbits(2);                         // consume BOTH bits
+        // This previously consumed a single bit, which left the entire rest of
+        // the stream shifted by one bit — every table and symbol after it
+        // decoded as garbage, so any genuinely compressed v29 payload failed.
+        const bit_field = try self.br.peekBits(16);
+        if (bit_field & 0x8000 != 0) {
+            // PPM mode. The PPM decoder re-reads its own header, so consume
+            // only the single mode bit here, matching the reference's
+            // DecodeInit path.
+            self.br.skipBits(1);
             self.block_mode = .ppm_mode;
             self.ppm_model = PpmModel.init(self.allocator, self.br) catch {
                 return Unpack29Error.UnsupportedPpmMode;
@@ -199,10 +213,42 @@ pub const Unpack29State = struct {
         // LZ mode
         self.block_mode = .lz;
 
-        // Step 3: Read 20 code lengths for the code-length Huffman table (4 bits each)
+        // 0x4000 clear means "start from a zeroed table" rather than continuing
+        // the delta chain from the previous block.
+        if (bit_field & 0x4000 == 0) {
+            self.old_table = [_]u8{0} ** TOTAL_CODE_LENGTHS;
+        }
+        self.br.skipBits(2);
+
+        // Step 3: Read the 20 code-length-alphabet lengths (4 bits each).
+        // A value of 15 is an ESCAPE, not a literal length of 15: the next 4
+        // bits are a zero-run count. Reading all twenty as plain 4-bit values
+        // (the previous behaviour) desynchronised the bitstream and produced an
+        // invalid code-length table.
         var bc_lengths: [BC]u8 = [_]u8{0} ** BC;
-        for (0..BC) |i| {
-            bc_lengths[i] = @intCast(try self.br.readBits(4));
+        {
+            var i: usize = 0;
+            while (i < BC) : (i += 1) {
+                const length: u8 = @intCast(try self.br.readBits(4));
+                if (length == 15) {
+                    const zero_count: u8 = @intCast(try self.br.readBits(4));
+                    if (zero_count == 0) {
+                        bc_lengths[i] = 15;
+                    } else {
+                        // ZeroCount+2 entries of zero, then the outer loop's
+                        // increment accounts for the last one (reference does
+                        // `I--` after the inner while).
+                        var remaining: u32 = @as(u32, zero_count) + 2;
+                        while (remaining > 0 and i < BC) : (remaining -= 1) {
+                            bc_lengths[i] = 0;
+                            i += 1;
+                        }
+                        i -= 1;
+                    }
+                } else {
+                    bc_lengths[i] = length;
+                }
+            }
         }
 
         // Step 4: Build code-length decode table
@@ -225,38 +271,48 @@ pub const Unpack29State = struct {
                 };
             };
 
+            // Reference symbol mapping (unpack30.cpp):
+            //   0..15 literal, applied as a DELTA against the old table
+            //   16 -> repeat previous,  N = 3  + read(3)
+            //   17 -> repeat previous,  N = 11 + read(7)
+            //   18 -> zeros,            N = 3  + read(3)
+            //   19 -> zeros,            N = 11 + read(7)
+            // The previous mapping was shifted (17 treated as zeros-3, 18 as
+            // zeros-11) and used 2 bits instead of 3 for symbol 16 — and symbol
+            // 19 matched no branch at all, so `i` never advanced and the loop
+            // could spin forever on input that legitimately emits it.
             if (sym < 16) {
-                // Literal code length
-                code_lengths[i] = @intCast(sym);
+                // Delta against the previous block's length for this slot.
+                code_lengths[i] = @intCast((sym + self.old_table[i]) & 0x0F);
                 i += 1;
-            } else if (sym == 16) {
-                // Repeat previous length 3 + readBits(2) times
+            } else if (sym < 18) {
+                const n: u32 = if (sym == 16)
+                    3 + try self.br.readBits(3)
+                else
+                    11 + try self.br.readBits(7);
+                // "Repeat previous" cannot appear first — there is nothing to
+                // repeat, and reading code_lengths[i-1] would underflow.
                 if (i == 0) return Unpack29Error.CorruptData;
-                const repeat = 3 + try self.br.readBits(2);
-                const prev = code_lengths[i - 1];
-                var j: u32 = 0;
-                while (j < repeat and i < TOTAL_CODE_LENGTHS) : (j += 1) {
-                    code_lengths[i] = prev;
+                var remaining = n;
+                while (remaining > 0 and i < TOTAL_CODE_LENGTHS) : (remaining -= 1) {
+                    code_lengths[i] = code_lengths[i - 1];
                     i += 1;
                 }
-            } else if (sym == 17) {
-                // Zero 3 + readBits(3) times
-                const count = 3 + try self.br.readBits(3);
-                var j: u32 = 0;
-                while (j < count and i < TOTAL_CODE_LENGTHS) : (j += 1) {
-                    code_lengths[i] = 0;
-                    i += 1;
-                }
-            } else if (sym == 18) {
-                // Zero 11 + readBits(7) times
-                const count = 11 + try self.br.readBits(7);
-                var j: u32 = 0;
-                while (j < count and i < TOTAL_CODE_LENGTHS) : (j += 1) {
+            } else {
+                const n: u32 = if (sym == 18)
+                    3 + try self.br.readBits(3)
+                else
+                    11 + try self.br.readBits(7);
+                var remaining = n;
+                while (remaining > 0 and i < TOTAL_CODE_LENGTHS) : (remaining -= 1) {
                     code_lengths[i] = 0;
                     i += 1;
                 }
             }
         }
+
+        // The lengths just decoded become the delta base for the next block.
+        self.old_table = code_lengths;
 
         // Step 6: Free old tables if allocated
         if (self.mc_allocated) {
@@ -304,7 +360,9 @@ pub const Unpack29State = struct {
         };
 
         if (slot >= RC) return Unpack29Error.CorruptData;
-        const base = LENGTH_BASES[slot];
+        // Rep-distance path: LDecode[n] + 2 + extra. No distance-dependent
+        // bonus here — the reference applies that only to new matches.
+        const base = LENGTH_BASES[slot] + LENGTH_REP_BASE;
         const extra = LENGTH_EXTRA_BITS[slot];
         if (extra == 0) return base;
         const extra_val = try self.br.readBits(extra);
@@ -428,7 +486,11 @@ pub const Unpack29State = struct {
         if (symbol >= 263 and symbol <= 270) {
             // Short-distance 2-byte match
             const dist_index = symbol - 263;
-            const distance = SHORT_DISTANCES[dist_index] + 1;
+            var distance = SHORT_DISTANCES[dist_index] + 1;
+            const dbits = SHORT_DISTANCE_BITS[dist_index];
+            if (dbits > 0) {
+                distance += try self.br.readBits(dbits);
+            }
             const length: u32 = 2;
 
             // Update distance history
@@ -449,7 +511,8 @@ pub const Unpack29State = struct {
             const length_slot = symbol - 271;
             if (length_slot >= RC) return Unpack29Error.CorruptData;
 
-            const base = LENGTH_BASES[length_slot];
+            // New-match path: LDecode[n] + 3 + extra.
+            const base = LENGTH_BASES[length_slot] + LENGTH_MATCH_BASE;
             const extra = LENGTH_EXTRA_BITS[length_slot];
             var length: u32 = base;
             if (extra > 0) {
@@ -457,6 +520,17 @@ pub const Unpack29State = struct {
             }
 
             const distance = try self.decodeDistance();
+
+            // Distance-dependent length bonus. The encoder cannot emit a
+            // 2-byte match at a large distance, so those short lengths are
+            // reused to mean longer matches and the decoder adds the bonus
+            // back. Reference (unpack30.cpp), applied to NEW matches only:
+            //     if (Distance>=0x2000) { Length++; if (Distance>=0x40000) Length++; }
+            // Omitting it silently truncated every match beyond 8 KB.
+            if (distance >= 0x2000) {
+                length += 1;
+                if (distance >= 0x40000) length += 1;
+            }
 
             // Update distance history
             self.prev_distances[3] = self.prev_distances[2];
@@ -568,10 +642,21 @@ pub fn decompress(
 
 const testing = std.testing;
 
-test "LENGTH_BASES slots 0-7 are slot+2" {
-    for (0..8) |i| {
-        try testing.expectEqual(@as(u32, @intCast(i + 2)), LENGTH_BASES[i]);
-    }
+test "LENGTH_BASES is the raw reference LDecode table" {
+    // LENGTH_BASES holds unrar's LDecode verbatim; the +2/+3 is added by the
+    // caller because the rep and new-match paths use different bases. These
+    // assertions previously encoded the folded-in +2, which is why replacing a
+    // wrong derivation with the correct table broke them.
+    const reference_ldecode = [RC]u32{
+        0,   1,   2,   3,   4,   5,   6,   7,
+        8,   10,  12,  14,  16,  20,  24,  28,
+        32,  40,  48,  56,  64,  80,  96,  112,
+        128, 160, 192, 224,
+    };
+    try testing.expectEqualSlices(u32, &reference_ldecode, &LENGTH_BASES);
+    // And the two documented call-site bases.
+    try testing.expectEqual(@as(u32, 3), LENGTH_MATCH_BASE);
+    try testing.expectEqual(@as(u32, 2), LENGTH_REP_BASE);
 }
 
 test "LENGTH_EXTRA_BITS slots 0-7 are 0" {
@@ -580,8 +665,22 @@ test "LENGTH_EXTRA_BITS slots 0-7 are 0" {
     }
 }
 
-test "LENGTH_BASES slot 8 starts at 10" {
-    try testing.expectEqual(@as(u32, 10), LENGTH_BASES[8]);
+test "LENGTH_BASES slot 8 starts at 8 (raw LDecode)" {
+    try testing.expectEqual(@as(u32, 8), LENGTH_BASES[8]);
+    // With the caller's constants this is a length of 11 for a new match and
+    // 10 for a rep match — the latter is what the old folded table encoded.
+    try testing.expectEqual(@as(u32, 11), LENGTH_BASES[8] + LENGTH_MATCH_BASE);
+    try testing.expectEqual(@as(u32, 10), LENGTH_BASES[8] + LENGTH_REP_BASE);
+}
+
+test "LENGTH_EXTRA_BITS groups slots in FOURS, not pairs" {
+    // The original derivation advanced the extra-bit width every TWO slots.
+    // The reference advances every FOUR (LBits = 1,1,1,1,2,2,2,2,...), so the
+    // tables diverged from slot 11 onward and long matches decoded too long.
+    for (8..RC) |i| {
+        const expected: u5 = @intCast((i - 8) / 4 + 1);
+        try testing.expectEqual(expected, LENGTH_EXTRA_BITS[i]);
+    }
 }
 
 test "LENGTH_EXTRA_BITS slot 8 is 1" {
@@ -604,8 +703,13 @@ test "alphabet size constants" {
 }
 
 test "SHORT_DISTANCES values" {
+	// Reference SDDecode/SDBits (unrar unpack30.cpp). The old assertion
+	// encoded {0,1,2,3,4,5,6,7}, matching the buggy table.
+	const reference_sddecode = [8]u32{ 0, 4, 8, 16, 32, 64, 128, 192 };
+	const reference_sdbits = [8]u5{ 2, 2, 3, 4, 5, 6, 6, 6 };
+	try testing.expectEqualSlices(u5, &reference_sdbits, &SHORT_DISTANCE_BITS);
     for (0..8) |i| {
-        try testing.expectEqual(@as(u32, @intCast(i)), SHORT_DISTANCES[i]);
+		try testing.expectEqual(reference_sddecode[i], SHORT_DISTANCES[i]);
     }
 }
 
@@ -920,14 +1024,60 @@ test "BlockMode enum values" {
 test "LENGTH_BASES coverage for all slots" {
     // Verify all 28 slots have reasonable base values
     for (0..RC) |i| {
-        try testing.expect(LENGTH_BASES[i] >= 2);
+		try testing.expect(LENGTH_BASES[i] <= 224);
     }
     // Verify last slot has a large base
-    try testing.expect(LENGTH_BASES[RC - 1] > 256);
+	// Reference LDecode[27] = 224 (raw, before the caller-added +2/+3).
+	try testing.expectEqual(@as(u32, 224), LENGTH_BASES[RC - 1]);
 }
 
 test "LENGTH_EXTRA_BITS coverage for all slots" {
     for (0..RC) |i| {
         try testing.expect(LENGTH_EXTRA_BITS[i] <= 25);
     }
+}
+
+test "unpack29: decodes a minimal real v29 archive (official rar 6.21)" {
+	// Minimal reproduction of the v29 decoder failure. rar4_v29_min.rar is an
+	// 87-byte archive holding 101 bytes of 'a' plus a newline, produced by the
+	// official rar 6.21 and verified by `unrar t` (All OK). Every genuinely
+	// compressed v29 input currently fails to decode; only effectively-stored
+	// payloads survive, which is why extraction of real RAR4 archives returns
+	// wrong or missing data.
+	const std_full = @import("std");
+	const rar4 = @import("../rar4_headers.zig");
+	const archive: []const u8 = @embedFile("rar4_v29_min");
+
+	var iter = rar4.BlockIterator{ .data = archive, .pos = 0 };
+	while (try iter.next()) |block| switch (block) {
+		.file => |f| {
+			if (f.method == 0) continue;
+			const start = f.block.header_offset + f.block.head_size;
+			const payload = archive[start .. start + @as(usize, @intCast(f.packed_size))];
+			const out = decompress(
+				std_full.testing.allocator,
+                payload,
+				f.unpacked_size,
+				@as(u5, 16) + @as(u5, @intCast(@min(6, (f.block.flags >> 5) & 7))),
+			) catch |err| {
+				std_full.debug.print("[v29] decode failed: {t} (ver={d} method={d} packed={d} unpacked={d})\n", .{ err, f.unpack_version, f.method, f.packed_size, f.unpacked_size });
+				return err;
+			};
+			defer std_full.testing.allocator.free(out);
+			try std_full.testing.expectEqual(@as(usize, @intCast(f.unpacked_size)), out.len);
+			// EXACT content: 100 'a' then a newline. An earlier version of this
+			// test skipped the final byte and passed while extraction still
+			// produced a wrong trailing byte.
+			var expected: [101]u8 = undefined;
+			@memset(expected[0..100], 'a');
+			expected[100] = '\n';
+			for (out, 0..) |c, idx| {
+				if (c != expected[idx]) {
+					std_full.debug.print("[v29] first mismatch at {d}: got 0x{X:0>2} want 0x{X:0>2}\n", .{ idx, c, expected[idx] });
+					return error.ContentMismatch;
+				}
+			}
+		},
+		else => {},
+	};
 }

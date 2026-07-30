@@ -883,28 +883,16 @@ pub fn decompress(
 
     try state.decompressLoop(unpacked_size);
 
-    // SAFETY GATE. The stream declared a filter, and we do not apply filters
-    // yet. The LZ output is real, but a filter is a transform over it — handing
-    // it back would be silently wrong data, the single worst outcome for an
-    // integrity tool (see the RAR4 false-green work). Fail loudly instead, so
-    // callers report the entry as unverifiable rather than trusting it.
+    // A filter program we could not identify — or one of the six whose
+    // transform is not implemented (itanium, rgb) — means we cannot
+    // reproduce the data. The LZ output is real but incomplete, so
+    // returning it would be silently wrong: the worst outcome for an
+    // integrity tool. Fail loudly so callers report the entry as
+    // unverifiable rather than trusting it.
     //
-    // Remove this gate only when the filters are actually applied; until then
-    // it is what keeps "we parsed the filter" from being mistaken for
-    // "we honoured the filter".
-    // SAFETY GATE — deliberately still closed.
-    //
-    // Filter identification and the delta/audio/e8 transforms below are
-    // implemented and demonstrably working: applying them takes a filtered x86
-    // archive from 85% to 97% byte-identical against unrar. But 97% is not
-    // correct, and the 3% would be returned with NO error — silently wrong
-    // data, the exact failure this codebase has spent its recent history
-    // eliminating. Until output is byte-identical, filtered entries must be
-    // reported unverifiable rather than trusted.
-    //
-    // Remaining suspect: block geometry (start/length resolution and ordering
-    // of overlapping filter blocks), not the transforms themselves.
-    if (state.unsupported_filter_seen or state.filter_seen != .none) {
+    // Recognised filters ARE applied below and verified byte-identical
+    // to unrar, so this no longer rejects every filtered entry.
+    if (state.unsupported_filter_seen) {
         return Unpack29Error.UnsupportedFilter;
     }
 
@@ -929,7 +917,23 @@ pub fn decompress(
                 return Unpack29Error.UnsupportedFilter;
             }
             if (len > scratch.len) return Unpack29Error.UnsupportedFilter;
-            if (!rarvm.applyFilter(pf.filter, output[start .. start + len], scratch, pf.init_r)) {
+
+            // R[6] is NOT taken from the record's optional parameters — the
+            // reference overwrites it at execution time:
+            //     void Unpack::ExecuteCode(VM_PreparedProgram *Prg) {
+            //       Prg->InitR[6] = (uint)WrittenFileSize; VM.Execute(Prg); }
+            // ExecuteCode runs once the window has been flushed up to the
+            // block, so WrittenFileSize is the block's byte offset within the
+            // FILE. The E8/E8E9 filter converts call/jump targets between
+            // relative and absolute using exactly that offset, so passing the
+            // record's value (normally 0) mis-relocates every branch it edits.
+            var init_r = pf.init_r;
+            init_r[6] = @truncate(pf.start);
+
+            // Chaining is handled implicitly: consecutive filters sharing a
+            // range operate on this same slice, so a second one sees the
+            // first's output, which is what the reference's PrgStack loop does.
+            if (!rarvm.applyFilter(pf.filter, output[start .. start + len], scratch, init_r)) {
                 return Unpack29Error.UnsupportedFilter;
             }
         }

@@ -1539,8 +1539,10 @@ test "validate detects RAR4 encrypted content via main password flag" {
 	@memcpy(archive[pos..][0..7], &detect_mod.RAR15_SIG);
 	pos += 7;
 
-	// Main block with password flag (0x0040)
-	const main_len = build_rar4_block(archive[pos..], 0x73, 0x0040, &.{});
+	// Main block with MHD_PASSWORD (0x0080). This said 0x0040, which is
+	// MHD_PROTECT (recovery record) — the test passed only because
+	// parse_main_flags had the same off-by-one-bit mapping.
+	const main_len = build_rar4_block(archive[pos..], 0x73, 0x0080, &.{});
 	pos += main_len;
 
 	// End archive block

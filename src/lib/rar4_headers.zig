@@ -129,8 +129,11 @@ pub fn parse_main_flags(raw: u16) MainFlags {
 		.comment = (raw & 0x0002) != 0,
 		.lock = (raw & 0x0004) != 0,
 		.solid = (raw & 0x0008) != 0,
-		.protect = (raw & 0x0020) != 0,
-		.password = (raw & 0x0040) != 0,
+		// Reference (unrar headers.hpp): MHD_AV 0x0020, MHD_PROTECT 0x0040,
+		// MHD_PASSWORD 0x0080. These were each one bit-position low, so a
+		// recovery record (PROTECT) read as PASSWORD and AV read as PROTECT.
+		.protect = (raw & 0x0040) != 0,
+		.password = (raw & 0x0080) != 0,
 		.first_volume = (raw & 0x0100) != 0,
 		.raw = raw,
 	};
@@ -349,8 +352,9 @@ test "parse_block_header with LONG_BLOCK reads data_size" {
 
 test "parse_main_flags extracts bits correctly" {
 	// All flags set: volume(0x0001) | comment(0x0002) | lock(0x0004) | solid(0x0008)
-	//               | protect(0x0020) | password(0x0040) | first_volume(0x0100)
-	const all_set: u16 = 0x0001 | 0x0002 | 0x0004 | 0x0008 | 0x0020 | 0x0040 | 0x0100;
+	//               | protect(0x0040) | password(0x0080) | first_volume(0x0100)
+	// (reference unrar headers.hpp; 0x0020 is MHD_AV, not PROTECT)
+	const all_set: u16 = 0x0001 | 0x0002 | 0x0004 | 0x0008 | 0x0040 | 0x0080 | 0x0100;
 	const flags = parse_main_flags(all_set);
 	try testing.expect(flags.volume);
 	try testing.expect(flags.comment);
@@ -371,11 +375,12 @@ test "parse_main_flags extracts bits correctly" {
 	try testing.expect(!none.password);
 	try testing.expect(!none.first_volume);
 
-	// Only solid + password
-	const partial = parse_main_flags(0x0008 | 0x0040);
+	// Only solid + password (MHD_PASSWORD is 0x0080, not 0x0040)
+	const partial = parse_main_flags(0x0008 | 0x0080);
 	try testing.expect(!partial.volume);
 	try testing.expect(partial.solid);
 	try testing.expect(partial.password);
+	try testing.expect(!partial.protect);
 	try testing.expect(!partial.first_volume);
 }
 
@@ -812,3 +817,33 @@ test "parse_file_header: real RAR4 fixture matches unrar ground truth" {
 	try testing.expect(crcs[1] != crcs[2]);
 }
 
+
+test "parse_main_flags: PROTECT (recovery record) is not PASSWORD" {
+	// Reference (unrar headers.hpp):
+	//   MHD_AV       0x0020
+	//   MHD_PROTECT  0x0040   (recovery record)
+	//   MHD_PASSWORD 0x0080
+	// rarz had protect=0x0020 (actually AV) and password=0x0040 (actually
+	// PROTECT), so ANY archive carrying a recovery record was reported as
+	// password-protected. Validation then took the has_encrypted_content early
+	// exit, skipped every payload check, and still returned VALID — a
+	// false-green on a very common archive shape. Observed on a real 29 MB RAR4
+	// that unrar reads with no password at all.
+	const protect_only = parse_main_flags(0x0040);
+	try testing.expect(protect_only.protect);
+	try testing.expect(!protect_only.password);
+
+	const password_only = parse_main_flags(0x0080);
+	try testing.expect(password_only.password);
+	try testing.expect(!password_only.protect);
+
+	// 0x0020 is AV, and must not be mistaken for PROTECT.
+	const av_only = parse_main_flags(0x0020);
+	try testing.expect(!av_only.protect);
+	try testing.expect(!av_only.password);
+
+	// Unaffected neighbours stay correct.
+	try testing.expect(parse_main_flags(0x0001).volume);
+	try testing.expect(parse_main_flags(0x0008).solid);
+	try testing.expect(parse_main_flags(0x0100).first_volume);
+}

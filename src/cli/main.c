@@ -28,6 +28,25 @@
 
 static int g_is_tty = 0;  /* set once in main() — used for non-TTY filename printing */
 
+/* RAR4 stores paths with Windows-style '\' separators. The library reports the
+ * stored name verbatim (it borrows a pointer into the archive and copies
+ * nothing), so translating to the host separator is this layer's job — the same
+ * thing unrar does. Without it, extracting a real RAR4 on POSIX produced files
+ * literally named "Data\foo.txt" in the destination root instead of "foo.txt"
+ * inside a "Data" directory, and listings showed the backslashes too.
+ *
+ * On Windows both separators are accepted by the filesystem APIs, so the stored
+ * form is already usable and is left alone. */
+static void normalize_archive_path(char *s) {
+#ifndef _WIN32
+	for (; *s; s++) {
+		if (*s == '\\') *s = '/';
+	}
+#else
+	(void)s;
+#endif
+}
+
 /** Format bytes as human-readable string into buf (e.g., "1.2 MB") */
 static void format_bytes(char *buf, size_t buflen, uint64_t bytes) {
 	if (bytes >= 1073741824ULL)
@@ -797,6 +816,7 @@ static int cmd_list(const char *path) {
 		                ? entry.name_len : (uint32_t)(sizeof(name_buf) - 1);
 		memcpy(name_buf, entry.name, nlen);
 		name_buf[nlen] = '\0';
+		normalize_archive_path(name_buf);
 
 		/* Compute ratio */
 		int ratio = 100;
@@ -896,6 +916,7 @@ static int cmd_extract(const char *archive_path, const char *dest_dir) {
 		                ? entry.name_len : (uint32_t)(sizeof(name_buf) - 1);
 		memcpy(name_buf, entry.name, nlen);
 		name_buf[nlen] = '\0';
+		normalize_archive_path(name_buf);
 
 		/* Build full output path */
 		char out_path[8192];

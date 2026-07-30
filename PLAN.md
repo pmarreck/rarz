@@ -124,31 +124,48 @@ Work items, in order:
   archive offset). Now matches `unrar l` exactly on names/sizes/dates/CRCs;
   extraction of the store fixture is byte-identical to unrar; store-method
   corruption detection went 0/5 → 5/5. (2026-07-30 EDT)
-- [ ] 🔴 **RAR4 v29 decoder is broken on real archives — silent data
-  corruption.** Attempted to wire compressed-RAR4 payload verification; it
-  flagged the *pristine* official fixture INVALID ("decompression failed"), so
-  the wiring was reverted rather than ship false positives on every compressed
-  RAR4. Root cause is the decoder itself. Evidence from `rarz x` on
-  `rar4_m3.rar` vs unrar:
-  | payload | entropy | result |
-  |---|---|---|
-  | `text.txt` | highly compressible | decompression FAILED |
-  | `mixed.bin` | partially compressible | **silently DIFFERS from unrar** |
-  | `noise.bin` | incompressible (stored) | identical |
-  The middle case is the worst: rarz hands back **wrong file contents with no
-  error**. Note this is only visible because the corpus spans entropy levels —
-  testing only "runs of one character" or pure noise would have missed it.
-  The 49 unit tests in unpack29/20/15 pass, so they are not exercising real
-  official-encoder output (same producer==checker weakness as the synthetic
-  header fixtures). Fix the decoder against the corpus, THEN re-wire
-  verification and add the mutation gate.
-- [ ] Add a mutation gate once the decoder is fixed: for each corpus archive,
-  corrupting a payload byte must flip rarz to INVALID. Currently 6/12
-  (store-method 6/6, compressed 0/6).
-- [ ] Until then compressed RAR4 remains a known false-green (reported VALID,
-  unverified). The honest fix is an "unverified" state rather than a VALID/
-  INVALID binary — which is exactly what the structured-error ABI question to
-  validate is about.
+- [x] **RAR4 v29 decoder fixed** (`976d34b`) — six defects, all found by
+  differential-testing tiny official-rar archives against unrar with
+  `unpack30.cpp` as the reference: (1) readTables consumed 1 flag bit instead
+  of 2, shifting the whole stream; (2) the BC length-15 escape was ignored;
+  (3) the symbol loop lacked the delta-vs-old-table, had 16/17/18/19 shifted,
+  read 2 bits instead of 3 for symbol 16, and left symbol 19 matching NO branch
+  (index never advanced — a hang); (4) LENGTH tables grouped slots in pairs
+  instead of fours; (5) the same LDecode table needs +3 for new matches and +2
+  for rep matches, so the constant cannot be folded in; (6) short-match
+  distances used {0..7} with no extra bits instead of SDDecode/SDBits, and the
+  distance-dependent length bonus was missing. All five RAR4 fixtures now
+  extract byte-identical to unrar. (2026-07-30 EDT)
+- [x] **Compressed RAR4 payload verification wired** (`3c97623`). Corruption
+  gate: unrar flagged 16 mutations, rarz catches **16/16, missed 0** (was 6/12,
+  and 0/5 before any of this). Pristine archives stay VALID.
+- [x] **MHD_PROTECT read as PASSWORD** (`02a4f4a`) — main-header flags were one
+  bit low (AV 0x0020 / PROTECT 0x0040 / PASSWORD 0x0080), so any archive with a
+  recovery record was called encrypted, which skipped ALL payload verification
+  and returned VALID. It was also masking the filter gap below.
+- [x] **RAR4 '\' path separators** translated to the host separator in the CLI
+  (`02a4f4a`); a real third-party RAR4 now extracts with a tree and contents
+  byte-identical to unrar.
+
+### 4c. Remaining RAR4 gap: RarVM filter subsystem (not a decode bug)
+
+On a real 29 MB third-party RAR4, 595 of 859 files still fail — every one of
+them at `symbol == 257` -> `UnsupportedFilter`. Confirmed by instrumenting the
+three failure sites: 595/595 were VM-code, zero PPM, zero decode errors. The
+v29 LZ decoder itself is correct; RAR3's VM filter subsystem is simply not
+implemented (already tracked as Phase 2E "v29 VM filter subsystem").
+
+Current behaviour is at least honest: rarz reports INVALID ("decompression
+failed during validation") rather than the previous false VALID. But INVALID is
+the wrong verdict for "we cannot decode this filter" — the archive is fine.
+This is the strongest argument yet for the **"unverified" state** in the
+structured-result design pending with validate: three distinct outcomes
+(verified-good / verified-bad / could-not-verify) rather than a boolean.
+
+- [ ] Implement the RAR3 VM filter subsystem (standard filters by CRC
+  recognition: delta, E8/E9, RGB, audio, x86 itanium).
+- [ ] Until then, report filter-limited entries as unverified rather than
+  invalid, once the result API supports it.
 - [ ] **Structured error detail for the `validate` consumer.** Today
   `error_message` is a bare static string. Validate wants location + specifics:
   byte offset, block type, entry name, expected-vs-actual. Design note: entry

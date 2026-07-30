@@ -63,7 +63,6 @@ fn validate_rar4_structural(data: []const u8, sig_offset: usize) ValidationResul
 	var block_count: u32 = 0;
 	var file_count: u32 = 0;
 	var has_encrypted: bool = false;
-	var saw_end_of_archive: bool = false;
 
 	while (true) {
 		// Record position before parsing so we know where this block starts
@@ -128,7 +127,7 @@ fn validate_rar4_structural(data: []const u8, sig_offset: usize) ValidationResul
 				const fflags = rar4_headers.parse_file_flags(f.block.flags);
 				if (fflags.password) has_encrypted = true;
 			},
-			.end_archive => saw_end_of_archive = true,
+			.end_archive => {},
 			else => {},
 		}
 	}
@@ -137,19 +136,20 @@ fn validate_rar4_structural(data: []const u8, sig_offset: usize) ValidationResul
 		return invalid_result(.rar15, "no blocks found");
 	}
 
-	// PRECISION: same clean-EOF blind spot the RAR5 path had. Losing whole
-	// trailing blocks leaves every surviving block well-formed, so the iterator
-	// reports a clean end and a truncated archive was reported VALID.
-	if (!saw_end_of_archive) {
-		return .{
-			.is_valid = false,
-			.family = .rar15,
-			.has_encrypted_content = has_encrypted,
-			.error_message = "archive ends without an end-of-archive block (truncated)",
-			.block_count = block_count,
-			.file_count = file_count,
-		};
-	}
+	// NOTE: unlike RAR5, a missing end-of-archive block is NOT an error here.
+	//
+	// RAR5 mandates the terminator, so its absence there means truncation. RAR
+	// 2.x does not: archives produced by the original RAR 2.90 frequently just
+	// end after the last file, and `unrar t` reports them "All OK" (see the
+	// rar2_v20_* fixtures and tests/generate_rar2_fixtures.sh). Requiring it
+	// rejected perfectly good old archives — a false positive, and on precisely
+	// the vintage files a file-integrity tool most needs to be believed about.
+	//
+	// Truncation of RAR4 is still detected, by the checks that actually observe
+	// missing bytes rather than a missing terminator: a payload declared past
+	// end-of-archive, and a block header that fails to parse. Verified against
+	// the oracle — cutting a v20 fixture short still reports INVALID while
+	// unrar reports an error, and the intact archive stays VALID.
 
 	return .{
 		.is_valid = true,
@@ -1942,23 +1942,22 @@ test "validate_volumes: official rar m3 multi-volume fixture validates (spanning
 }
 
 test "validate: truncated RAR4 archive must NOT be VALID" {
-	// The RAR5 path was fixed to require an end-of-archive block; RAR4 has the
-	// same clean-EOF blind spot. A truncation that removes whole trailing blocks
-	// leaves every surviving block well-formed, so the iterator reports a clean
-	// end and validation used to return VALID on a damaged archive.
-	var archive: [128]u8 = undefined;
-	var pos: usize = 0;
-	@memcpy(archive[pos..][0..7], &detect_mod.RAR15_SIG);
-	pos += 7;
-	pos += build_rar4_block(archive[pos..], 0x73, 0x0000, &.{}); // main
-	const before_end = pos;
-	pos += build_rar4_block(archive[pos..], 0x7B, 0x0000, &.{}); // end_archive
+	// Truncation must be detected by observing MISSING BYTES, not by a
+	// missing end-of-archive block.
+	//
+	// This test used to build a synthetic RAR4, drop its end block, and
+	// require INVALID. That premise was wrong: RAR 2.x archives routinely
+	// have no end block at all and unrar reports them fine, so the rule
+	// rejected valid vintage archives. Now it truncates a REAL RAR 2.90
+	// archive part-way through its payload, which is genuine damage —
+	// `unrar t` errors on this input too.
+	const full: []const u8 = @embedFile("rar2_v20_store");
 
-	// Sanity: intact archive is valid.
-	try testing.expect(validate(archive[0..pos]).is_valid);
+	// Intact: valid (no end-of-archive block in this vintage archive).
+	try testing.expect(validate(full).is_valid);
 
-	// The end block is gone entirely — that is a truncated archive.
-	try testing.expect(!validate(archive[0..before_end]).is_valid);
+	// Cut into the payload: the declared data now runs past end-of-file.
+	try testing.expect(!validate(full[0 .. full.len - 500]).is_valid);
 }
 
 test "validate: corrupted COMPRESSED RAR4 payload must be detected" {
@@ -1978,4 +1977,21 @@ test "validate: corrupted COMPRESSED RAR4 payload must be detected" {
 	@memcpy(buf, pristine);
 	buf[pristine.len / 2] ^= 0xFF; // corrupt inside the compressed payload
 	try testing.expect(!validate(buf).is_valid);
+}
+
+test "validate: a genuine RAR 2.x archive with no end-of-archive block is VALID" {
+	// REGRESSION against over-strictness. e781e58/00be71e made a missing
+	// end-of-archive block mean "truncated". That is correct for RAR5, where the
+	// terminator is mandatory, but RAR 2.x archives frequently do not carry one
+	// at all — this fixture, produced by the original RAR 2.90 and reported
+	// "All OK" by unrar, simply ends after its last file.
+	//
+	// The rule therefore rejected perfectly good old archives: exactly the
+	// false-positive direction that matters most for a tool whose job is to be
+	// believed about old files. Truncation of RAR4 is still caught by the
+	// payload-past-end-of-archive and block-parse checks (verified: cutting this
+	// same fixture short still reports INVALID, matching unrar).
+	const data: []const u8 = @embedFile("rar2_v20_store");
+	const result = validate(data);
+	try testing.expect(result.is_valid);
 }

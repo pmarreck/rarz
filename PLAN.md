@@ -147,7 +147,47 @@ Work items, in order:
   (`02a4f4a`); a real third-party RAR4 now extracts with a tree and contents
   byte-identical to unrar.
 
-### 4c. Remaining RAR4 gap: RarVM filter subsystem (not a decode bug)
+### 4d. 🔴 RAR 2.x (v20) decoder is broken on real archives — NEW, 2026-07-30
+
+First-ever differential test of `unpack20` against real archives. Corpus built
+with the ORIGINAL RAR 2.90 (2001) under wine — modern rar always emits v29, so
+only a period-correct binary produces v20. See
+`tests/generate_rar2_fixtures.sh` (6 archives: store/m1/m3/m5/mm/solid).
+
+Results vs `unrar` (all six test "All OK" under unrar):
+
+| fixture | files | missing | wrong |
+|---|---|---|---|
+| `rar2_v20_store` | 7 | 0 | 0 | ✅ (after the fix below) |
+| `rar2_v20_m1/m3/m5/mm` | 7 | 3 | 1 | ❌ |
+| `rar2_v20_solid` | 7 | 6 | 1 | ❌ |
+
+So `unpack20` partially works — effectively-stored payloads survive — but real
+compressed v20 data fails, and one file per archive comes back **silently
+wrong**. Same shape as the unpack29 situation: ~1160 lines, 18 unit tests, and
+never once decoded a real archive, so the tests agreed with the decoder.
+
+- [x] **False positive fixed:** a missing end-of-archive block was treated as
+  truncation. RAR5 mandates that terminator; **RAR 2.x frequently has none at
+  all** and unrar reports such archives fine, so the rule rejected valid vintage
+  archives — the worst direction for a tool that must be believed about old
+  files. Narrowed to RAR5. RAR4 truncation is still caught by the
+  payload-past-EOF and block-parse checks (verified: cutting a v20 fixture short
+  still reports INVALID, matching unrar). The synthetic test that encoded the
+  over-strict rule was replaced with one that truncates a real archive.
+- [ ] **Fix `unpack20` against the corpus**, same method that fixed unpack29:
+  shrink to the smallest failing archive, diff against `unpack20.cpp`, one
+  divergence at a time. Expect table/base-constant errors of the same family.
+- [ ] The five compressed v20 fixtures live in `tests/fixtures/known_gaps/` so
+  Interop Gate A (which treats `tests/fixtures/` as "must be VALID") stays
+  green. **Move them up into `tests/fixtures/` the moment the decoder works** —
+  that is the acceptance test.
+- [ ] **v15 (RAR 1.5) has NO corpus and NO coverage at all.** RARLAB no longer
+  hosts a RAR 1.5 binary (`rar15.exe`, `rar200.exe` -> 404); `rar250.exe` (DOS,
+  16-bit) exists but needs dosbox, which is not installed. Decide whether v15 is
+  worth supporting or should be explicitly declared unsupported.
+
+### 4c. Remaining RAR4 gap: RarVM filter subsystem — RESOLVED for delta/audio/e8
 
 On a real 29 MB third-party RAR4, 595 of 859 files still fail — every one of
 them at `symbol == 257` -> `UnsupportedFilter`. Confirmed by instrumenting the

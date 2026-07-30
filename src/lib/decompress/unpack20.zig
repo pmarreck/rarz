@@ -21,14 +21,71 @@ const BC20: u16 = 20;
 /// Number of audio channels (max 4, indexed 0-3)
 const MAX_AUDIO_CHANNELS: u8 = 4;
 
-/// Short distances for 2-byte matches (symbols 261-268)
-const short_distances = [8]u32{ 0, 1, 2, 3, 4, 8, 16, 32 };
+/// Largest symbol-length table a v20 block can declare: MC20 per audio channel.
+const OLD_TABLE_SIZE: usize = @as(usize, MC20) * @as(usize, MAX_AUDIO_CHANNELS);
 
-/// Length base values for length slots
-/// Slots 0-7: length = slot + 2
-/// Slots 8+: extra bits pattern
-const length_bases = computeLengthBases();
-const length_extra_bits = computeLengthExtraBits();
+// ============================================================================
+// Decode tables — written out literally, straight from unrar unpack20.cpp.
+//
+// These were previously DERIVED, and every derivation was wrong in the same way
+// unpack29's were: extra-bit widths grouped in PAIRS where the real tables group
+// them in FOURS, and distances computed by formula rather than read from a
+// table. Small payloads never reach the slots where the two diverge, so 18 unit
+// tests passed while real v20 archives failed to decode at all.
+// ============================================================================
+
+/// Reference `SDDecode` — base distances for the 2-byte short matches
+/// (symbols 261..268). Was {0,1,2,3,4,8,16,32}, which is not this table, and
+/// the accompanying extra bits were not read at all.
+const SHORT_DISTANCES = [8]u32{ 0, 4, 8, 16, 32, 64, 128, 192 };
+
+/// Reference `SDBits` — extra distance bits for symbols 261..268.
+const SHORT_DISTANCE_BITS = [8]u5{ 2, 2, 3, 4, 5, 6, 6, 6 };
+
+/// Reference `LDecode`, RAW — the caller adds its own base, because v20 uses
+/// two of them: `LDecode[n] + 3` for a new match (symbol >= 270) and
+/// `LDecode[n] + 2` for a rep-distance match (symbols 257..260).
+const LENGTH_BASES = [RC20]u32{
+    0,   1,   2,   3,   4,   5,   6,   7,
+    8,   10,  12,  14,  16,  20,  24,  28,
+    32,  40,  48,  56,  64,  80,  96,  112,
+    128, 160, 192, 224,
+};
+
+/// Added to LENGTH_BASES on the new-match path (symbol >= 270).
+const LENGTH_MATCH_BASE: u32 = 3;
+/// Added to LENGTH_BASES on the rep-distance path (symbols 257..260).
+const LENGTH_REP_BASE: u32 = 2;
+
+/// Reference `LBits` — note the groups of FOUR after the eight zero-width slots.
+const LENGTH_EXTRA_BITS = [RC20]u5{
+    0, 0, 0, 0, 0, 0, 0, 0,
+    1, 1, 1, 1, 2, 2, 2, 2,
+    3, 3, 3, 3, 4, 4, 4, 4,
+    5, 5, 5, 5,
+};
+
+/// Reference `DDecode` (48 entries). v20's distance table is its own — it is
+/// NOT the v29 one, and it is not `slot/2 - 1` either.
+const DIST_DECODE = [DC20]u32{
+    0,     1,     2,     3,     4,     6,     8,      12,
+    16,    24,    32,    48,    64,    96,    128,    192,
+    256,   384,   512,   768,   1024,  1536,  2048,   3072,
+    4096,  6144,  8192,  12288, 16384, 24576, 32768,  49152,
+    65536, 98304, 131072, 196608, 262144, 327680, 393216, 458752,
+    524288, 589824, 655360, 720896, 786432, 851968, 917504, 983040,
+};
+
+/// Reference `DBits` (48 entries) — note it SATURATES at 16 for the high slots
+/// rather than continuing to grow, which no formula reproduces.
+const DIST_BITS = [DC20]u5{
+    0,  0,  0,  0,  1,  1,  2,  2,
+    3,  3,  4,  4,  5,  5,  6,  6,
+    7,  7,  8,  8,  9,  9,  10, 10,
+    11, 11, 12, 12, 13, 13, 14, 14,
+    15, 15, 16, 16, 16, 16, 16, 16,
+    16, 16, 16, 16, 16, 16, 16, 16,
+};
 
 fn computeLengthBases() [RC20]u32 {
     var bases: [RC20]u32 = undefined;
@@ -69,13 +126,16 @@ fn computeLengthExtraBits() [RC20]u5 {
 
 /// Distance extra bits: slot/2 - 1 for slot >= 4
 fn distanceDecode(slot: u32, br: *BitReader) !u32 {
-    if (slot < 4) {
-        return slot + 1;
+    // Table-driven, matching the reference. The old `slot/2 - 1` formula does
+    // not reproduce DDecode/DBits — in particular DBits saturates at 16 for the
+    // high slots instead of growing, so every long distance was wrong.
+    if (slot >= DC20) return error.InvalidData;
+    var distance: u32 = DIST_DECODE[slot] + 1;
+    const bits = DIST_BITS[slot];
+    if (bits > 0) {
+        distance += try br.readBits(bits);
     }
-    const extra: u5 = @intCast(slot / 2 - 1);
-    const base: u32 = (2 | (slot & 1)) << extra;
-    const extra_val = try br.readBits(extra);
-    return base + extra_val + 1;
+    return distance;
 }
 
 // ============================================================================
@@ -192,6 +252,9 @@ const Unpack20State = struct {
     audio_block: bool,
     audio_channels: u8,
     cur_channel: u8,
+    /// Previous block's symbol lengths (reference `UnpOldTable20`). v20 encodes
+    /// each block as a 4-bit DELTA against this, so it must persist.
+    old_table: [OLD_TABLE_SIZE]u8,
     channel_delta: u8,
     tables_loaded: bool,
     audio_state: [MAX_AUDIO_CHANNELS]AudioChannel,
@@ -213,6 +276,7 @@ const Unpack20State = struct {
             .audio_block = false,
             .audio_channels = 0,
             .cur_channel = 0,
+            .old_table = [_]u8{0} ** OLD_TABLE_SIZE,
             .channel_delta = 0,
             .tables_loaded = false,
             .audio_state = [_]AudioChannel{.{}} ** MAX_AUDIO_CHANNELS,
@@ -243,102 +307,110 @@ const Unpack20State = struct {
 fn readTables(state: *Unpack20State) !void {
     const br = state.br;
 
-    // Step 1: Align to byte boundary
+    // Step 1: align to a byte boundary.
     br.alignByte();
 
-    // Step 2: Read audio mode flag
-    const audio_flag = try br.readBits(1);
-    state.audio_block = (audio_flag != 0);
+    // Step 2: TWO flag bits, read by peeking 16 and consuming 2 — plus two MORE
+    // for the channel count when this is an audio block. Reference
+    // (unrar unpack20.cpp ReadTables20):
+    //     uint BitField = Inp.getbits();            // peek, does not consume
+    //     UnpAudioBlock = (BitField & 0x8000) != 0;
+    //     if (!(BitField & 0x4000)) memset(UnpOldTable20, 0, ...);
+    //     Inp.addbits(2);
+    //     if (UnpAudioBlock) { UnpChannels = ((BitField>>12) & 3) + 1;
+    //                          Inp.addbits(2); TableSize = MC20*UnpChannels; }
+    //     else TableSize = NC20 + DC20 + RC20;
+    //
+    // This previously consumed a single bit for the audio flag, ignored the
+    // keep-old-table flag entirely, and read the channel count as a separate
+    // 2-bit field rather than out of the peeked word — so the bitstream was
+    // desynchronised from the very first table and no real v20 archive could
+    // decode.
+    const bit_field = try br.peekBits(16);
+    state.audio_block = (bit_field & 0x8000) != 0;
 
+    // 0x4000 clear means "start from a zeroed table" rather than continuing the
+    // delta chain from the previous block.
+    if ((bit_field & 0x4000) == 0) {
+        state.old_table = [_]u8{0} ** OLD_TABLE_SIZE;
+    }
+    br.skipBits(2);
+
+    var table_size: u16 = undefined;
     if (state.audio_block) {
-        // Audio mode
-        const channels_raw = try br.readBits(2);
-        state.audio_channels = @intCast(channels_raw + 1);
-        state.cur_channel = 0;
+        state.audio_channels = @intCast(((bit_field >> 12) & 3) + 1);
+        if (state.cur_channel >= state.audio_channels) state.cur_channel = 0;
+        br.skipBits(2);
+        table_size = @intCast(@as(u32, MC20) * @as(u32, state.audio_channels));
+    } else {
+        // NC20 == MC20 == 298.
+        table_size = MC20 + DC20 + RC20;
+    }
 
-        // Free old audio tables
+    // Step 3: the 20 code-length-alphabet lengths, 4 bits each. Unlike v29,
+    // v20 has NO length-15 escape here.
+    var bc_lengths: [BC20]u8 = undefined;
+    for (0..BC20) |i| {
+        bc_lengths[i] = @intCast(try br.readBits(4));
+    }
+
+    var bc_table = try huffman.makeDecodeTables(&bc_lengths, state.allocator);
+    defer huffman.freeDecodeTable(&bc_table, state.allocator);
+
+    // Step 4: decode the symbol lengths. Values are a 4-bit DELTA against the
+    // previous block's table, which is why old_table must persist.
+    //
+    // v20's escape mapping is its own — do not copy v29's:
+    //     16 -> repeat previous, N = 3  + read(2)
+    //     17 -> zeros,           N = 3  + read(3)
+    //     else (18,19) -> zeros, N = 11 + read(7)
+    var table: [OLD_TABLE_SIZE]u8 = [_]u8{0} ** OLD_TABLE_SIZE;
+    var i: u16 = 0;
+    while (i < table_size) {
+        const sym = try huffman.decodeNumber(br, &bc_table);
+        if (sym < 16) {
+            table[i] = @intCast((sym + state.old_table[i]) & 0x0f);
+            i += 1;
+        } else if (sym == 16) {
+            // "Repeat previous" cannot appear first — nothing to repeat.
+            if (i == 0) return error.InvalidData;
+            var n: u32 = 3 + try br.readBits(2);
+            while (n > 0 and i < table_size) : (n -= 1) {
+                table[i] = table[i - 1];
+                i += 1;
+            }
+        } else {
+            var n: u32 = if (sym == 17)
+                3 + try br.readBits(3)
+            else
+                11 + try br.readBits(7);
+            while (n > 0 and i < table_size) : (n -= 1) {
+                table[i] = 0;
+                i += 1;
+            }
+        }
+    }
+
+    // Step 5: build the decode tables from the lengths just read.
+    if (state.audio_block) {
         for (&state.md) |*t| {
             if (t.valid) huffman.freeDecodeTable(t, state.allocator);
         }
-
-        // Build per-channel audio Huffman tables
         for (0..state.audio_channels) |ch| {
-            var code_lengths: [MC20]u8 = [_]u8{0} ** MC20;
-            // Read 20 code lengths (4 bits each) for the first 20 symbols
-            for (0..BC20) |i| {
-                code_lengths[i] = @intCast(try br.readBits(4));
-            }
-            state.md[ch] = try huffman.makeDecodeTables(code_lengths[0..MC20], state.allocator);
+            const off = ch * MC20;
+            state.md[ch] = try huffman.makeDecodeTables(table[off .. off + MC20], state.allocator);
         }
     } else {
-        // LZ mode
-
-        // Free old tables
         if (state.ld.valid) huffman.freeDecodeTable(&state.ld, state.allocator);
         if (state.dd.valid) huffman.freeDecodeTable(&state.dd, state.allocator);
         if (state.rd.valid) huffman.freeDecodeTable(&state.rd, state.allocator);
-
-        // Read 20 code lengths for the code-length Huffman table (4 bits each)
-        var bc_lengths: [BC20]u8 = undefined;
-        for (0..BC20) |i| {
-            bc_lengths[i] = @intCast(try br.readBits(4));
-        }
-
-        var bc_table = try huffman.makeDecodeTables(&bc_lengths, state.allocator);
-        defer huffman.freeDecodeTable(&bc_table, state.allocator);
-
-        // Now decode the code lengths for the three tables: LD, DD, RD
-        // Total symbols: MC20 + DC20 + RC20 = 298 + 48 + 28 = 374
-        const total_symbols: u16 = MC20 + DC20 + RC20;
-        var all_lengths: [total_symbols]u8 = [_]u8{0} ** total_symbols;
-
-        var i: u16 = 0;
-        while (i < total_symbols) {
-            // If we cannot decode, break out
-            if (br.remainingBits() < 1) break;
-
-            const sym = try huffman.decodeNumber(br, &bc_table);
-
-            if (sym < 16) {
-                // Direct code length
-                all_lengths[i] = @intCast(sym);
-                i += 1;
-            } else if (sym == 16) {
-                // Repeat previous code length 3 + readBits(2) times
-                if (i == 0) return error.InvalidData;
-                const repeat_count: u16 = @intCast(3 + try br.readBits(2));
-                const prev = all_lengths[i - 1];
-                var j: u16 = 0;
-                while (j < repeat_count and i < total_symbols) : (j += 1) {
-                    all_lengths[i] = prev;
-                    i += 1;
-                }
-            } else if (sym == 17) {
-                // Zero run: 3 + readBits(3) zeros
-                const run_count: u16 = @intCast(3 + try br.readBits(3));
-                var j: u16 = 0;
-                while (j < run_count and i < total_symbols) : (j += 1) {
-                    all_lengths[i] = 0;
-                    i += 1;
-                }
-            } else if (sym == 18) {
-                // Long zero run: 11 + readBits(7) zeros
-                const run_count: u16 = @intCast(11 + try br.readBits(7));
-                var j: u16 = 0;
-                while (j < run_count and i < total_symbols) : (j += 1) {
-                    all_lengths[i] = 0;
-                    i += 1;
-                }
-            } else {
-                return error.InvalidData;
-            }
-        }
-
-        // Build the three tables from the concatenated lengths
-        state.ld = try huffman.makeDecodeTables(all_lengths[0..MC20], state.allocator);
-        state.dd = try huffman.makeDecodeTables(all_lengths[MC20 .. MC20 + DC20], state.allocator);
-        state.rd = try huffman.makeDecodeTables(all_lengths[MC20 + DC20 .. MC20 + DC20 + RC20], state.allocator);
+        state.ld = try huffman.makeDecodeTables(table[0..MC20], state.allocator);
+        state.dd = try huffman.makeDecodeTables(table[MC20 .. MC20 + DC20], state.allocator);
+        state.rd = try huffman.makeDecodeTables(table[MC20 + DC20 .. MC20 + DC20 + RC20], state.allocator);
     }
+
+    // These lengths become the delta base for the next block.
+    @memcpy(state.old_table[0..table_size], table[0..table_size]);
 
     state.tables_loaded = true;
 }
@@ -352,8 +424,9 @@ fn decodeLength(br: *BitReader, rd: *const DecodeTable) !u32 {
     const slot = try huffman.decodeNumber(br, rd);
     if (slot >= RC20) return error.InvalidData;
 
-    const base = length_bases[slot];
-    const extra = length_extra_bits[slot];
+    // Rep-distance path: LDecode[n] + 2 + extra.
+    const base = LENGTH_BASES[slot] + LENGTH_REP_BASE;
+    const extra = LENGTH_EXTRA_BITS[slot];
     if (extra > 0) {
         const extra_val = try br.readBits(extra);
         return base + extra_val;
@@ -445,7 +518,22 @@ fn unpackLzBlock(state: *Unpack20State) !void {
             state.prev_distances[0] = dist;
 
             // Read new length from RD table
-            const length = try decodeLength(br, &state.rd);
+            var length = try decodeLength(br, &state.rd);
+
+            // v20's rep path has its OWN three-tier bonus, starting a tier
+            // lower than the new-match path and unlike anything in v29:
+            //   if (Distance>=0x101) { Length++;
+            //     if (Distance>=0x2000) { Length++;
+            //       if (Distance>=0x40000) Length++; } }
+            // It was missing entirely, so every repeated match past 257 bytes
+            // came out short.
+            if (dist >= 0x101) {
+                length += 1;
+                if (dist >= 0x2000) {
+                    length += 1;
+                    if (dist >= 0x40000) length += 1;
+                }
+            }
 
             state.last_distance = dist;
             state.last_length = length;
@@ -454,7 +542,12 @@ fn unpackLzBlock(state: *Unpack20State) !void {
         } else if (sym >= 261 and sym <= 268) {
             // Short-distance 2-byte match
             const short_idx: u32 = sym - 261;
-            const dist = short_distances[short_idx] + 1; // +1 because distance 0 means distance 1
+            // SDDecode[n] + 1, plus SDBits[n] extra bits. The extra bits were
+            // not read at all before, which both used a wrong distance AND left
+            // the bitstream desynchronised for everything after.
+            var dist = SHORT_DISTANCES[short_idx] + 1;
+            const sd_bits = SHORT_DISTANCE_BITS[short_idx];
+            if (sd_bits > 0) dist += try br.readBits(sd_bits);
 
             // Shift previous distances, put new at front
             state.prev_distances[3] = state.prev_distances[2];
@@ -475,9 +568,10 @@ fn unpackLzBlock(state: *Unpack20State) !void {
             const length_slot: u32 = sym - 270;
             if (length_slot >= RC20) return error.InvalidData;
 
-            const length: u32 = blk: {
-                const base = length_bases[length_slot];
-                const extra = length_extra_bits[length_slot];
+            // New-match path: LDecode[n] + 3 + extra.
+            var length: u32 = blk: {
+                const base = LENGTH_BASES[length_slot] + LENGTH_MATCH_BASE;
+                const extra = LENGTH_EXTRA_BITS[length_slot];
                 if (extra > 0) {
                     const extra_val = try br.readBits(extra);
                     break :blk base + extra_val;
@@ -488,6 +582,16 @@ fn unpackLzBlock(state: *Unpack20State) !void {
             // Read distance from DD table
             const dist_sym = try huffman.decodeNumber(br, &state.dd);
             const dist = try distanceDecode(dist_sym, br);
+
+            // Distance-dependent length bonus, missing entirely before. The
+            // encoder cannot emit short matches at large distances, so those
+            // lengths are reused to mean longer matches and the decoder adds
+            // the bonus back (reference: `if (Distance>=0x2000) { Length++;
+            // if (Distance>=0x40000) Length++; }`).
+            if (dist >= 0x2000) {
+                length += 1;
+                if (dist >= 0x40000) length += 1;
+            }
 
             // Shift previous distances
             state.prev_distances[3] = state.prev_distances[2];
@@ -601,30 +705,28 @@ fn bitstreamByteCount(comptime pairs: anytype) usize {
     return (bitstreamBitCount(pairs) + 7) / 8;
 }
 
-test "length base and extra bits tables are consistent" {
-    // Slots 0-7: length = slot + 2, no extra bits
-    for (0..8) |i| {
-        try testing.expectEqual(@as(u32, @intCast(i + 2)), length_bases[i]);
-        try testing.expectEqual(@as(u5, 0), length_extra_bits[i]);
-    }
-
-    // Slot 8: base=10, extra=1 -> lengths 10-11
-    try testing.expectEqual(@as(u32, 10), length_bases[8]);
-    try testing.expectEqual(@as(u5, 1), length_extra_bits[8]);
-
-    // Slot 9: base=12, extra=1 -> lengths 12-13
-    // Wait, let's verify: with 1 extra bit, slot 8 covers 10-11, slot 9 covers 12-13
-    try testing.expectEqual(@as(u32, 12), length_bases[9]);
-    try testing.expectEqual(@as(u5, 1), length_extra_bits[9]);
-
-    // Slot 10: base=14, extra=2 -> lengths 14-17
-    try testing.expectEqual(@as(u32, 14), length_bases[10]);
-    try testing.expectEqual(@as(u5, 2), length_extra_bits[10]);
-
-    // All lengths should be monotonically increasing
-    for (1..RC20) |i| {
-        try testing.expect(length_bases[i] >= length_bases[i - 1]);
-    }
+test "v20 length/short-distance tables match the reference verbatim" {
+	// These assertions used to encode the DERIVED tables (slot+2 bases,
+	// short distances 0,1,2,3,4,8,16,32), so they agreed with the bug and
+	// could never fail. They now assert unrar unpack20.cpp verbatim.
+	const ref_ldecode = [RC20]u32{
+		0,   1,   2,   3,   4,   5,   6,   7,
+		8,   10,  12,  14,  16,  20,  24,  28,
+		32,  40,  48,  56,  64,  80,  96,  112,
+		128, 160, 192, 224,
+	};
+	try testing.expectEqualSlices(u32, &ref_ldecode, &LENGTH_BASES);
+	// LBits groups in FOURS after the first eight zero-width slots.
+	for (8..RC20) |i| {
+		const want: u5 = @intCast((i - 8) / 4 + 1);
+		try testing.expectEqual(want, LENGTH_EXTRA_BITS[i]);
+	}
+	// SDDecode / SDBits.
+	try testing.expectEqualSlices(u32, &[8]u32{ 0, 4, 8, 16, 32, 64, 128, 192 }, &SHORT_DISTANCES);
+	try testing.expectEqualSlices(u5, &[8]u5{ 2, 2, 3, 4, 5, 6, 6, 6 }, &SHORT_DISTANCE_BITS);
+	// DBits saturates at 16 — no formula reproduces that.
+	try testing.expectEqual(@as(u5, 16), DIST_BITS[DC20 - 1]);
+	try testing.expectEqual(@as(u32, 983040), DIST_DECODE[DC20 - 1]);
 }
 
 test "distance decode for small slots (0-3)" {
@@ -670,304 +772,8 @@ test "distance decode for slot 5 (1 extra bit)" {
     try testing.expectEqual(@as(u32, 8), try distanceDecode(5, &br1));
 }
 
-test "readTables in LZ mode builds three tables" {
-    // Construct a bitstream that readTables can parse:
-    // 1) Byte-aligned (we start at position 0, already aligned)
-    // 2) Audio flag = 0 (1 bit)
-    // 3) 20 code lengths for BC table, each 4 bits
-    //    We'll use a simple BC table: all symbols have length 4
-    //    (This gives us a uniform 4-bit Huffman code for the BC symbols 0-15)
-    //    But we actually need codes for symbols 0-19.
-    //    With 20 symbols all at length 5 => 20 codes from a 5-bit space (32 entries).
-    //    Let's be practical: give symbols 0-15 length 4 (that's 16 codes from 16 available at len 4 = exactly full).
-    //    But we need up to symbol 18. Let's make all 20 symbols length 5.
-    //    20 * 5-bit codes from 32 total => valid (20 <= 32).
-    //    Actually for canonical Huffman, not all assignments with identical lengths produce valid prefix codes.
-    //    20 symbols all at length 5 IS valid: the Kraft inequality sum = 20/32 = 0.625 < 1.
-    //    But it's an incomplete code. That's fine, the decoder will still work.
-    //
-    //    Actually let's keep it really simple:
-    //    Give only symbol 0 (code length 0 = direct 0-length code) a length of 1,
-    //    and all others 0.
-    //    Wait, that won't help us encode lengths > 0 for the main tables.
-    //
-    //    Let's try: give all 20 symbols a length of 5. That produces 20 codes.
-    //    Then to build the LD/DD/RD tables, we just need to encode code lengths using
-    //    these 20 symbols.
-    //
-    //    For simplicity, let's encode all 374 symbols as having code length 0
-    //    (i.e., not present). We can do this with symbol 18 (long zero run = 11 + readBits(7)).
-    //
-    //    Actually let's think simpler. Let's use symbol 17 (zero run: 3 + readBits(3))
-    //    and symbol 18 (long zero run: 11 + readBits(7)) to fill all 374 with zeros,
-    //    which will produce invalid tables (valid=false) but that's OK for testing
-    //    that readTables doesn't crash.
-    //
-    //    Better approach: let's give a simple table where a few symbols have non-zero lengths.
 
-    // Let's build a bitstream manually. We want:
-    //   - audio_flag = 0 (1 bit)
-    //   - 20 BC lengths, each 4 bits. Let's give symbol 0 length 1, symbols 17,18 length 2, rest 0.
-    //     Symbol 0 (direct length 0): code = "0" (length 1)
-    //     Symbol 17 (zero run): one of the length-2 codes
-    //     Symbol 18 (long zero run): the other length-2 code
-    //     Canonical codes:
-    //       len 1: first_code = 0 -> sym 0 = 0b0
-    //       len 2: first_code = (0+1)<<1 = 2 -> sym 17 = 0b10, sym 18 = 0b11
-    //   - Then encode the 374 code lengths for LD+DD+RD:
-    //     Use symbol 18 (long zero run) repeatedly to zero-fill, then
-    //     use symbol 0 to set a few lengths to 0.
-    //     Actually symbol 0 = "direct code length 0" means the target symbol has length 0.
-    //     We need at least some non-zero lengths for valid tables.
-    //
-    //     Let's put length 1 for the first two symbols of LD (symbols 0 and 1).
-    //     But our BC table can only represent length values 0-15 via symbols 0-15.
-    //     Symbol 1 (direct code length 1) has BC code length 0 in our table.
-    //     We need to give symbol 1 a non-zero BC code length too.
-    //
-    //     OK, let's redo the BC table:
-    //     Symbol 0: length 2 (for encoding "length 0")
-    //     Symbol 1: length 2 (for encoding "length 1")
-    //     Symbol 18: length 2 (for long zero runs)
-    //     Rest: 0
-    //
-    //     Wait, 3 symbols at length 2 means 3 codes from 4 available (00, 01, 10).
-    //     Canonical:
-    //       len 2: first_code = 0 -> sym 0 = 00, sym 1 = 01, sym 18 = 10
-    //
-    //     Actually canonical ordering is by symbol number, so among the length-2 symbols:
-    //       sym 0 -> code 00
-    //       sym 1 -> code 01
-    //       sym 18 -> code 10
 
-    // BC code lengths (20 entries, 4 bits each):
-    // [0]=2, [1]=2, [2..17]=0, [18]=2, [19]=0
-    // Binary (4 bits each):
-    //   0010 0010 0000 0000 0000 0000 0000 0000 0000 0000 0000 0000 0000 0000 0000 0000 0000 0010 0000
-    // That's: sym0=2(0010), sym1=2(0010), sym2-17=0(0000 x16), sym18=2(0010), sym19=0(0000)
-    // Total: 20 * 4 = 80 bits for BC lengths
-
-    // Then encode the main code lengths (374 total):
-    // We want sym 0 of LD to have length 1, sym 1 of LD to have length 1,
-    // and everything else length 0.
-    //
-    // Encoding:
-    //   BC sym 1 (code 01) -> code_length = 1 for LD sym 0
-    //   BC sym 1 (code 01) -> code_length = 1 for LD sym 1
-    //   BC sym 18 (code 10) + 7 bits for run length -> zeros for the rest
-    //     We need 374 - 2 = 372 zeros.
-    //     sym 18 = 11 + readBits(7) = 11..138 zeros per invocation
-    //     372 = 138 + 138 + 96
-    //     138 = 11 + 127 -> readBits(7) = 127 = 0b1111111
-    //     96 = 11 + 85 -> readBits(7) = 85 = 0b1010101
-
-    // Let me assemble this bitstream:
-    // [audio_flag: 0 (1 bit)]
-    // [20 BC lengths, 4 bits each (80 bits)]
-    // [BC sym 1 = code 01 (2 bits)] -> LD[0] = length 1
-    // [BC sym 1 = code 01 (2 bits)] -> LD[1] = length 1
-    // [BC sym 18 = code 10 (2 bits) + 1111111 (7 bits)] -> 138 zeros
-    // [BC sym 18 = code 10 (2 bits) + 1111111 (7 bits)] -> 138 zeros
-    // [BC sym 18 = code 10 (2 bits) + 1010101 (7 bits)] -> 96 zeros
-    // Total zeros: 138 + 138 + 96 = 372
-
-    var buf: [64]u8 = [_]u8{0} ** 64;
-    var bit_pos: usize = 0;
-
-    // Helper to write bits
-    const writeBits = struct {
-        fn f(buffer: []u8, pos: *usize, value: u32, count: u5) void {
-            var i: u5 = 0;
-            while (i < count) : (i += 1) {
-                const bit_val: u1 = @intCast((value >> @intCast(count - 1 - i)) & 1);
-                const byte_idx = pos.* / 8;
-                const bit_idx: u3 = @intCast(7 - (pos.* % 8));
-                buffer[byte_idx] |= @as(u8, bit_val) << bit_idx;
-                pos.* += 1;
-            }
-        }
-    }.f;
-
-    // Audio flag = 0
-    writeBits(&buf, &bit_pos, 0, 1);
-
-    // BC lengths: sym0=2, sym1=2, sym2-17=0, sym18=2, sym19=0
-    writeBits(&buf, &bit_pos, 2, 4); // sym 0
-    writeBits(&buf, &bit_pos, 2, 4); // sym 1
-    for (0..16) |_| {
-        writeBits(&buf, &bit_pos, 0, 4); // syms 2-17
-    }
-    writeBits(&buf, &bit_pos, 2, 4); // sym 18
-    writeBits(&buf, &bit_pos, 0, 4); // sym 19
-
-    // Encode code lengths for LD/DD/RD tables:
-    // LD[0] = 1: encode BC sym 1 (code 01)
-    writeBits(&buf, &bit_pos, 1, 2);
-    // LD[1] = 1: encode BC sym 1 (code 01)
-    writeBits(&buf, &bit_pos, 1, 2);
-    // 138 zeros: BC sym 18 (code 10) + 127 (7 bits)
-    writeBits(&buf, &bit_pos, 2, 2);
-    writeBits(&buf, &bit_pos, 127, 7);
-    // 138 zeros: BC sym 18 (code 10) + 127 (7 bits)
-    writeBits(&buf, &bit_pos, 2, 2);
-    writeBits(&buf, &bit_pos, 127, 7);
-    // 96 zeros: BC sym 18 (code 10) + 85 (7 bits)
-    writeBits(&buf, &bit_pos, 2, 2);
-    writeBits(&buf, &bit_pos, 85, 7);
-
-    var br = BitReader.init(buf[0 .. (bit_pos + 7) / 8]);
-    var state = Unpack20State.init(testing.allocator, &br, 15, 0) catch unreachable;
-    defer state.deinit();
-
-    try readTables(&state);
-
-    // Verify: tables are loaded and the LD table is valid
-    try testing.expect(state.tables_loaded);
-    try testing.expect(!state.audio_block);
-    try testing.expect(state.ld.valid);
-    // DD and RD tables should have all-zero lengths (valid=false since no symbols)
-    try testing.expect(!state.dd.valid);
-    try testing.expect(!state.rd.valid);
-}
-
-test "readTables detects audio mode" {
-    // Build a minimal bitstream for audio mode:
-    // 1) Audio flag = 1 (1 bit)
-    // 2) Channels = 0 (2 bits, means 1 channel)
-    // 3) 20 code lengths for channel 0's table, each 4 bits
-    //    Give all 20 code lengths as 0 (80 bits of zeros)
-
-    var buf: [16]u8 = [_]u8{0} ** 16;
-    var bit_pos: usize = 0;
-
-    const writeBits = struct {
-        fn f(buffer: []u8, pos: *usize, value: u32, count: u5) void {
-            var i: u5 = 0;
-            while (i < count) : (i += 1) {
-                const bit_val: u1 = @intCast((value >> @intCast(count - 1 - i)) & 1);
-                const byte_idx = pos.* / 8;
-                const bit_idx: u3 = @intCast(7 - (pos.* % 8));
-                buffer[byte_idx] |= @as(u8, bit_val) << bit_idx;
-                pos.* += 1;
-            }
-        }
-    }.f;
-
-    // Audio flag = 1
-    writeBits(&buf, &bit_pos, 1, 1);
-    // Channels = 0 (means 1 channel)
-    writeBits(&buf, &bit_pos, 0, 2);
-    // 20 code lengths of 0 for channel 0 (80 bits of zeros already in buffer)
-    bit_pos += 80;
-
-    var br = BitReader.init(buf[0 .. (bit_pos + 7) / 8]);
-    var state = Unpack20State.init(testing.allocator, &br, 15, 0) catch unreachable;
-    defer state.deinit();
-
-    try readTables(&state);
-
-    try testing.expect(state.tables_loaded);
-    try testing.expect(state.audio_block);
-    try testing.expectEqual(@as(u8, 1), state.audio_channels);
-}
-
-test "literal decoding in LZ mode" {
-    // Build a compressed stream that encodes two literal bytes: 'A' (65) and 'B' (66).
-    // We need:
-    //   1. Tables header (audio_flag=0, BC lengths, then LD/DD/RD code lengths)
-    //   2. Two literal symbols (65, 66) encoded with the LD table
-
-    // Strategy: build a simple LD table where symbols 65 and 66 have short codes.
-    // To keep things manageable, give only symbols 65 and 66 a code length.
-    // sym 65: length 1 (code 0)
-    // sym 66: length 1 -- can't, only one symbol at length 1
-    // sym 65: length 1 (code 0), sym 66: length 2... wait, that doesn't work for 2 symbols.
-    // Two symbols: sym 65 length 1 (code 0), sym 66 length 1 (code 1)
-    // Wait, canonical Huffman with 2 symbols at length 1 = codes 0, 1. That works.
-
-    // BC table: we need to encode code lengths for 374 symbols.
-    // LD[65]=1, LD[66]=1, everything else=0.
-    // BC symbols needed: 0 (for length 0), 1 (for length 1), 18 (for long zero runs)
-    // BC code lengths: [0]=2, [1]=2, [2..17]=0, [18]=2, [19]=0
-
-    var buf: [64]u8 = [_]u8{0} ** 64;
-    var bit_pos: usize = 0;
-
-    const writeBits = struct {
-        fn f(buffer: []u8, pos: *usize, value: u32, count: u5) void {
-            var i: u5 = 0;
-            while (i < count) : (i += 1) {
-                const bit_val: u1 = @intCast((value >> @intCast(count - 1 - i)) & 1);
-                const byte_idx = pos.* / 8;
-                const bit_idx: u3 = @intCast(7 - (pos.* % 8));
-                buffer[byte_idx] |= @as(u8, bit_val) << bit_idx;
-                pos.* += 1;
-            }
-        }
-    }.f;
-
-    // Audio flag = 0
-    writeBits(&buf, &bit_pos, 0, 1);
-
-    // BC lengths: [0]=2, [1]=2, [2-17]=0, [18]=2, [19]=0
-    writeBits(&buf, &bit_pos, 2, 4);
-    writeBits(&buf, &bit_pos, 2, 4);
-    for (0..16) |_| writeBits(&buf, &bit_pos, 0, 4);
-    writeBits(&buf, &bit_pos, 2, 4);
-    writeBits(&buf, &bit_pos, 0, 4);
-
-    // BC canonical codes: sym 0 -> 00, sym 1 -> 01, sym 18 -> 10
-
-    // LD code lengths (298 symbols):
-    // Symbols 0-64: all zero (65 zeros)
-    //   65 = 11 + 54 -> sym 18 (code 10) + 54 (0110110 in 7 bits)
-    writeBits(&buf, &bit_pos, 2, 2); // BC sym 18
-    writeBits(&buf, &bit_pos, 54, 7);
-    // Symbol 65: length 1 -> BC sym 1 (code 01)
-    writeBits(&buf, &bit_pos, 1, 2);
-    // Symbol 66: length 1 -> BC sym 1 (code 01)
-    writeBits(&buf, &bit_pos, 1, 2);
-    // Symbols 67-297: all zero (231 zeros)
-    //   138 = 11 + 127 -> sym 18 + 127
-    writeBits(&buf, &bit_pos, 2, 2);
-    writeBits(&buf, &bit_pos, 127, 7);
-    //   93 = 11 + 82 -> sym 18 + 82
-    writeBits(&buf, &bit_pos, 2, 2);
-    writeBits(&buf, &bit_pos, 82, 7);
-
-    // DD code lengths (48 symbols): all zero
-    //   48 = 11 + 37 -> sym 18 + 37
-    writeBits(&buf, &bit_pos, 2, 2);
-    writeBits(&buf, &bit_pos, 37, 7);
-
-    // RD code lengths (28 symbols): all zero
-    //   28 = 11 + 17 -> sym 18 + 17
-    writeBits(&buf, &bit_pos, 2, 2);
-    writeBits(&buf, &bit_pos, 17, 7);
-
-    // Now encode the data symbols using the LD table:
-    // LD sym 65 has canonical code: at length 1, first_code = 0
-    //   Symbols sorted by length then number: sym 65 and sym 66 both at length 1
-    //   first code of length 1 = 0 -> sym 65 = 0, sym 66 = 1
-    writeBits(&buf, &bit_pos, 0, 1); // literal 'A' (sym 65)
-    writeBits(&buf, &bit_pos, 1, 1); // literal 'B' (sym 66)
-
-    const data_len = (bit_pos + 7) / 8;
-    var br = BitReader.init(buf[0..data_len]);
-    var state = Unpack20State.init(testing.allocator, &br, 15, 2) catch unreachable;
-    defer state.deinit();
-
-    try readTables(&state);
-    try unpackLzBlock(&state);
-
-    try testing.expectEqual(@as(u64, 2), state.written_size);
-
-    // Extract output
-    var output: [2]u8 = undefined;
-    _ = state.window.copyToOutput(&output, 2, 2);
-    try testing.expectEqual(@as(u8, 'A'), output[0]);
-    try testing.expectEqual(@as(u8, 'B'), output[1]);
-}
 
 test "old-distance repeat (symbols 257-260) rotates distances" {
     // Test the distance rotation logic directly
@@ -1004,17 +810,6 @@ test "old-distance repeat (symbols 257-260) rotates distances" {
     try testing.expectEqual(@as(u32, 40), prev_distances[3]);
 }
 
-test "short distance table values" {
-    // Verify the short distance lookup table
-    try testing.expectEqual(@as(u32, 0), short_distances[0]);
-    try testing.expectEqual(@as(u32, 1), short_distances[1]);
-    try testing.expectEqual(@as(u32, 2), short_distances[2]);
-    try testing.expectEqual(@as(u32, 3), short_distances[3]);
-    try testing.expectEqual(@as(u32, 4), short_distances[4]);
-    try testing.expectEqual(@as(u32, 8), short_distances[5]);
-    try testing.expectEqual(@as(u32, 16), short_distances[6]);
-    try testing.expectEqual(@as(u32, 32), short_distances[7]);
-}
 
 test "audio channel predictor basic decode" {
     var ch = AudioChannel{};
@@ -1094,67 +889,25 @@ test "adapt coefficient no change when sign is zero" {
     try testing.expectEqual(@as(i32, 5), k); // d sign is 0, no change
 }
 
-test "full decompression of literal-only stream" {
-    // Build a complete compressed stream that encodes "AB" (two literal bytes)
-    // This exercises the full decompress() -> readTables() -> unpackLzBlock() path.
 
-    var buf: [64]u8 = [_]u8{0} ** 64;
-    var bit_pos: usize = 0;
-
-    const writeBits = struct {
-        fn f(buffer: []u8, pos: *usize, value: u32, count: u5) void {
-            var i: u5 = 0;
-            while (i < count) : (i += 1) {
-                const bit_val: u1 = @intCast((value >> @intCast(count - 1 - i)) & 1);
-                const byte_idx = pos.* / 8;
-                const bit_idx: u3 = @intCast(7 - (pos.* % 8));
-                buffer[byte_idx] |= @as(u8, bit_val) << bit_idx;
-                pos.* += 1;
-            }
-        }
-    }.f;
-
-    // Audio flag = 0
-    writeBits(&buf, &bit_pos, 0, 1);
-
-    // BC lengths: [0]=2, [1]=2, [2-17]=0, [18]=2, [19]=0
-    writeBits(&buf, &bit_pos, 2, 4);
-    writeBits(&buf, &bit_pos, 2, 4);
-    for (0..16) |_| writeBits(&buf, &bit_pos, 0, 4);
-    writeBits(&buf, &bit_pos, 2, 4);
-    writeBits(&buf, &bit_pos, 0, 4);
-
-    // LD code lengths (298 symbols):
-    // [0..64] = 0 (65 zeros via sym 18 + 54)
-    writeBits(&buf, &bit_pos, 2, 2);
-    writeBits(&buf, &bit_pos, 54, 7);
-    // [65] = 1
-    writeBits(&buf, &bit_pos, 1, 2);
-    // [66] = 1
-    writeBits(&buf, &bit_pos, 1, 2);
-    // [67..297] = 0 (231 zeros)
-    writeBits(&buf, &bit_pos, 2, 2);
-    writeBits(&buf, &bit_pos, 127, 7); // 138 zeros
-    writeBits(&buf, &bit_pos, 2, 2);
-    writeBits(&buf, &bit_pos, 82, 7); // 93 zeros
-
-    // DD code lengths: 48 zeros
-    writeBits(&buf, &bit_pos, 2, 2);
-    writeBits(&buf, &bit_pos, 37, 7);
-
-    // RD code lengths: 28 zeros
-    writeBits(&buf, &bit_pos, 2, 2);
-    writeBits(&buf, &bit_pos, 17, 7);
-
-    // Data: sym 65 (code 0, 1 bit) and sym 66 (code 1, 1 bit)
-    writeBits(&buf, &bit_pos, 0, 1); // 'A'
-    writeBits(&buf, &bit_pos, 1, 1); // 'B'
-
-    const data_len = (bit_pos + 7) / 8;
-    const result = try decompress(testing.allocator, buf[0..data_len], 2, 15);
-    defer testing.allocator.free(result);
-
-    try testing.expectEqual(@as(usize, 2), result.len);
-    try testing.expectEqual(@as(u8, 'A'), result[0]);
-    try testing.expectEqual(@as(u8, 'B'), result[1]);
+test "unpack20: real RAR 2.90 store archive decodes byte-identically" {
+    // Real-archive arbiter for v20, replacing four hand-rolled bitstream tests.
+    //
+    // Those tests constructed their own v20 streams from the SAME wrong reading
+    // of the format as the decoder — a single flag bit instead of two, no
+    // keep-old-table flag — so they passed while no real v20 archive could be
+    // decoded, and they would actively have blocked a correct implementation.
+    // The pattern has now recurred often enough in this codebase to be a rule:
+    // a fixture the implementation authored cannot falsify that implementation.
+    //
+    // This fixture comes from the original RAR 2.90 (2001) and `unrar t` reports
+    // it "All OK" (see tests/generate_rar2_fixtures.sh). The archive is
+    // store-method, so it exercises header/CRC handling and the block walk.
+    // COMPRESSED v20 is still a known gap tracked in PLAN.md §4d — its fixtures
+    // live in tests/fixtures/known_gaps/ and moving them up is the acceptance
+    // test for that work.
+    const policy = @import("../policy.zig");
+    const data: []const u8 = @embedFile("rar2_v20_store");
+    const result = policy.validate(data);
+    try std.testing.expect(result.is_valid);
 }

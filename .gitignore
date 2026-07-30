@@ -10,3 +10,6 @@ result
 .DS_Store
 inbox/
 .direnv/
+
+# session handoff docs (skill: handoff)
+HANDOFF*

@@ -7,6 +7,7 @@ const Window = lz.Window;
 const ppm = @import("ppm.zig");
 const PpmModel = ppm.PpmModel;
 const PpmResult = ppm.PpmResult;
+const rarvm = @import("rarvm.zig");
 
 // ============================================================================
 // Constants
@@ -18,6 +19,10 @@ const DC: usize = 60; // Distance slots
 const LDC: usize = 17; // Low distance bits
 const RC: usize = 28; // Repeat length slots
 const BC: usize = 20; // Code-length alphabet (used for reading tables)
+
+/// Upper bound on a RAR3 filter program. The largest standard filter is 216
+/// bytes (AUDIO); the length field can encode more, which we reject as corrupt.
+const MAX_VM_CODE_SIZE: usize = 0x1000;
 
 const TOTAL_CODE_LENGTHS: usize = MC + DC + LDC + RC;
 
@@ -35,6 +40,45 @@ const SHORT_DISTANCES = [8]u32{ 0, 4, 8, 16, 32, 64, 128, 192 };
 
 /// Extra distance bits for symbols 263..270 (reference `SDBits`).
 const SHORT_DISTANCE_BITS = [8]u5{ 2, 2, 3, 4, 5, 6, 6, 6 };
+
+/// How many times a repeated low-distance may be reused (reference
+/// `LOW_DIST_REP_COUNT`, compress.hpp).
+const LOW_DIST_REP_COUNT: u32 = 16;
+
+/// Slot counts per bit-length used to build DDecode/DBits, verbatim from
+/// unrar unpack30.cpp (`DBitLengthCounts`).
+const D_BIT_LENGTH_COUNTS = [_]u32{ 4, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 14, 0, 12 };
+
+/// Distance bases and their extra-bit widths, built exactly as the reference
+/// builds them:
+///     Dist=0; BitLength=0; Slot=0;
+///     for each count: repeat count times { DDecode[Slot]=Dist; DBits[Slot]=BitLength;
+///                                         Slot++; Dist += 1<<BitLength }
+/// (the outer loop increments BitLength each iteration)
+///
+/// Deriving these arithmetically from the slot index — as this file used to —
+/// is the same trap that broke the length tables: the real progression is not a
+/// clean formula, and small payloads never reach the slots where it diverges.
+const DIST_TABLES = blk: {
+    var decode: [DC]u32 = undefined;
+    var bits: [DC]u5 = undefined;
+    var dist: u32 = 0;
+    var bit_length: u5 = 0;
+    var slot: usize = 0;
+    for (D_BIT_LENGTH_COUNTS) |count| {
+        var j: u32 = 0;
+        while (j < count) : (j += 1) {
+            decode[slot] = dist;
+            bits[slot] = bit_length;
+            slot += 1;
+            dist += @as(u32, 1) << bit_length;
+        }
+        bit_length += 1;
+    }
+    break :blk .{ .decode = decode, .bits = bits };
+};
+const DIST_DECODE = DIST_TABLES.decode;
+const DIST_BITS = DIST_TABLES.bits;
 
 // ============================================================================
 // Length Decoding Tables
@@ -119,6 +163,17 @@ pub const Unpack29State = struct {
     /// readTables() calls. A block may also ask to keep it (BitField & 0x4000);
     /// when that bit is clear the table is reset to zero.
     old_table: [TOTAL_CODE_LENGTHS]u8,
+    /// Set when a filter program was recognised as one of the six standard
+    /// filters. Applying it is the next step; today its presence still means
+    /// the output is unfiltered.
+    filter_seen: rarvm.StandardFilter,
+    /// Set when a filter program was NOT one of the six. The transform cannot
+    /// be reproduced at all, so output must be reported unverifiable.
+    unsupported_filter_seen: bool,
+    /// Low-distance repeat state (reference PrevLowDist / LowDistRepCount).
+    /// Reset at each table read, as ReadTables30 does.
+    prev_low_dist: u32,
+    low_dist_rep_count: u32,
     // PPM state
     ppm_model: ?PpmModel,
     allocator: std.mem.Allocator,
@@ -149,6 +204,10 @@ pub const Unpack29State = struct {
             .block_mode = .lz,
             .tables_loaded = false,
             .old_table = [_]u8{0} ** TOTAL_CODE_LENGTHS,
+            .filter_seen = .none,
+            .unsupported_filter_seen = false,
+            .prev_low_dist = 0,
+            .low_dist_rep_count = 0,
             .ppm_model = null,
             .allocator = allocator,
             .mc_allocated = false,
@@ -212,6 +271,10 @@ pub const Unpack29State = struct {
 
         // LZ mode
         self.block_mode = .lz;
+
+        // Reference ReadTables30 clears these when entering an LZ block.
+        self.prev_low_dist = 0;
+        self.low_dist_rep_count = 0;
 
         // 0x4000 clear means "start from a zeroed table" rather than continuing
         // the delta chain from the previous block.
@@ -349,6 +412,43 @@ pub const Unpack29State = struct {
         return true;
     }
 
+    /// Read a filter program from the bitstream (reference: Unpack::ReadVMCode).
+    ///
+    /// Layout: one length byte, whose low 3 bits give (len-1); the escape values
+    /// 7 and 8 introduce an 8-bit or 16-bit length respectively. The program
+    /// bytes follow. RAR guarantees a filter program never crosses a Huffman
+    /// block boundary, so it is always fully present here.
+    ///
+    /// The program is then identified against the six standard filters. Anything
+    /// else cannot be run (modern unrar dropped the general VM interpreter), and
+    /// is recorded so the caller can report the data as unverifiable rather than
+    /// silently emitting unfiltered bytes.
+    fn readVMCode(self: *Self) !void {
+        const first_byte: u32 = try self.br.readBits(8);
+        var length: u32 = (first_byte & 7) + 1;
+        if (length == 7) {
+            length = (try self.br.readBits(8)) + 7;
+        } else if (length == 8) {
+            length = try self.br.readBits(16);
+        }
+        if (length == 0) return Unpack29Error.CorruptData;
+        if (length > MAX_VM_CODE_SIZE) return Unpack29Error.CorruptData;
+
+        var code_buf: [MAX_VM_CODE_SIZE]u8 = undefined;
+        for (0..length) |i| {
+            code_buf[i] = @intCast(try self.br.readBits(8));
+        }
+
+        const filter = rarvm.identifyFilter(code_buf[0..length]);
+        if (filter == .none) {
+            // An unrecognised program. We cannot reproduce its transform, so the
+            // decoded bytes would be wrong in a way no CRC check could localise.
+            self.unsupported_filter_seen = true;
+        } else {
+            self.filter_seen = filter;
+        }
+    }
+
     /// Decode a length from the RC table.
     fn decodeLength(self: *Self) !u32 {
         const slot = huffman.decodeNumber(self.br, &self.rc) catch |err| {
@@ -379,39 +479,50 @@ pub const Unpack29State = struct {
             };
         };
 
-        if (slot < 4) {
-            return slot + 1;
+        if (slot >= DC) return Unpack29Error.CorruptData;
+
+        // Table-driven, matching the reference exactly. The old code derived
+        // base/extra arithmetically from the slot index and omitted the
+        // low-distance repeat machinery entirely; both only bite once distances
+        // grow past slot 9, which small payloads never reach.
+        var distance: u32 = DIST_DECODE[slot] + 1;
+        const bits = DIST_BITS[slot];
+
+        if (bits > 0) {
+            if (slot > 9) {
+                // Wide distance: the high part comes from the bitstream, and
+                // the low 4 bits come from the LDC table — with a repeat
+                // mechanism, because consecutive matches often share them.
+                if (bits > 4) {
+                    const high = try self.br.readBits(bits - 4);
+                    distance += high << 4;
+                }
+                if (self.low_dist_rep_count > 0) {
+                    self.low_dist_rep_count -= 1;
+                    distance += self.prev_low_dist;
+                } else {
+                    const low_dist = huffman.decodeNumber(self.br, &self.ldc) catch |err| {
+                        return switch (err) {
+                            error.EndOfData => Unpack29Error.EndOfData,
+                            error.InvalidTable => Unpack29Error.CorruptData,
+                        };
+                    };
+                    if (low_dist == 16) {
+                        // Symbol 16 means "reuse the previous low distance for
+                        // the next LOW_DIST_REP_COUNT matches".
+                        self.low_dist_rep_count = LOW_DIST_REP_COUNT - 1;
+                        distance += self.prev_low_dist;
+                    } else {
+                        distance += low_dist;
+                        self.prev_low_dist = low_dist;
+                    }
+                }
+            } else {
+                distance += try self.br.readBits(bits);
+            }
         }
 
-        const extra_bits_raw: u32 = (slot / 2) - 1;
-        const extra_shift: u5 = @intCast(extra_bits_raw);
-        const base: u32 = 2 | (@as(u32, slot) & 1);
-        var distance: u32 = base << extra_shift;
-
-        if (extra_bits_raw >= 4) {
-            // High bits from bitstream, low 4 bits from LDC table
-            const high_bits_count: u5 = @intCast(extra_bits_raw - 4);
-            if (high_bits_count > 0) {
-                const high = try self.br.readBits(high_bits_count);
-                distance += high << 4;
-            }
-            const low = huffman.decodeNumber(self.br, &self.ldc) catch |err| {
-                return switch (err) {
-                    error.EndOfData => Unpack29Error.EndOfData,
-
-                    error.InvalidTable => Unpack29Error.CorruptData,
-                };
-            };
-            distance += low;
-        } else {
-            // All extra bits from bitstream
-            if (extra_bits_raw > 0) {
-                const extra = try self.br.readBits(extra_shift);
-                distance += extra;
-            }
-        }
-
-        return distance + 1;
+        return distance;
     }
 
     /// Rotate previous distances: move index to position 0.
@@ -444,19 +555,32 @@ pub const Unpack29State = struct {
         }
 
         if (symbol == 256) {
-            // End of block
-            const continuation = try self.br.readBits(1);
-            if (continuation == 1) {
-                // Read tables for next block
+            // End of Huffman block (reference: Unpack::ReadEndOfBlock).
+            //   "1"  -> no new file; a new table follows right here
+            //   "00" -> new file, no new table
+            //   "01" -> new file, new table at the start of the next file
+            // So the prefix is ONE bit in the first case and TWO in the others.
+            //
+            // This previously consumed exactly one bit in every case and then
+            // returned "stop" unconditionally. Both halves were wrong: the
+            // new-file case left a stray bit and desynchronised the stream, and
+            // the new-table case aborted the file instead of continuing it. A
+            // payload small enough to fit one Huffman block never reaches here,
+            // which is why the tiny fixtures decoded perfectly while larger real
+            // files came apart.
+            const bit_field = try self.br.peekBits(16);
+            if (bit_field & 0x8000 != 0) {
+                self.br.skipBits(1);
                 _ = try self.readTables();
+                return true; // same file continues with the new table
             }
-            // Return false to signal end of current block
-            return false;
+            self.br.skipBits(2);
+            return false; // new file — this one is done
         }
 
         if (symbol == 257) {
-            // VM filter command - not supported
-            return Unpack29Error.UnsupportedFilter;
+            try self.readVMCode();
+            return true;
         }
 
         if (symbol == 258) {
@@ -629,6 +753,19 @@ pub fn decompress(
     defer state.deinit();
 
     try state.decompressLoop(unpacked_size);
+
+    // SAFETY GATE. The stream declared a filter, and we do not apply filters
+    // yet. The LZ output is real, but a filter is a transform over it — handing
+    // it back would be silently wrong data, the single worst outcome for an
+    // integrity tool (see the RAR4 false-green work). Fail loudly instead, so
+    // callers report the entry as unverifiable rather than trusting it.
+    //
+    // Remove this gate only when the filters are actually applied; until then
+    // it is what keeps "we parsed the filter" from being mistaken for
+    // "we honoured the filter".
+    if (state.unsupported_filter_seen or state.filter_seen != .none) {
+        return Unpack29Error.UnsupportedFilter;
+    }
 
     // Copy output from window
     const output = try allocator.alloc(u8, @intCast(unpacked_size));

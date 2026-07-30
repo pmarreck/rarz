@@ -2170,6 +2170,7 @@ comptime {
 	_ = @import("decompress/unpack50.zig");
 	_ = @import("decompress/ppm.zig");
 	_ = @import("decompress/unpack29.zig");
+	_ = @import("decompress/rarvm.zig");
 	_ = @import("decompress/unpack20.zig");
 	_ = @import("decompress/unpack15.zig");
 	_ = @import("decompress/dispatch.zig");

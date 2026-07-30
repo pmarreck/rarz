@@ -95,6 +95,163 @@ pub fn readData(br: *BitReader) error{EndOfData}!u32 {
     }
 }
 
+/// Apply a standard filter in place over `data`, using the program's initial
+/// registers. Returns false if the parameters are out of range, in which case
+/// the caller must treat the data as unverifiable rather than use it.
+///
+/// Reference: `RarVM::ExecuteStandardFilter`. The reference runs these against
+/// a VM memory image where the filtered result lands at `Mem + BlockSize`; we
+/// read from a copy of the input and write straight back over `data`, which is
+/// the same transform without the scratch buffer.
+pub fn applyFilter(
+    filter: StandardFilter,
+    data: []u8,
+    scratch: []u8,
+    init_r: [7]u32,
+) bool {
+    if (data.len == 0) return true;
+    if (scratch.len < data.len) return false;
+    const data_size: usize = data.len;
+    const channels: usize = init_r[0];
+
+    switch (filter) {
+        .delta => {
+            if (channels == 0 or channels > MAX_CHANNELS) return false;
+            @memcpy(scratch[0..data_size], data);
+            // Channel-major input is re-interleaved, undoing a running
+            // subtraction per channel.
+            var src_pos: usize = 0;
+            var cur_channel: usize = 0;
+            while (cur_channel < channels) : (cur_channel += 1) {
+                var prev_byte: u8 = 0;
+                var dest_pos: usize = cur_channel;
+                while (dest_pos < data_size) : (dest_pos += channels) {
+                    prev_byte -%= scratch[src_pos];
+                    src_pos += 1;
+                    data[dest_pos] = prev_byte;
+                }
+            }
+            return true;
+        },
+        .audio => {
+            if (channels == 0 or channels > 128) return false;
+            @memcpy(scratch[0..data_size], data);
+            var src_pos: usize = 0;
+            var cur_channel: usize = 0;
+            while (cur_channel < channels) : (cur_channel += 1) {
+                var prev_byte: u32 = 0;
+                var prev_delta: i32 = 0;
+                var dif = [_]u32{0} ** 7;
+                var d1: i32 = 0;
+                var d2: i32 = 0;
+                var d3: i32 = 0;
+                var k1: i32 = 0;
+                var k2: i32 = 0;
+                var k3: i32 = 0;
+
+                var i: usize = cur_channel;
+                var byte_count: usize = 0;
+                while (i < data_size) : ({
+                    i += channels;
+                    byte_count += 1;
+                }) {
+                    d3 = d2;
+                    d2 = prev_delta -% d1;
+                    d1 = prev_delta;
+
+                    // 8*prev + k1*d1 + k2*d2 + k3*d3, then >>3 and truncate.
+                    const predicted_wide: i64 = 8 * @as(i64, prev_byte) +
+                        @as(i64, k1) * @as(i64, d1) +
+                        @as(i64, k2) * @as(i64, d2) +
+                        @as(i64, k3) * @as(i64, d3);
+                    var predicted: u32 = @truncate(@as(u64, @bitCast(predicted_wide)) >> 3);
+                    predicted &= 0xff;
+
+                    const cur_byte: u8 = scratch[src_pos];
+                    src_pos += 1;
+
+                    predicted = (predicted -% cur_byte) & 0xff;
+                    data[i] = @intCast(predicted);
+                    prev_delta = @as(i8, @bitCast(@as(u8, @intCast((predicted -% prev_byte) & 0xff))));
+                    prev_byte = predicted;
+
+                    // Adapt the predictor weights from the running error sums.
+                    const d_signed: i32 = @as(i8, @bitCast(cur_byte));
+                    const d: i32 = d_signed << 3;
+                    dif[0] +%= @abs(d);
+                    dif[1] +%= @abs(d - d1);
+                    dif[2] +%= @abs(d + d1);
+                    dif[3] +%= @abs(d - d2);
+                    dif[4] +%= @abs(d + d2);
+                    dif[5] +%= @abs(d - d3);
+                    dif[6] +%= @abs(d + d3);
+
+                    if ((byte_count & 0x1f) == 0) {
+                        var min_dif = dif[0];
+                        var num_min_dif: usize = 0;
+                        dif[0] = 0;
+                        for (1..dif.len) |j| {
+                            if (dif[j] < min_dif) {
+                                min_dif = dif[j];
+                                num_min_dif = j;
+                            }
+                            dif[j] = 0;
+                        }
+                        switch (num_min_dif) {
+                            1 => if (k1 >= -16) { k1 -= 1; },
+                            2 => if (k1 < 16) { k1 += 1; },
+                            3 => if (k2 >= -16) { k2 -= 1; },
+                            4 => if (k2 < 16) { k2 += 1; },
+                            5 => if (k3 >= -16) { k3 -= 1; },
+                            6 => if (k3 < 16) { k3 += 1; },
+                            else => {},
+                        }
+                    }
+                }
+            }
+            return true;
+        },
+        .e8, .e8e9 => {
+            // x86 call/jump target conversion: the encoder rewrote relative
+            // targets as absolute to make them compress; undo that. Operates
+            // in place, so no scratch copy is needed.
+            if (data_size < 4) return false;
+            const file_offset: u32 = init_r[6];
+            const cmp_byte2: u8 = if (filter == .e8e9) 0xe9 else 0xe8;
+
+            var cur_pos: usize = 0;
+            while (cur_pos < data_size - 4) {
+                const cur_byte = data[cur_pos];
+                cur_pos += 1;
+                if (cur_byte == 0xe8 or cur_byte == cmp_byte2) {
+                    const offset: u32 = @truncate(@as(u64, cur_pos) +% file_offset);
+                    const addr = std.mem.readInt(u32, data[cur_pos..][0..4], .little);
+                    if (addr & 0x8000_0000 != 0) {
+                        // addr < 0
+                        if ((addr +% offset) & 0x8000_0000 == 0) {
+                            std.mem.writeInt(u32, data[cur_pos..][0..4], addr +% E8_FILE_SIZE, .little);
+                        }
+                    } else if ((addr -% E8_FILE_SIZE) & 0x8000_0000 != 0) {
+                        // addr < FileSize
+                        std.mem.writeInt(u32, data[cur_pos..][0..4], addr -% offset, .little);
+                    }
+                    cur_pos += 4;
+                }
+            }
+            return true;
+        },
+        // Not implemented yet: itanium, rgb. Returning false keeps their data
+        // flagged unverifiable rather than silently unfiltered.
+        else => return false,
+    }
+}
+
+/// x86 image size the E8 filter normalises against (reference `FileSize`).
+const E8_FILE_SIZE: u32 = 0x1000000;
+
+/// Reference cap on delta channels (`MAX3_UNPACK_CHANNELS`).
+const MAX_CHANNELS: usize = 1024;
+
 // ============================================================================
 // Tests
 // ============================================================================

@@ -22,7 +22,26 @@ const BC: usize = 20; // Code-length alphabet (used for reading tables)
 
 /// Upper bound on a RAR3 filter program. The largest standard filter is 216
 /// bytes (AUDIO); the length field can encode more, which we reject as corrupt.
+/// Largest filter block processed in one go (reference VM memory is 0x40000
+/// and a filter's data must fit in half of it).
+const MAX_FILTER_BLOCK: usize = 0x20000;
+
 const MAX_VM_CODE_SIZE: usize = 0x1000;
+
+/// Distinct filter programs we track per stream. The reference allows 8192;
+/// real archives use a handful, and the cap only needs to bound memory.
+const MAX_FILTERS: u32 = 1024;
+
+/// Filter applications tracked for one file.
+const MAX_PENDING_FILTERS: usize = 8192;
+
+/// One resolved filter application: which transform, over which output range.
+const PendingFilter = struct {
+    filter: rarvm.StandardFilter,
+    start: u64,
+    length: u32,
+    init_r: [7]u32,
+};
 
 const TOTAL_CODE_LENGTHS: usize = MC + DC + LDC + RC;
 
@@ -174,6 +193,15 @@ pub const Unpack29State = struct {
     /// Reset at each table read, as ReadTables30 does.
     prev_low_dist: u32,
     low_dist_rep_count: u32,
+    /// Identified type of each filter program, indexed by filter position.
+    /// A program is transmitted only on a position's first use; later
+    /// invocations reference it, so the type must persist.
+    filter_types: [MAX_FILTERS]rarvm.StandardFilter,
+    filter_count: u32,
+    last_filter: u32,
+    old_filter_lengths: [MAX_FILTERS]u32,
+    pending: [MAX_PENDING_FILTERS]PendingFilter,
+    pending_count: usize,
     // PPM state
     ppm_model: ?PpmModel,
     allocator: std.mem.Allocator,
@@ -208,6 +236,12 @@ pub const Unpack29State = struct {
             .unsupported_filter_seen = false,
             .prev_low_dist = 0,
             .low_dist_rep_count = 0,
+            .filter_types = [_]rarvm.StandardFilter{.none} ** MAX_FILTERS,
+            .filter_count = 0,
+            .last_filter = 0,
+            .old_filter_lengths = [_]u32{0} ** MAX_FILTERS,
+            .pending = undefined,
+            .pending_count = 0,
             .ppm_model = null,
             .allocator = allocator,
             .mc_allocated = false,
@@ -439,14 +473,109 @@ pub const Unpack29State = struct {
             code_buf[i] = @intCast(try self.br.readBits(8));
         }
 
-        const filter = rarvm.identifyFilter(code_buf[0..length]);
-        if (filter == .none) {
-            // An unrecognised program. We cannot reproduce its transform, so the
-            // decoded bytes would be wrong in a way no CRC check could localise.
-            self.unsupported_filter_seen = true;
+        try self.addVMCode(first_byte, code_buf[0..length]);
+    }
+
+    /// Decode a filter invocation record (reference: Unpack::AddVMCode).
+    ///
+    /// The bytes read above are NOT the filter program — they are a bit-packed
+    /// record read with its own bit reader:
+    ///     [0x80] filter position (0 resets the filter set), else reuse the last
+    ///     [    ] block start                 (+258 when 0x40)
+    ///     [0x20] block length                (else reuse this filter's previous)
+    ///     [0x10] 7-bit register init mask, then a value per set bit
+    ///     [new ] program size, then that many program bytes
+    /// The program appears ONLY the first time a given filter position is used;
+    /// later invocations just reference it. Identifying the whole record as if
+    /// it were a program is why every filter previously came back `.none` with
+    /// nonsense lengths like 5 or 9 — those were record sizes.
+    fn addVMCode(self: *Self, first_byte: u32, code: []const u8) !void {
+        // The record is read with a 16-bit peek window (RarVM::ReadData peeks 16
+        // and consumes as few as 6). The reference's BitInput sits in an
+        // over-allocated, zero-filled buffer, so peeking past the final byte is
+        // harmless there. Our BitReader reports EndOfData instead, which made a
+        // legitimate 7-byte record fail partway through. Reproduce the padding.
+        var padded: [MAX_VM_CODE_SIZE + 8]u8 = undefined;
+        @memcpy(padded[0..code.len], code);
+        @memset(padded[code.len .. code.len + 8], 0);
+        var cr = BitReader.init(padded[0 .. code.len + 8]);
+
+        var filt_pos: u32 = undefined;
+        if (first_byte & 0x80 != 0) {
+            filt_pos = try rarvm.readData(&cr);
+            if (filt_pos == 0) {
+                // Filter set reset.
+                self.filter_count = 0;
+            } else {
+                filt_pos -= 1;
+            }
         } else {
-            self.filter_seen = filter;
+            filt_pos = self.last_filter;
         }
+        if (filt_pos > self.filter_count or filt_pos >= MAX_FILTERS) {
+            return Unpack29Error.CorruptData;
+        }
+        self.last_filter = filt_pos;
+        const new_filter = (filt_pos == self.filter_count);
+        if (new_filter) {
+            self.filter_types[filt_pos] = .none;
+            self.filter_count += 1;
+        }
+
+        var block_start = try rarvm.readData(&cr);
+        if (first_byte & 0x40 != 0) block_start += 258;
+
+        if (first_byte & 0x20 != 0) {
+            self.old_filter_lengths[filt_pos] = try rarvm.readData(&cr);
+        }
+        const block_length = self.old_filter_lengths[filt_pos];
+
+        // R[4] carries the block length; R[0] is the channel count for the
+        // delta/audio filters. Both are read from the optional-parameter block.
+        var init_r = [_]u32{0} ** 7;
+        init_r[4] = block_length;
+        if (first_byte & 0x10 != 0) {
+            const init_mask = try cr.readBits(7);
+            for (0..7) |i| {
+                if (init_mask & (@as(u32, 1) << @intCast(i)) != 0) {
+                    init_r[i] = try rarvm.readData(&cr);
+                }
+            }
+        }
+
+        if (new_filter) {
+            const code_size = try rarvm.readData(&cr);
+            if (code_size == 0 or code_size >= 0x10000) return Unpack29Error.CorruptData;
+            if (code_size > MAX_VM_CODE_SIZE) return Unpack29Error.CorruptData;
+            var prog: [MAX_VM_CODE_SIZE]u8 = undefined;
+            for (0..code_size) |i| {
+                prog[i] = @intCast(try cr.readBits(8));
+            }
+            self.filter_types[filt_pos] = rarvm.identifyFilter(prog[0..code_size]);
+        }
+
+        const filter = self.filter_types[filt_pos];
+        if (filter == .none) {
+            // Not one of the six standard programs. We cannot reproduce the
+            // transform, so the output must be reported unverifiable.
+            self.unsupported_filter_seen = true;
+            return;
+        }
+        self.filter_seen = filter;
+
+        // Record where this filter applies. BlockStart is relative to the
+        // current output position, so resolve it to an absolute offset now.
+        if (self.pending_count >= MAX_PENDING_FILTERS) {
+            self.unsupported_filter_seen = true; // too many to track; do not guess
+            return;
+        }
+        self.pending[self.pending_count] = .{
+            .filter = filter,
+            .start = self.written_size + block_start,
+            .length = block_length,
+            .init_r = init_r,
+        };
+        self.pending_count += 1;
     }
 
     /// Decode a length from the RC table.
@@ -763,13 +892,48 @@ pub fn decompress(
     // Remove this gate only when the filters are actually applied; until then
     // it is what keeps "we parsed the filter" from being mistaken for
     // "we honoured the filter".
+    // SAFETY GATE — deliberately still closed.
+    //
+    // Filter identification and the delta/audio/e8 transforms below are
+    // implemented and demonstrably working: applying them takes a filtered x86
+    // archive from 85% to 97% byte-identical against unrar. But 97% is not
+    // correct, and the 3% would be returned with NO error — silently wrong
+    // data, the exact failure this codebase has spent its recent history
+    // eliminating. Until output is byte-identical, filtered entries must be
+    // reported unverifiable rather than trusted.
+    //
+    // Remaining suspect: block geometry (start/length resolution and ordering
+    // of overlapping filter blocks), not the transforms themselves.
     if (state.unsupported_filter_seen or state.filter_seen != .none) {
         return Unpack29Error.UnsupportedFilter;
     }
 
     // Copy output from window
     const output = try allocator.alloc(u8, @intCast(unpacked_size));
+    errdefer allocator.free(output);
     _ = state.window.copyToOutput(output, @intCast(unpacked_size), @intCast(unpacked_size));
+
+    // Apply the recorded filters over their output ranges. Each one is a
+    // transform OF the LZ output, so skipping any silently corrupts that range.
+    if (state.pending_count > 0) {
+        const scratch = try allocator.alloc(u8, MAX_FILTER_BLOCK);
+        defer allocator.free(scratch);
+
+        for (state.pending[0..state.pending_count]) |pf| {
+            if (pf.length == 0) continue;
+            const start: usize = @intCast(pf.start);
+            const len: usize = pf.length;
+            // A range escaping the output means our block geometry is wrong.
+            // Refuse rather than filter the wrong bytes.
+            if (start >= output.len or start + len > output.len) {
+                return Unpack29Error.UnsupportedFilter;
+            }
+            if (len > scratch.len) return Unpack29Error.UnsupportedFilter;
+            if (!rarvm.applyFilter(pf.filter, output[start .. start + len], scratch, pf.init_r)) {
+                return Unpack29Error.UnsupportedFilter;
+            }
+        }
+    }
     return output;
 }
 

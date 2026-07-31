@@ -229,15 +229,69 @@ Evidence — `rar2_v20_solid.rar` vs the same content non-solid:
 Files that decode fine when non-solid fail when solid, which is the signature:
 it is not the v20 decoder, it is the missing cross-file continuation.
 
-- [ ] Decide 1.0 scope. Solid is common in the wild (it is how multi-file RAR
-  archives are usually built for ratio), so "unsupported" is a real coverage
-  hole — but it needs the decoder to carry window + table state across entries,
-  which touches the extraction API, not just one decoder.
-- [ ] Until implemented, solid entries must report **could-not-verify**, never a
-  false verdict. Check that a solid archive does not currently produce a
-  confident wrong answer anywhere.
-- [ ] Applies to RAR5 solid as well — verify whether the RAR5 path has the same
-  hole (untested).
+**RAR5 SOLID IS BROKEN TOO** (verified 2026-07-30). This is not a legacy-format
+edge case — it is a live defect on our best-supported format:
+
+| archive | unrar | rarz |
+|---|---|---|
+| RAR2 v20 solid | All OK | **INVALID** |
+| **RAR5 solid** | valid | **INVALID**, 2 of 3 files wrong |
+
+That is a FALSE POSITIVE on valid archives — the same class as the RAR 2.x
+end-block bug fixed in `c9679d9`, and the exact trust failure this project
+exists to prevent. **1.0 ship-blocker.**
+
+#### Design: sequential decode with carried state (Peter's call, 2026-07-31)
+
+Root cause is an API-shape mismatch, not a decoder bug.
+`rarz_extract_to_buffer(handle, index, buf, len)` is index-based RANDOM ACCESS
+with a fresh decoder per call; a solid archive is one continuous stream where
+file N inherits the window and Huffman tables from N-1.
+
+Rejected: decoding files `0..N` on every extraction. Correct but O(n^2) — on the
+9710-file archive that is unusable.
+
+**Chosen: a sequential decode path that carries decoder state across entries.**
+
+Peter's key refinement — *validate never needs the bytes, only the verdict*:
+
+> "since validate is just validating archives and not actually extracting them,
+> only rarz's CLI needs to actually extract; both its Zig functions and its C FFI
+> should permit an option of discarding all output and only returning a
+> validation (or error) data structure. This would also greatly reduce any
+> related memory requirements, since you're simply streaming into the void while
+> watching for errors."
+
+So the sequential path takes a **sink**: either write decoded bytes to a caller
+buffer (CLI extraction) or discard them while still running CRC/BLAKE2sp
+(validation). Consequences worth noting:
+
+- Memory drops from "whole archive + whole decoded file" to "window + a
+  streaming hash". Today `validate()` decompresses whole files into
+  `page_allocator` buffers purely to checksum them and throw them away.
+- This **also answers validate's 2026-07-10 streaming-verification request**
+  (`inbox/2026-07-10-from-validate-archive-streaming-streaming-verifier.md`) —
+  one design satisfies both. Tell them when it lands; they deprioritised it only
+  because it looked separate.
+
+Work items:
+- [ ] Add a stateful/sequential decode entry to `decompress/dispatch.zig` that
+  reuses an existing `Unpack20State`/`Unpack29State` (and the RAR5 equivalent)
+  instead of constructing one per file. The reference gates on the solid flag:
+  `if ((!Solid || !TablesRead3) && !ReadTables20())` — i.e. for a solid entry do
+  NOT re-read tables, and do NOT reset the window.
+- [ ] Add the discard-output sink so validation streams without materialising
+  decoded files; keep CRC32/BLAKE2sp verification intact.
+- [ ] Wire `policy.zig` validation to iterate entries through one shared decoder
+  when the archive is solid.
+- [ ] Wire `root.zig` extraction: CLI extract-all uses the sequential path.
+  Decide what index-based random access does on a solid archive (decode
+  predecessors, or return a distinct "sequential access required" error).
+- [ ] Expose the discard/verify-only option through the C FFI too.
+- [ ] Acceptance: `tests/fixtures/known_gaps/rar2_v20_solid.rar` extracts 7/7
+  byte-identical and validates VALID, then gets promoted into
+  `tests/fixtures/`; plus a RAR5 solid fixture added to the corpus (generate
+  with `rar a -s`, which works with the modern devshell rar).
 
 #### POST-1.0: older-format enhancement track
 - [ ] **v15 (RAR 1.5).** No corpus and no coverage today. RARLAB no longer hosts

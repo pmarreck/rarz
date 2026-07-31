@@ -1,5 +1,6 @@
 const std = @import("std");
-const BitReader = @import("bitreader.zig").BitReader;
+const bitreader = @import("bitreader.zig");
+const BitReader = bitreader.BitReader;
 const huffman = @import("huffman.zig");
 const DecodeTable = huffman.DecodeTable;
 const lz = @import("lz.zig");
@@ -8,6 +9,8 @@ const ppm = @import("ppm.zig");
 const PpmModel = ppm.PpmModel;
 const PpmResult = ppm.PpmResult;
 const rarvm = @import("rarvm.zig");
+const sink = @import("sink.zig");
+const Sink = sink.Sink;
 
 // ============================================================================
 // Constants
@@ -163,7 +166,13 @@ pub const Unpack29Error = error{
 };
 
 pub const Unpack29State = struct {
-    br: *BitReader,
+    /// By value, not by pointer. A solid Session outlives any single file, and
+    /// the reference restarts bit input per entry (`Inp.InitBitInput()` in
+    /// UnpInitData, called for solid entries too). Holding a pointer would mean
+    /// parking a dangling one between files. The address is stable once the
+    /// state is in place, so the PPM model's borrowed `*BitReader` stays valid
+    /// across entries and observes each new entry's stream.
+    br: BitReader,
     window: Window,
     // LZ Huffman tables
     mc: DecodeTable,
@@ -215,11 +224,11 @@ pub const Unpack29State = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
-        br: *BitReader,
+        packed_data: []const u8,
         dict_bits: u5,
     ) !Self {
         return Self{
-            .br = br,
+            .br = BitReader.init(packed_data),
             .window = try Window.initFromBits(allocator, dict_bits),
             .mc = DecodeTable{},
             .dc = DecodeTable{},
@@ -251,7 +260,11 @@ pub const Unpack29State = struct {
         };
     }
 
-    pub fn deinit(self: *Self) void {
+    /// Release the four LZ decode tables, leaving the state ready to rebuild
+    /// them. Separate from `deinit` because a non-solid entry has to discard
+    /// inherited tables (reference: `memset(&BlockTables,0,sizeof(BlockTables))`
+    /// in `UnpInitData`) without tearing down the window or the allocator.
+    pub fn freeTables(self: *Self) void {
         if (self.mc_allocated) {
             huffman.freeDecodeTable(&self.mc, self.allocator);
             self.mc_allocated = false;
@@ -268,6 +281,14 @@ pub const Unpack29State = struct {
             huffman.freeDecodeTable(&self.rc, self.allocator);
             self.rc_allocated = false;
         }
+        self.mc = DecodeTable{};
+        self.dc = DecodeTable{};
+        self.ldc = DecodeTable{};
+        self.rc = DecodeTable{};
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.freeTables();
         if (self.ppm_model) |*m| {
             m.deinit();
             self.ppm_model = null;
@@ -297,7 +318,7 @@ pub const Unpack29State = struct {
             // DecodeInit path.
             self.br.skipBits(1);
             self.block_mode = .ppm_mode;
-            self.ppm_model = PpmModel.init(self.allocator, self.br) catch {
+            self.ppm_model = PpmModel.init(self.allocator, &self.br) catch {
                 return Unpack29Error.UnsupportedPpmMode;
             };
             return false;
@@ -360,7 +381,7 @@ pub const Unpack29State = struct {
         var code_lengths: [TOTAL_CODE_LENGTHS]u8 = [_]u8{0} ** TOTAL_CODE_LENGTHS;
         var i: usize = 0;
         while (i < TOTAL_CODE_LENGTHS) {
-            const sym = huffman.decodeNumber(self.br, &bc_table) catch |err| {
+            const sym = huffman.decodeNumber(&self.br, &bc_table) catch |err| {
                 return switch (err) {
                     error.EndOfData => Unpack29Error.EndOfData,
 
@@ -580,7 +601,7 @@ pub const Unpack29State = struct {
 
     /// Decode a length from the RC table.
     fn decodeLength(self: *Self) !u32 {
-        const slot = huffman.decodeNumber(self.br, &self.rc) catch |err| {
+        const slot = huffman.decodeNumber(&self.br, &self.rc) catch |err| {
             return switch (err) {
                 error.EndOfData => Unpack29Error.EndOfData,
 
@@ -600,7 +621,7 @@ pub const Unpack29State = struct {
 
     /// Decode a distance from the DC + LDC tables.
     fn decodeDistance(self: *Self) !u32 {
-        const slot = huffman.decodeNumber(self.br, &self.dc) catch |err| {
+        const slot = huffman.decodeNumber(&self.br, &self.dc) catch |err| {
             return switch (err) {
                 error.EndOfData => Unpack29Error.EndOfData,
 
@@ -630,7 +651,7 @@ pub const Unpack29State = struct {
                     self.low_dist_rep_count -= 1;
                     distance += self.prev_low_dist;
                 } else {
-                    const low_dist = huffman.decodeNumber(self.br, &self.ldc) catch |err| {
+                    const low_dist = huffman.decodeNumber(&self.br, &self.ldc) catch |err| {
                         return switch (err) {
                             error.EndOfData => Unpack29Error.EndOfData,
                             error.InvalidTable => Unpack29Error.CorruptData,
@@ -668,7 +689,7 @@ pub const Unpack29State = struct {
     /// Process one LZ symbol from the MC table.
     /// Returns true if decoding should continue, false if end of block/file.
     fn processLzSymbol(self: *Self) !bool {
-        const symbol = huffman.decodeNumber(self.br, &self.mc) catch |err| {
+        const symbol = huffman.decodeNumber(&self.br, &self.mc) catch |err| {
             return switch (err) {
                 error.EndOfData => Unpack29Error.EndOfData,
 
@@ -703,7 +724,21 @@ pub const Unpack29State = struct {
                 _ = try self.readTables();
                 return true; // same file continues with the new table
             }
+            // New file. The SECOND bit says whether that next file begins with a
+            // fresh table, and the reference records exactly that for the next
+            // entry to consult:
+            //     TablesRead3 = !NewTable;
+            // (unpack30.cpp, ReadEndOfBlock)
+            //
+            // Dropping it was invisible until solid archives arrived: a
+            // NON-solid entry clears tables_loaded during its own reset, so it
+            // re-reads tables regardless and the lost flag never mattered. A
+            // SOLID entry does not reset — it consults this flag — so leaving it
+            // true made the next entry skip a table read the encoder had
+            // announced, desynchronising the shared stream from its first symbol.
+            const new_table = (bit_field & 0x4000) != 0;
             self.br.skipBits(2);
+            self.tables_loaded = !new_table;
             return false; // new file — this one is done
         }
 
@@ -842,25 +877,53 @@ pub const Unpack29State = struct {
     }
 
     /// Main decompression loop.
+    ///
+    /// Runs to the END-OF-BLOCK MARKER, not to `unpacked_size`. The reference
+    /// has no size test in its loop at all — `Unpack29` decodes until
+    /// `ReadEndOfBlock` reports a new file (or the input runs out), and clips
+    /// against `DestUnpSize` only when WRITING, in `UnpWriteData`.
+    ///
+    /// Stopping at `unpacked_size` looks equivalent and is not, for two reasons
+    /// that only surface in a solid archive:
+    ///
+    ///   1. The marker carries the "next file starts with a new table" bit. Exit
+    ///      before consuming it and the following solid entry inherits a stale
+    ///      answer, skips a table read the encoder announced, and desynchronises
+    ///      from its first symbol.
+    ///   2. A trailing match may run past the declared size. Those bytes are not
+    ///      written to the file, but they ARE in the window, and the next solid
+    ///      entry can match against them.
+    ///
+    /// Symptom before the fix: the first four entries of a six-entry solid v29
+    /// archive decoded with correct CRCs and the fifth died with EndOfData.
     pub fn decompressLoop(self: *Self, unpacked_size: u64) !void {
         // Read initial tables
         if (!self.tables_loaded) {
             _ = try self.readTables();
         }
 
-        while (self.written_size < unpacked_size) {
+        // Termination guard. The encoder emits the marker where the entry ends,
+        // so a legitimate overshoot is at most one match. A stream that keeps
+        // producing well past that is corrupt, and without a bound a crafted
+        // archive could spin here indefinitely.
+        const overshoot_limit = unpacked_size +| self.window.buffer.len;
+
+        while (true) {
             const should_continue = switch (self.block_mode) {
-                .lz => try self.processLzSymbol(),
-                .ppm_mode => try self.processPpmSymbol(),
+                .lz => self.processLzSymbol(),
+                .ppm_mode => self.processPpmSymbol(),
+            } catch |err| {
+                // Input exhausted after the entry's declared bytes were all
+                // produced is a normal end, not truncation.
+                if (self.written_size >= unpacked_size) break;
+                return err;
             };
 
             if (!should_continue) {
-                // End of block or file - if we still have data to decode,
-                // tables were already read for the next block
-                if (self.written_size >= unpacked_size) break;
-                // Continue decoding the next block
-                continue;
+                break; // marker consumed: end of this entry
             }
+
+            if (self.written_size > overshoot_limit) return Unpack29Error.CorruptData;
         }
     }
 };
@@ -869,75 +932,186 @@ pub const Unpack29State = struct {
 // Public Interface
 // ============================================================================
 
+/// A decoder that persists across the entries of a solid archive.
+///
+/// RAR3 solid is the most common solid archive in the wild — it was the default
+/// for the whole RAR 3.x/4.x era. On top of the window and Huffman tables that
+/// v20 carries, v29 also carries the block mode (LZ vs PPM), the PPM model
+/// itself, and the VM filter PROGRAMS: a program is transmitted only on a
+/// filter position's first use, so an entry can invoke one defined by an earlier
+/// entry in the same solid group.
+///
+/// Filter INVOCATIONS, by contrast, are per file. The reference is explicit
+/// about the distinction — `UnpInitData` calls `InitFilters()` unconditionally
+/// with the comment "Filters never share several solid files, so we can safely
+/// reset them even in solid archive", while `InitFilters30` clears the program
+/// table only when `!Solid`.
+pub const Session = struct {
+    state: Unpack29State,
+
+    pub fn init(allocator: std.mem.Allocator, dict_bits: u5) !Session {
+        return .{ .state = try Unpack29State.init(allocator, &.{}, dict_bits) };
+    }
+
+    pub fn deinit(self: *Session) void {
+        self.state.deinit();
+    }
+
+    /// Reference `UnpInitData(false)` + `UnpInitData30(false)` + the `!Solid`
+    /// half of `InitFilters30`.
+    fn resetForNewStream(self: *Session) void {
+        const st = &self.state;
+        st.window.reset();
+        st.prev_distances = [_]u32{ 0, 0, 0, 0 };
+        st.last_distance = 0;
+        st.last_length = 0;
+        st.freeTables();
+        st.tables_loaded = false;
+        st.old_table = [_]u8{0} ** TOTAL_CODE_LENGTHS;
+        st.block_mode = .lz;
+        if (st.ppm_model) |*m| {
+            m.deinit();
+            st.ppm_model = null;
+        }
+        // InitFilters30(!Solid): the filter PROGRAM table.
+        st.filter_types = [_]rarvm.StandardFilter{.none} ** MAX_FILTERS;
+        st.filter_count = 0;
+        st.last_filter = 0;
+        st.old_filter_lengths = [_]u32{0} ** MAX_FILTERS;
+        st.prev_low_dist = 0;
+        st.low_dist_rep_count = 0;
+    }
+
+    /// Decode one archive entry, emitting its bytes to `out`.
+    ///
+    /// The reference gate is `if ((!Solid || !TablesRead3) && !ReadTables30())`:
+    /// a solid entry neither re-reads tables nor resets the window.
+    pub fn decodeFile(
+        self: *Session,
+        packed_data: []const u8,
+        unpacked_size: u64,
+        solid: bool,
+        out: Sink,
+    ) !void {
+        const st = &self.state;
+
+        if (!solid) self.resetForNewStream();
+
+        // Reset every entry, solid or not — see the InitFilters() note above.
+        st.pending_count = 0;
+        st.filter_seen = .none;
+        st.unsupported_filter_seen = false;
+
+        // Padded, unlike the other decoders. v29 ends an entry with an
+        // end-of-block marker that costs a 16-bit PEEK to read but only 1-2 bits
+        // to consume. At the tail of an entry a hard-bounded reader fails that
+        // peek, so the marker — and the "next entry starts a new table" bit it
+        // carries — was never read, and the following solid entry desynchronised.
+        // The reference has the same slack (`ReadBorder = ReadTop - 30`).
+        st.br = BitReader.initPadded(packed_data, bitreader.DEFAULT_PAD_BYTES);
+        st.written_size = 0;
+
+        if (unpacked_size == 0) return;
+
+        const start_pos = st.window.write_pos;
+
+        try st.decompressLoop(unpacked_size);
+
+        // A filter program we could not identify — or one of the six whose
+        // transform is not implemented — means we cannot reproduce the data.
+        // The LZ output is real but incomplete, so returning it would be
+        // silently wrong: the worst outcome for an integrity tool.
+        if (st.unsupported_filter_seen) return Unpack29Error.UnsupportedFilter;
+
+        const out_size: usize = @intCast(@min(st.written_size, unpacked_size));
+        const consumed = st.window.write_pos - start_pos;
+
+        if (st.pending_count == 0) {
+            // No filters: stream straight out of the window, no staging buffer.
+            if (!st.window.emitTo(out, consumed, out_size)) {
+                return Unpack29Error.CorruptData;
+            }
+            return;
+        }
+
+        // Filters rewrite ranges of the decoded output IN PLACE, so those bytes
+        // have to be materialised contiguously before they can be transformed.
+        // This allocation is why the sink cannot avoid buffering here — but it
+        // happens only for entries that actually carry a filter, so the common
+        // unfiltered entry still streams straight out of the window above.
+        const staged = try self.state.allocator.alloc(u8, out_size);
+        defer self.state.allocator.free(staged);
+
+        var staged_sink = sink.BufferSink.init(staged);
+        if (!st.window.emitTo(staged_sink.sink(), consumed, out_size)) {
+            return Unpack29Error.CorruptData;
+        }
+
+        try applyPendingFilters(st, staged, self.state.allocator);
+        out.write(staged);
+    }
+};
+
+/// Apply the entry's recorded filters over their output ranges. Each one is a
+/// transform OF the LZ output, so skipping any silently corrupts that range.
+fn applyPendingFilters(state: *Unpack29State, output: []u8, allocator: std.mem.Allocator) !void {
+    const scratch = try allocator.alloc(u8, MAX_FILTER_BLOCK);
+    defer allocator.free(scratch);
+
+    for (state.pending[0..state.pending_count]) |pf| {
+        if (pf.length == 0) continue;
+        const start: usize = @intCast(pf.start);
+        const len: usize = pf.length;
+        // A range escaping the output means our block geometry is wrong.
+        // Refuse rather than filter the wrong bytes.
+        if (start >= output.len or start + len > output.len) {
+            return Unpack29Error.UnsupportedFilter;
+        }
+        if (len > scratch.len) return Unpack29Error.UnsupportedFilter;
+
+        // R[6] is NOT taken from the record's optional parameters — the
+        // reference overwrites it at execution time:
+        //     void Unpack::ExecuteCode(VM_PreparedProgram *Prg) {
+        //       Prg->InitR[6] = (uint)WrittenFileSize; VM.Execute(Prg); }
+        // ExecuteCode runs once the window has been flushed up to the
+        // block, so WrittenFileSize is the block's byte offset within the
+        // FILE. The E8/E8E9 filter converts call/jump targets between
+        // relative and absolute using exactly that offset, so passing the
+        // record's value (normally 0) mis-relocates every branch it edits.
+        var init_r = pf.init_r;
+        init_r[6] = @truncate(pf.start);
+
+        // Chaining is handled implicitly: consecutive filters sharing a
+        // range operate on this same slice, so a second one sees the
+        // first's output, which is what the reference's PrgStack loop does.
+        if (!rarvm.applyFilter(pf.filter, output[start .. start + len], scratch, init_r)) {
+            return Unpack29Error.UnsupportedFilter;
+        }
+    }
+}
+
 /// Decompress RAR3 (v29) packed data.
 /// Returns the unpacked data as an allocated slice.
+///
+/// A thin wrapper over a single-entry `Session`, so the one-shot and solid paths
+/// cannot drift apart. Every fix to the decode/filter sequence now lands in one
+/// place instead of two copies that agree only by inspection.
 pub fn decompress(
     allocator: std.mem.Allocator,
     packed_data: []const u8,
     unpacked_size: u64,
     dict_bits: u5,
 ) ![]u8 {
-    var br = BitReader.init(packed_data);
-    var state = try Unpack29State.init(allocator, &br, dict_bits);
-    defer state.deinit();
-
-    try state.decompressLoop(unpacked_size);
-
-    // A filter program we could not identify — or one of the six whose
-    // transform is not implemented (itanium, rgb) — means we cannot
-    // reproduce the data. The LZ output is real but incomplete, so
-    // returning it would be silently wrong: the worst outcome for an
-    // integrity tool. Fail loudly so callers report the entry as
-    // unverifiable rather than trusting it.
-    //
-    // Recognised filters ARE applied below and verified byte-identical
-    // to unrar, so this no longer rejects every filtered entry.
-    if (state.unsupported_filter_seen) {
-        return Unpack29Error.UnsupportedFilter;
-    }
-
-    // Copy output from window
     const output = try allocator.alloc(u8, @intCast(unpacked_size));
     errdefer allocator.free(output);
-    _ = state.window.copyToOutput(output, @intCast(unpacked_size), @intCast(unpacked_size));
+    if (unpacked_size == 0) return output;
 
-    // Apply the recorded filters over their output ranges. Each one is a
-    // transform OF the LZ output, so skipping any silently corrupts that range.
-    if (state.pending_count > 0) {
-        const scratch = try allocator.alloc(u8, MAX_FILTER_BLOCK);
-        defer allocator.free(scratch);
+    var session = try Session.init(allocator, dict_bits);
+    defer session.deinit();
 
-        for (state.pending[0..state.pending_count]) |pf| {
-            if (pf.length == 0) continue;
-            const start: usize = @intCast(pf.start);
-            const len: usize = pf.length;
-            // A range escaping the output means our block geometry is wrong.
-            // Refuse rather than filter the wrong bytes.
-            if (start >= output.len or start + len > output.len) {
-                return Unpack29Error.UnsupportedFilter;
-            }
-            if (len > scratch.len) return Unpack29Error.UnsupportedFilter;
+    var bs = sink.BufferSink.init(output);
+    try session.decodeFile(packed_data, unpacked_size, false, bs.sink());
 
-            // R[6] is NOT taken from the record's optional parameters — the
-            // reference overwrites it at execution time:
-            //     void Unpack::ExecuteCode(VM_PreparedProgram *Prg) {
-            //       Prg->InitR[6] = (uint)WrittenFileSize; VM.Execute(Prg); }
-            // ExecuteCode runs once the window has been flushed up to the
-            // block, so WrittenFileSize is the block's byte offset within the
-            // FILE. The E8/E8E9 filter converts call/jump targets between
-            // relative and absolute using exactly that offset, so passing the
-            // record's value (normally 0) mis-relocates every branch it edits.
-            var init_r = pf.init_r;
-            init_r[6] = @truncate(pf.start);
-
-            // Chaining is handled implicitly: consecutive filters sharing a
-            // range operate on this same slice, so a second one sees the
-            // first's output, which is what the reference's PrgStack loop does.
-            if (!rarvm.applyFilter(pf.filter, output[start .. start + len], scratch, init_r)) {
-                return Unpack29Error.UnsupportedFilter;
-            }
-        }
-    }
     return output;
 }
 
@@ -1020,8 +1194,7 @@ test "SHORT_DISTANCES values" {
 
 test "Unpack29State init and deinit" {
     const data = [_]u8{0x00} ** 16;
-    var br = BitReader.init(&data);
-    var state = try Unpack29State.init(testing.allocator, &br, 20);
+    var state = try Unpack29State.init(testing.allocator, &data, 20);
     defer state.deinit();
 
     try testing.expectEqual(@as(u64, 0), state.written_size);
@@ -1033,8 +1206,7 @@ test "Unpack29State init and deinit" {
 
 test "rotatePrevDistances moves index to front" {
     const data = [_]u8{0x00} ** 16;
-    var br = BitReader.init(&data);
-    var state = try Unpack29State.init(testing.allocator, &br, 10);
+    var state = try Unpack29State.init(testing.allocator, &data, 10);
     defer state.deinit();
 
     state.prev_distances = [_]u32{ 10, 20, 30, 40 };
@@ -1049,8 +1221,7 @@ test "rotatePrevDistances moves index to front" {
 
 test "rotatePrevDistances index 0 is no-op" {
     const data = [_]u8{0x00} ** 16;
-    var br = BitReader.init(&data);
-    var state = try Unpack29State.init(testing.allocator, &br, 10);
+    var state = try Unpack29State.init(testing.allocator, &data, 10);
     defer state.deinit();
 
     state.prev_distances = [_]u32{ 10, 20, 30, 40 };
@@ -1063,8 +1234,7 @@ test "rotatePrevDistances index 0 is no-op" {
 
 test "rotatePrevDistances index 3 rotates last to front" {
     const data = [_]u8{0x00} ** 16;
-    var br = BitReader.init(&data);
-    var state = try Unpack29State.init(testing.allocator, &br, 10);
+    var state = try Unpack29State.init(testing.allocator, &data, 10);
     defer state.deinit();
 
     state.prev_distances = [_]u32{ 10, 20, 30, 40 };
@@ -1193,8 +1363,7 @@ test "readTables with LZ mode bit loads tables" {
     //   bit 104 = byte 13 bit 7 = 1
     stream[13] = 0x80;
 
-    var br = BitReader.init(&stream);
-    var state = try Unpack29State.init(testing.allocator, &br, 15);
+    var state = try Unpack29State.init(testing.allocator, &stream, 15);
     defer state.deinit();
 
     // readTables should succeed (LZ mode)
@@ -1269,8 +1438,7 @@ test "readTables with PPM mode bit switches to PPM" {
     // This is getting tedious. The PPM init may fail due to insufficient
     // data or other issues, which is fine for testing the mode switch logic.
 
-    var br = BitReader.init(&stream);
-    var state = try Unpack29State.init(testing.allocator, &br, 15);
+    var state = try Unpack29State.init(testing.allocator, &stream, 15);
     defer state.deinit();
 
     const is_lz = state.readTables() catch {
@@ -1296,8 +1464,7 @@ test "decodeDistance slot 0-3 returns slot+1" {
 
     // Build a state with these tables
     var data_buf: [64]u8 = [_]u8{0} ** 64;
-    var br = BitReader.init(&data_buf);
-    var state = try Unpack29State.init(testing.allocator, &br, 10);
+    var state = try Unpack29State.init(testing.allocator, &data_buf, 10);
     defer state.deinit();
 
     // Manually set up the DC table

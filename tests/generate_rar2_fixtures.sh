@@ -87,16 +87,16 @@ gen() {
 	local dest="$FIXTURES/$out"
 	# Only solid remains unsupported (see PLAN.md 4f); everything else is
 	# verified byte-identical to unrar and belongs in the all-valid gate.
-	case "$out" in rar2_v20_solid.rar) mkdir -p "$FIXTURES/known_gaps"; dest="$FIXTURES/known_gaps/$out" ;; esac
+	# Solid support landed 2026-07-31; every fixture now belongs in the all-valid gate.
 	cp "$work/$out" "$dest"
 	echo "  wrote $dest ($(wc -c < "$dest") bytes)"
 }
 
-# NOTE: only the store archive lands in tests/fixtures/ proper. Interop Gate A
-# treats that directory as "archives rarz must accept", and the COMPRESSED v20
-# archives below cannot be decoded yet (unpack20 is broken on real data — see
-# PLAN.md). They are still generated and committed, under known_gaps/, so the
-# gap is measurable and the fixtures are ready the moment the decoder works.
+# All six land in tests/fixtures/ proper, which Interop Gate A treats as
+# "archives rarz must accept". They did not always: the compressed archives sat
+# in known_gaps/ until unpack20 was fixed (2026-07-30), and the solid one until
+# sequential decoding landed (2026-07-31). Promotion out of known_gaps/ is how
+# this project records that a gap actually closed.
 gen rar2_v20_store.rar   -m0        # store: header/CRC paths, no decoder
 gen rar2_v20_m1.rar      -m1        # fastest compression
 gen rar2_v20_m3.rar      -m3        # default
@@ -110,8 +110,7 @@ gen rar2_v20_solid.rar   -s -m3     # solid: shared window/tables across files
 echo "Verifying with unrar..."
 for f in rar2_v20_store rar2_v20_m1 rar2_v20_m3 rar2_v20_m5 rar2_v20_mm rar2_v20_solid; do
 	if unrar t "$FIXTURES/$f.rar" >/dev/null 2>&1; then
-		p="$FIXTURES/$f.rar"; [ -f "$p" ] || p="$FIXTURES/known_gaps/$f.rar"
-		v=$(unrar lt "$p" 2>&1 | grep -o 'RAR [0-9.]*(v[0-9]*)' | sort -u | tr '\n' ' ')
+		v=$(unrar lt "$FIXTURES/$f.rar" 2>&1 | grep -o 'RAR [0-9.]*(v[0-9]*)' | sort -u | tr '\n' ' ')
 		echo "  OK   $f.rar  ($v)"
 	else
 		die "$f.rar failed unrar verification"

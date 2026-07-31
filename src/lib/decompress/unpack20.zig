@@ -4,6 +4,8 @@ const huffman = @import("huffman.zig");
 const DecodeTable = huffman.DecodeTable;
 const lz = @import("lz.zig");
 const Window = lz.Window;
+const sink = @import("sink.zig");
+const Sink = sink.Sink;
 
 // ============================================================================
 // RAR 2.x Constants
@@ -241,7 +243,11 @@ fn adaptCoefficient(k: *i32, sign_dd: i32, sign_d: i32) void {
 // ============================================================================
 
 const Unpack20State = struct {
-    br: *BitReader,
+    /// By value, not by pointer. A solid Session outlives any single file, and
+    /// the reference restarts bit input per entry (`Inp.InitBitInput()` in
+    /// UnpInitData, called for solid entries too). Holding a pointer would mean
+    /// parking a dangling one between files.
+    br: BitReader,
     window: Window,
     ld: DecodeTable, // main (298 symbols)
     dd: DecodeTable, // distance (48 symbols)
@@ -268,9 +274,9 @@ const Unpack20State = struct {
     audio_state: [MAX_AUDIO_CHANNELS]AudioChannel,
     allocator: std.mem.Allocator,
 
-    fn init(allocator: std.mem.Allocator, br: *BitReader, dict_bits: u5, unpacked_size: u64) !Unpack20State {
+    fn init(allocator: std.mem.Allocator, packed_data: []const u8, dict_bits: u5, unpacked_size: u64) !Unpack20State {
         return .{
-            .br = br,
+            .br = BitReader.init(packed_data),
             .window = try Window.initFromBits(allocator, dict_bits),
             .ld = .{},
             .dd = .{},
@@ -314,7 +320,7 @@ const Unpack20State = struct {
 
 /// Read and build Huffman tables from the bitstream (ReadTables20).
 fn readTables(state: *Unpack20State) !void {
-    const br = state.br;
+    const br = &state.br;
 
     // Step 1: align to a byte boundary.
     br.alignByte();
@@ -465,7 +471,7 @@ fn unpackLoop(state: *Unpack20State) !void {
 }
 
 fn unpackAudioBlock(state: *Unpack20State) !void {
-    const br = state.br;
+    const br = &state.br;
 
     while (state.written_size < state.unpacked_size) {
         if (br.remainingBits() < 1) return error.EndOfData;
@@ -492,7 +498,7 @@ fn unpackAudioBlock(state: *Unpack20State) !void {
 }
 
 fn unpackLzBlock(state: *Unpack20State) !void {
-    const br = state.br;
+    const br = &state.br;
 
     while (state.written_size < state.unpacked_size) {
         if (br.remainingBits() < 1) return error.EndOfData;
@@ -639,6 +645,108 @@ pub const DecompressError = error{
     InvalidTable,
 };
 
+/// A decoder that persists across the entries of a solid archive.
+///
+/// In a solid archive every file is compressed as ONE continuous stream: file N
+/// inherits the LZ window, the Huffman tables and the old-distance ring from
+/// file N-1. Constructing a fresh decoder per file — which is what
+/// `decompress()` does — therefore decodes file 0 correctly and everything after
+/// it against an empty history.
+///
+/// The reset rules follow unrar's `UnpInitData`/`UnpInitData20` exactly; see
+/// `resetForNewStream` for the field-by-field correspondence.
+pub const Session = struct {
+    state: Unpack20State,
+
+    pub fn init(allocator: std.mem.Allocator, dict_bits: u5) DecompressError!Session {
+        return .{
+            .state = Unpack20State.init(allocator, &.{}, dict_bits, 0) catch return error.OutOfMemory,
+        };
+    }
+
+    pub fn deinit(self: *Session) void {
+        self.state.deinit();
+    }
+
+    /// Reference `UnpInitData(false)` + `UnpInitData20(false)`: everything a
+    /// non-solid entry starts over from. A solid entry runs NONE of this, which
+    /// is the whole point.
+    fn resetForNewStream(self: *Session) void {
+        const st = &self.state;
+        st.window.reset();
+        st.old_dist = [_]u32{ 0, 0, 0, 0 };
+        st.old_dist_ptr = 0;
+        st.last_distance = 0;
+        st.last_length = 0;
+        // memset(&BlockTables,0,...) — force a re-read rather than inheriting.
+        st.freeTables();
+        st.ld = .{};
+        st.dd = .{};
+        st.rd = .{};
+        st.md = [_]DecodeTable{.{}} ** MAX_AUDIO_CHANNELS;
+        st.tables_loaded = false;
+        st.audio_block = false;
+        st.audio_channels = 1;
+        st.cur_channel = 0;
+        st.channel_delta = 0;
+        st.audio_state = [_]AudioChannel{.{}} ** MAX_AUDIO_CHANNELS;
+        st.old_table = [_]u8{0} ** OLD_TABLE_SIZE;
+    }
+
+    /// Decode one archive entry, emitting its bytes to `out`.
+    ///
+    /// `solid` is the entry's own solid flag: true means "continue the previous
+    /// entry's stream". The reference gate is
+    /// `if ((!Solid || !TablesRead2) && !ReadTables20())` — a solid entry neither
+    /// re-reads tables nor resets the window.
+    pub fn decodeFile(
+        self: *Session,
+        packed_data: []const u8,
+        unpacked_size: u64,
+        solid: bool,
+        out: Sink,
+    ) DecompressError!void {
+        const st = &self.state;
+
+        if (!solid) self.resetForNewStream();
+
+        // Always restarted, solid or not: each entry has its own packed region.
+        // Reference: `Inp.InitBitInput()` sits outside the `if (!Solid)`.
+        st.br = BitReader.init(packed_data);
+        st.written_size = 0;
+        st.unpacked_size = unpacked_size;
+
+        if (unpacked_size == 0) return;
+
+        // Where this entry's output begins within the continuing window.
+        const start_pos = st.window.write_pos;
+
+        unpackLoop(st) catch |err| {
+            // Producing the declared number of bytes and then running out of
+            // input is success, not truncation.
+            if (st.written_size < st.unpacked_size) {
+                return switch (err) {
+                    error.EndOfData => error.EndOfData,
+                    error.InvalidData => error.InvalidData,
+                    error.InvalidTable => error.InvalidTable,
+                    error.OutOfMemory => error.OutOfMemory,
+                };
+            }
+        };
+
+        const out_size: usize = @intCast(@min(st.written_size, st.unpacked_size));
+        // A trailing match may overshoot the declared size, so measure how far
+        // the cursor actually moved rather than assuming it moved out_size.
+        const consumed = st.window.write_pos - start_pos;
+        if (!st.window.emitTo(out, consumed, out_size)) {
+            // The entry is larger than the window, so its opening bytes have
+            // already been overwritten. Refusing beats handing back the bytes
+            // that occupy those slots now.
+            return error.InvalidData;
+        }
+    }
+};
+
 /// Decompress RAR 2.x (v20/v26) packed data.
 ///
 /// Parameters:
@@ -654,35 +762,17 @@ pub fn decompress(
     unpacked_size: u64,
     dict_bits: u5,
 ) DecompressError![]u8 {
-    if (unpacked_size == 0) {
-        return allocator.alloc(u8, 0) catch return error.OutOfMemory;
-    }
+    const output = allocator.alloc(u8, @intCast(unpacked_size)) catch return error.OutOfMemory;
+    errdefer allocator.free(output);
+    if (unpacked_size == 0) return output;
 
-    var br = BitReader.init(packed_data);
-    var state = Unpack20State.init(allocator, &br, dict_bits, unpacked_size) catch return error.OutOfMemory;
-    defer state.deinit();
+    var session = try Session.init(allocator, dict_bits);
+    defer session.deinit();
 
-    unpackLoop(&state) catch |err| {
-        // If we have written the expected amount, that's success even on EndOfData
-        if (state.written_size >= state.unpacked_size) {
-            // Fall through to output extraction
-        } else {
-            return switch (err) {
-                error.EndOfData => error.EndOfData,
-                error.InvalidData => error.InvalidData,
-                error.InvalidTable => error.InvalidTable,
-                error.OutOfMemory => error.OutOfMemory,
-            };
-        }
-    };
+    var bs = sink.BufferSink.init(output);
+    try session.decodeFile(packed_data, unpacked_size, false, bs.sink());
 
-    // Extract the output from the window
-    const out_size: usize = @intCast(@min(state.written_size, state.unpacked_size));
-    const output = allocator.alloc(u8, out_size) catch return error.OutOfMemory;
-
-    _ = state.window.copyToOutput(output, out_size, out_size);
-
-    return output;
+    return allocator.realloc(output, bs.len) catch output[0..bs.len];
 }
 
 // ============================================================================

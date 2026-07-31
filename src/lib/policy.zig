@@ -5,6 +5,7 @@
 const std = @import("std");
 const detect_mod = @import("detect.zig");
 const dispatch = @import("decompress/dispatch.zig");
+const sink = @import("decompress/sink.zig");
 const integrity = @import("integrity.zig");
 const rar4_headers = @import("rar4_headers.zig");
 const rar5_headers = @import("rar5_headers.zig");
@@ -175,6 +176,11 @@ fn validate_rar4_payload(data: []const u8, sig_offset: usize) ValidationResult {
 	// Now walk again to check payload CRCs for store-method files
 	var iter = rar4_headers.walk_blocks(data[sig_offset..]);
 
+	// One decoder for the whole walk. In a solid archive the entries share a
+	// single continuous stream, so this must outlive any one of them.
+	var solid_session: ?dispatch.SolidSession = null;
+	defer if (solid_session) |*s| s.deinit();
+
 	while (true) {
 		const maybe_block = iter.next() catch break;
 		const block = maybe_block orelse break;
@@ -213,13 +219,14 @@ fn validate_rar4_payload(data: []const u8, sig_offset: usize) ValidationResult {
 					// were reported VALID however damaged they were (0/6 against
 					// the unrar oracle, versus 6/6 for store-method).
 					const alloc = std.heap.page_allocator;
-					const decompressed = dispatch.decompressRar4(
+					const decompressed = decodeEntryRar4(
+						&solid_session,
 						alloc,
 						payload,
 						f.unpacked_size,
 						f.unpack_version,
-						f.method,
 						f.block.flags,
+						fflags.solid,
 					) catch {
 						structural.is_valid = false;
 						structural.error_message = "decompression failed during validation";
@@ -347,6 +354,80 @@ fn validate_rar5_structural(data: []const u8, sig_offset: usize, sig_len: u8) Va
 }
 
 // ============================================================================
+// Sequential decode across entries (solid-archive support)
+// ============================================================================
+
+/// Decode one compressed entry through a decoder that PERSISTS across entries.
+///
+/// Every compressed entry goes through here, solid or not. Routing only solid
+/// entries through the session would not work: the first entry of a solid group
+/// carries solid=false, and if that one were decoded by a throwaway decoder the
+/// shared window would never be built and every later entry would decode against
+/// an empty history — the original bug, just moved.
+///
+/// Passing non-solid entries through costs nothing (a solid=false entry resets
+/// the decoder to exactly the state a fresh one would have) and saves a window
+/// allocation per entry.
+///
+/// The session is rebuilt when an entry needs a different unpack version or a
+/// larger dictionary than the one it was sized for.
+fn decodeEntryRar5(
+    session: *?dispatch.SolidSession,
+    allocator: std.mem.Allocator,
+    packed_data: []const u8,
+    unpacked_size: u64,
+    compression: rar5_headers.CompressionInfo,
+) ![]u8 {
+    if (session.*) |*s| {
+        if (!s.acceptsRar5(compression)) {
+            s.deinit();
+            session.* = null;
+        }
+    }
+    if (session.* == null) {
+        session.* = try dispatch.SolidSession.initRar5(allocator, compression);
+    }
+
+    const output = try allocator.alloc(u8, @intCast(unpacked_size));
+    errdefer allocator.free(output);
+    if (unpacked_size == 0) return output;
+
+    var bs = sink.BufferSink.init(output);
+    try session.*.?.decodeFile(packed_data, unpacked_size, compression.solid, bs.sink());
+    return output;
+}
+
+/// RAR4 counterpart of `decodeEntryRar5`; see that function for why non-solid
+/// entries go through the session too.
+fn decodeEntryRar4(
+    session: *?dispatch.SolidSession,
+    allocator: std.mem.Allocator,
+    packed_data: []const u8,
+    unpacked_size: u64,
+    unpack_version: u8,
+    file_flags_raw: u16,
+    solid: bool,
+) ![]u8 {
+    if (session.*) |*s| {
+        if (!s.acceptsRar4(unpack_version, file_flags_raw)) {
+            s.deinit();
+            session.* = null;
+        }
+    }
+    if (session.* == null) {
+        session.* = try dispatch.SolidSession.initRar4(allocator, unpack_version, file_flags_raw);
+    }
+
+    const output = try allocator.alloc(u8, @intCast(unpacked_size));
+    errdefer allocator.free(output);
+    if (unpacked_size == 0) return output;
+
+    var bs = sink.BufferSink.init(output);
+    try session.*.?.decodeFile(packed_data, unpacked_size, solid, bs.sink());
+    return output;
+}
+
+// ============================================================================
 // RAR5 payload validation (store-method files)
 // ============================================================================
 
@@ -359,6 +440,11 @@ fn validate_rar5_payload(data: []const u8, sig_offset: usize, sig_len: u8) Valid
 	// Walk again to verify payload CRCs for store-method files
 	const block_start = sig_offset + sig_len;
 	var iter = rar5_headers.walk_blocks(data[block_start..]);
+
+	// One decoder for the whole walk. In a solid archive the entries share a
+	// single continuous stream, so this must outlive any one of them.
+	var solid_session: ?dispatch.SolidSession = null;
+	defer if (solid_session) |*s| s.deinit();
 
 	while (true) {
 		const maybe_block = iter.next() catch break;
@@ -447,7 +533,8 @@ fn validate_rar5_payload(data: []const u8, sig_offset: usize, sig_len: u8) Valid
 							const packed_data = data[payload_start..payload_end];
 							const alloc = std.heap.page_allocator;
 
-							const decompressed = dispatch.decompressRar5(
+							const decompressed = decodeEntryRar5(
+								&solid_session,
 								alloc,
 								packed_data,
 								f.unpacked_size,

@@ -5,6 +5,8 @@ const DecodeTable = huffman.DecodeTable;
 const lz = @import("lz.zig");
 const Window = lz.Window;
 const filters = @import("filters.zig");
+const sink = @import("sink.zig");
+const Sink = sink.Sink;
 
 // ============================================================================
 // Constants — RAR5/7 alphabet sizes
@@ -472,8 +474,119 @@ fn decodeBlock(state: *Unpack50State, unpacked_size: u64) !bool {
 // Public Interface
 // ============================================================================
 
+/// A decoder that persists across the entries of a solid archive.
+///
+/// In a solid archive every file is compressed as ONE continuous stream: file N
+/// inherits the LZ window and the Huffman tables from file N-1. Constructing a
+/// fresh decoder per file therefore decodes file 0 correctly and everything
+/// after it against an empty history.
+///
+/// Reset rules follow unrar's `UnpInitData` / `UnpInitData50`; see
+/// `resetForNewStream`.
+pub const Session = struct {
+    state: Unpack50State,
+
+    pub fn init(allocator: std.mem.Allocator, is_rar7: bool, dict_bits: u5) !Session {
+        return .{ .state = try Unpack50State.init(allocator, &.{}, is_rar7, dict_bits) };
+    }
+
+    pub fn deinit(self: *Session) void {
+        self.state.deinit();
+    }
+
+    /// Reference `UnpInitData(false)` + `UnpInitData50(false)`. Note how little
+    /// v50 resets compared to v29: `UnpInitData50` is just `TablesRead5=false`.
+    fn resetForNewStream(self: *Session) void {
+        const st = &self.state;
+        st.window.reset();
+        st.prev_distances = .{ 0, 0, 0, 0 };
+        st.last_length = 0;
+        huffman.freeDecodeTable(&st.ld, st.allocator);
+        huffman.freeDecodeTable(&st.dd, st.allocator);
+        huffman.freeDecodeTable(&st.ldd, st.allocator);
+        huffman.freeDecodeTable(&st.rd, st.allocator);
+        st.ld = .{};
+        st.dd = .{};
+        st.ldd = .{};
+        st.rd = .{};
+        st.tables_loaded = false;
+    }
+
+    /// Decode one archive entry, emitting its bytes to `out`.
+    ///
+    /// `solid` is the entry's own solid flag. A solid entry keeps the window and
+    /// the tables; the reference relies on `TablesRead5` for exactly this
+    /// ("Check TablesRead5 to be sure that we read tables at least once
+    /// regardless of current block header TablePresent flag").
+    pub fn decodeFile(
+        self: *Session,
+        packed_data: []const u8,
+        unpacked_size: u64,
+        solid: bool,
+        out: Sink,
+    ) !void {
+        const st = &self.state;
+
+        if (!solid) self.resetForNewStream();
+
+        // Filters are per file even in a solid archive — reference `UnpInitData`
+        // calls `InitFilters()` outside the `if (!Solid)`, commenting "Filters
+        // never share several solid files".
+        st.pending_filters.clearRetainingCapacity();
+
+        st.br = BitReader.init(packed_data);
+        st.written_size = 0;
+
+        if (unpacked_size == 0) return;
+
+        // Where this entry's output begins within the continuing window.
+        const start_pos = st.window.write_pos;
+
+        var more_blocks = true;
+        while (more_blocks and st.written_size < unpacked_size) {
+            more_blocks = try decodeBlock(st, unpacked_size);
+        }
+
+        // Apply pending filters to the window data in place.
+        // (unrar applies filters during streaming output via UnpWriteBuf; we
+        // apply them once the entry is complete, which is equivalent for entries
+        // that fit the window — the same bound `emitTo` enforces below.)
+        for (st.pending_filters.items) |filter| {
+            if (filter.block_length > 0 and filter.block_start + filter.block_length <= st.window.write_pos) {
+                const start = filter.block_start & st.window.mask;
+                // Only apply if the region doesn't wrap around the circular buffer
+                if (start + filter.block_length <= st.window.buffer.len) {
+                    const region = st.window.buffer[start .. start + filter.block_length];
+                    // E8/E8E9 relocate branch targets using the block's offset
+                    // WITHIN THE FILE. block_start is a window position, and in a
+                    // solid stream the window does not restart per entry, so the
+                    // two differ by everything decoded before this entry. Passing
+                    // the raw window position would mis-relocate every branch —
+                    // the same defect as v29's R[6], which cost 97% -> 100%.
+                    const file_offset = filter.block_start - start_pos;
+                    try filters.applyFilter(region, filter, @intCast(file_offset), st.allocator);
+                }
+            }
+        }
+
+        const out_size: usize = @intCast(@min(unpacked_size, st.written_size));
+        // A trailing match may overshoot the declared size, so measure how far
+        // the cursor actually moved rather than assuming it moved out_size.
+        const consumed = st.window.write_pos - start_pos;
+        if (!st.window.emitTo(out, consumed, out_size)) {
+            // The entry is larger than the window, so its opening bytes have
+            // already been overwritten. Refusing beats handing back the bytes
+            // that occupy those slots now.
+            return error.CorruptData;
+        }
+    }
+};
+
 /// Decompress RAR5/7 compressed data.
 /// Returns decompressed bytes allocated from the provided allocator.
+///
+/// A thin wrapper over a single-entry `Session`, so the one-shot and solid paths
+/// cannot drift apart.
 pub fn decompress(
     allocator: std.mem.Allocator,
     packed_data: []const u8,
@@ -483,37 +596,21 @@ pub fn decompress(
 ) ![]u8 {
     const is_rar7 = (algo_version == 70);
 
-    var state = try Unpack50State.init(allocator, packed_data, is_rar7, dict_bits);
-    defer state.deinit();
+    const output = try allocator.alloc(u8, @intCast(unpacked_size));
+    errdefer allocator.free(output);
+    if (unpacked_size == 0) return output;
 
-    // Decode blocks until done
-    var more_blocks = true;
-    while (more_blocks and state.written_size < unpacked_size) {
-        more_blocks = try decodeBlock(&state, unpacked_size);
+    var session = try Session.init(allocator, is_rar7, dict_bits);
+    defer session.deinit();
+
+    var bs = sink.BufferSink.init(output);
+    try session.decodeFile(packed_data, unpacked_size, false, bs.sink());
+
+    // The declared size is an upper bound; a short entry legitimately produces
+    // fewer bytes, and callers compare against what they actually got.
+    if (bs.len < output.len) {
+        return allocator.realloc(output, bs.len) catch output[0..bs.len];
     }
-    // Apply any pending filters to the window data.
-    // (Note: unrar applies filters during streaming output via UnpWriteBuf.
-    // We apply them at the end on the window — equivalent for files <= window size,
-    // which covers all current consumers.)
-    for (state.pending_filters.items) |filter| {
-        if (filter.block_length > 0 and filter.block_start + filter.block_length <= state.window.write_pos) {
-            const start = filter.block_start & state.window.mask;
-            // Only apply if the region doesn't wrap around the circular buffer
-            if (start + filter.block_length <= state.window.buffer.len) {
-                const region = state.window.buffer[start .. start + filter.block_length];
-                try filters.applyFilter(region, filter, @intCast(filter.block_start), allocator);
-            }
-        }
-    }
-
-    // Copy decompressed data from the window.
-    // Use write_pos as start_offset (not out_size) because the last match may
-    // overshoot unpacked_size, making write_pos > written_size. We always want
-    // to read from the beginning of the window (position 0).
-    const out_size: usize = @intCast(@min(unpacked_size, state.written_size));
-    const output = try allocator.alloc(u8, out_size);
-    _ = state.window.copyToOutput(output, state.window.write_pos, out_size);
-
     return output;
 }
 

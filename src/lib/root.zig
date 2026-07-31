@@ -23,6 +23,7 @@ pub const reader = @import("reader.zig");
 pub const policy = @import("policy.zig");
 pub const writer = @import("writer.zig");
 pub const dispatch = @import("decompress/dispatch.zig");
+const sink = @import("decompress/sink.zig");
 
 // ============================================================================
 // Multi-volume types
@@ -68,9 +69,33 @@ const ArchiveHandle = struct {
 	unified_files: ?[]UnifiedFile,
 	arena: std.heap.ArenaAllocator,
 
+	/// Decoder carried across entries, for solid archives.
+	///
+	/// `rarz_extract_to_buffer` is index-based random access, which is the wrong
+	/// shape for a solid archive: every entry is one slice of a single
+	/// continuous stream, so entry N needs the window and tables entry N-1 left
+	/// behind. Caching the decoder here — together with the index it is
+	/// positioned at — turns the CLI's front-to-back extraction into ONE pass,
+	/// while an out-of-order request still gets a correct answer by replaying
+	/// the predecessors it missed.
+	///
+	/// This keeps the FFI signature unchanged, which matters: the C CLI is the
+	/// dogfooding consumer, and a solid archive should not need a different API.
+	solid_session: ?dispatch.SolidSession,
+	/// Entry index `solid_session` is ready to decode next. A request for any
+	/// other index means the session must be rewound and replayed.
+	solid_next_index: u32,
+
 	fn deinit(self: *ArchiveHandle) void {
+		if (self.solid_session) |*s| s.deinit();
 		self.arena.deinit();
 		std.heap.page_allocator.destroy(self);
+	}
+
+	fn resetSolidSession(self: *ArchiveHandle) void {
+		if (self.solid_session) |*s| s.deinit();
+		self.solid_session = null;
+		self.solid_next_index = 0;
 	}
 
 	fn fileCount(self: *const ArchiveHandle) u32 {
@@ -166,6 +191,8 @@ export fn rarz_open(data_ptr: ?[*]const u8, len: usize) ?*ArchiveHandle {
 		.volumes = null,
 		.unified_files = null,
 		.arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+		.solid_session = null,
+		.solid_next_index = 0,
 	};
 
 	const alloc = handle.arena.allocator();
@@ -577,19 +604,19 @@ export fn rarz_extract_to_buffer(
 			setLastError("output buffer too small");
 			return -2;
 		}
-		const decompressed = dispatch.decompressRar5(
-			std.heap.page_allocator,
-			packed_data,
-			f.unpacked_size,
-			f.compression,
-		) catch {
-			setLastError("decompression failed");
+
+		// See the RAR4 path for why this cast is sound: the cache is a memo on a
+		// heap-allocated handle that is only *declared* const across the FFI.
+		const mut5: *ArchiveHandle = @constCast(a);
+		const written5 = extractRar5Entry(mut5, files, index, buf[0..out_len]) catch |err| {
+			setLastError(switch (err) {
+				error.OutOfMemory => "out of memory",
+				else => "decompression failed",
+			});
 			return -3;
 		};
-		defer std.heap.page_allocator.free(decompressed);
-		@memcpy(buf[0..decompressed.len], decompressed);
 		clearLastError();
-		return @intCast(decompressed.len);
+		return @intCast(written5);
 	}
 
 	if (a.rar4_files) |files| {
@@ -623,25 +650,186 @@ export fn rarz_extract_to_buffer(
 			setLastError("output buffer too small");
 			return -2;
 		}
-		const decompressed = dispatch.decompressRar4(
-			std.heap.page_allocator,
-			packed_data,
-			f.unpacked_size,
-			f.unpack_version,
-			f.method,
-			f.block.flags,
-		) catch {
-			setLastError("decompression failed");
+
+		// The solid decoder cache is a MEMO: it changes how fast the next
+		// extraction runs, never what any call returns. The handle is
+		// heap-allocated by rarz_archive_open and only *declared* const across
+		// the FFI, so this is not a write to genuinely-const storage. Casting
+		// here keeps `const rarz_archive *` in the published header intact —
+		// solid support should not force every C caller to change.
+		const mut: *ArchiveHandle = @constCast(a);
+		const written = extractRar4Entry(mut, files, index, buf[0..out_len]) catch |err| {
+			setLastError(switch (err) {
+				error.OutOfMemory => "out of memory",
+				error.UnsupportedFilter => "entry uses an unsupported filter; contents cannot be verified",
+				else => "decompression failed",
+			});
 			return -3;
 		};
-		defer std.heap.page_allocator.free(decompressed);
-		@memcpy(buf[0..decompressed.len], decompressed);
 		clearLastError();
-		return @intCast(decompressed.len);
+		return @intCast(written);
 	}
 
 	setLastError("file index out of range");
 	return -1;
+}
+
+/// Byte range of a RAR5 entry's packed payload within the archive buffer.
+fn rar5PayloadRange(a: *ArchiveHandle, f: rar5_headers.FileBlock) ?struct { start: usize, end: usize } {
+	const data_size = f.header.data_size orelse return null;
+	const start = a.block_data_offset + f.header.header_start + 4 + f.header.crc_data_len;
+	const end = start + @as(usize, @intCast(data_size));
+	if (end > a.data.len) return null;
+	return .{ .start = start, .end = end };
+}
+
+/// RAR5 counterpart of `extractRar4Entry`; see that function for the caching and
+/// replay rationale.
+fn extractRar5Entry(
+	a: *ArchiveHandle,
+	files: []rar5_headers.FileBlock,
+	index: u32,
+	buf: []u8,
+) !usize {
+	const alloc = std.heap.page_allocator;
+	const target = files[index];
+
+	var usable = a.solid_next_index == index;
+	if (usable) {
+		if (a.solid_session) |*s| {
+			usable = s.acceptsRar5(target.compression);
+		} else {
+			usable = false;
+		}
+	}
+	if (!usable) {
+		a.resetSolidSession();
+		a.solid_session = try dispatch.SolidSession.initRar5(alloc, target.compression);
+
+		var run_start: u32 = index;
+		while (run_start > 0 and files[run_start].compression.solid) {
+			run_start -= 1;
+		}
+
+		var i = run_start;
+		while (i < index) : (i += 1) {
+			const pred = files[i];
+			// Store-method entries bypass the unpacker and contribute nothing to
+			// the window, so they are not replayed.
+			if (pred.compression.method == 0) continue;
+			const range = rar5PayloadRange(a, pred) orelse return error.CorruptData;
+			var discard = sink.DiscardSink{};
+			try a.solid_session.?.decodeFile(
+				a.data[range.start..range.end],
+				pred.unpacked_size,
+				pred.compression.solid,
+				discard.sink(),
+			);
+		}
+		a.solid_next_index = index;
+	}
+
+	const range = rar5PayloadRange(a, target) orelse return error.CorruptData;
+	var bs = sink.BufferSink.init(buf[0..@intCast(target.unpacked_size)]);
+	a.solid_session.?.decodeFile(
+		a.data[range.start..range.end],
+		target.unpacked_size,
+		target.compression.solid,
+		bs.sink(),
+	) catch |err| {
+		// The session's position is now unknown, so it must not be reused.
+		a.resetSolidSession();
+		return err;
+	};
+	a.solid_next_index = index + 1;
+	return bs.len;
+}
+
+/// Byte range of a RAR4 entry's packed payload within the archive buffer.
+fn rar4PayloadRange(a: *ArchiveHandle, f: rar4_headers.FileHeader) ?struct { start: usize, end: usize } {
+	const start = a.block_data_offset + f.block.header_offset + f.block.head_size;
+	const end = start + @as(usize, @intCast(f.packed_size));
+	if (end > a.data.len) return null;
+	return .{ .start = start, .end = end };
+}
+
+/// Extract one compressed RAR4 entry, replaying solid predecessors when needed.
+///
+/// The cached session makes the common case — the CLI walking entries 0,1,2,… —
+/// a single pass over the stream. An out-of-order request rewinds to the start
+/// of the solid run and replays the entries in between into a DiscardSink: their
+/// bytes are wanted only for the window they leave behind.
+///
+/// Replaying from index 0 on every call would also be correct but O(n^2); on an
+/// archive of thousands of entries that is the difference between usable and not.
+fn extractRar4Entry(
+	a: *ArchiveHandle,
+	files: []rar4_headers.FileHeader,
+	index: u32,
+	buf: []u8,
+) !usize {
+	const alloc = std.heap.page_allocator;
+	const target = files[index];
+
+	// Rewind when the cached decoder is not positioned here, or cannot serve
+	// this entry's format/dictionary.
+	var usable = a.solid_next_index == index;
+	if (usable) {
+		if (a.solid_session) |*s| {
+			usable = s.acceptsRar4(target.unpack_version, target.block.flags);
+		} else {
+			usable = false;
+		}
+	}
+	if (!usable) {
+		a.resetSolidSession();
+		a.solid_session = try dispatch.SolidSession.initRar4(
+			alloc,
+			target.unpack_version,
+			target.block.flags,
+		);
+
+		// Replay from the start of this entry's solid run. Walking back to the
+		// nearest non-solid entry — rather than to index 0 — keeps a
+		// multi-group archive from re-decoding groups it does not need.
+		var run_start: u32 = index;
+		while (run_start > 0 and rar4_headers.parse_file_flags(files[run_start].block.flags).solid) {
+			run_start -= 1;
+		}
+
+		var i = run_start;
+		while (i < index) : (i += 1) {
+			const pred = files[i];
+			// Store-method entries bypass the unpacker entirely and contribute
+			// nothing to the window, exactly as the reference does
+			// (`if (Method==0) UnstoreFile(...)`), so they are not replayed.
+			if (pred.method == 0 or pred.packed_size == 0) continue;
+			const range = rar4PayloadRange(a, pred) orelse return error.CorruptData;
+			var discard = sink.DiscardSink{};
+			try a.solid_session.?.decodeFile(
+				a.data[range.start..range.end],
+				pred.unpacked_size,
+				rar4_headers.parse_file_flags(pred.block.flags).solid,
+				discard.sink(),
+			);
+		}
+		a.solid_next_index = index;
+	}
+
+	const range = rar4PayloadRange(a, target) orelse return error.CorruptData;
+	var bs = sink.BufferSink.init(buf[0..@intCast(target.unpacked_size)]);
+	a.solid_session.?.decodeFile(
+		a.data[range.start..range.end],
+		target.unpacked_size,
+		rar4_headers.parse_file_flags(target.block.flags).solid,
+		bs.sink(),
+	) catch |err| {
+		// The session's position is now unknown, so it must not be reused.
+		a.resetSolidSession();
+		return err;
+	};
+	a.solid_next_index = index + 1;
+	return bs.len;
 }
 
 /// C-compatible file entry struct for archive creation (input).
@@ -1112,6 +1300,8 @@ export fn rarz_open_volumes(
 		.volumes = null,
 		.unified_files = null,
 		.arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+		.solid_session = null,
+		.solid_next_index = 0,
 	};
 
 	const alloc = handle.arena.allocator();
@@ -2166,6 +2356,7 @@ comptime {
 	_ = @import("decompress/bitreader.zig");
 	_ = @import("decompress/huffman.zig");
 	_ = @import("decompress/lz.zig");
+	_ = @import("decompress/sink.zig");
 	_ = @import("decompress/filters.zig");
 	_ = @import("decompress/unpack50.zig");
 	_ = @import("decompress/ppm.zig");

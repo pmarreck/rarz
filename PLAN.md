@@ -286,6 +286,36 @@ oracle). Both fixtures test "All OK" under unrar:
 the wrong bytes — a size check would bless it. That is the confidently-wrong
 outcome, not merely a refusal.
 
+**RESOLVED 2026-07-31 15:00 EDT.** All three solid fixtures extract
+byte-identically to unrar and validate VALID; all three promoted out of
+`known_gaps/`, which is now empty. Full-corpus differential: **27 archives,
+107 files, 0 mismatches**. Corruption gate: **36/36 mutations detected, 0
+blessed-while-damaged, 0 over-strict**.
+
+Three defects had to be fixed, only the first of which was the expected one:
+
+1. **API shape (the known one).** A persistent `SolidSession` per format, plus a
+   decoder cache on the archive handle keyed by *next expected index*. Sequential
+   extraction (what the CLI does) is one pass; an out-of-order request replays
+   predecessors into a `DiscardSink`. The FFI signature is unchanged — the cache
+   is a memo, reached via `@constCast` on a handle that is only *declared* const.
+2. **v29 dropped `TablesRead3`.** `ReadEndOfBlock`'s second bit says whether the
+   NEXT entry starts with a fresh table; the reference records `TablesRead3 =
+   !NewTable`. We discarded it. Invisible without solid archives, because a
+   non-solid entry clears the flag during its own reset and re-reads regardless.
+3. **The end-of-block marker was unreachable.** It costs a 16-bit PEEK to read
+   and 1-2 bits to consume, so at an entry's tail our hard-bounded BitReader
+   failed the peek and the marker — carrying defect 2's bit — was never seen.
+   The reference has 30 bytes of slack (`ReadBorder = ReadTop - 30`); we now have
+   opt-in padding, used by v29 only so truncation detection elsewhere is
+   untouched. Relatedly, `decompressLoop` now runs to the marker rather than to
+   `unpacked_size`, matching the reference, which has no size test in its loop at
+   all and clips only when writing.
+
+Only defect 1 was in the design. 2 and 3 were latent decoder bugs that solid
+archives were simply the first thing to expose — more evidence for the rule that
+a fixture the implementation authored cannot falsify that implementation.
+
 Work items:
 - [x] **RAR5 solid fixture built** — `tests/generate_rar5_solid_fixture.sh` →
   `tests/fixtures/rar5_solid.rar`. Additive and idempotent, unlike
@@ -296,20 +326,45 @@ Work items:
   resets, so it could not falsify the bug. Generator asserts the archive really
   is solid — `rar a -s` silently emits a NON-solid archive when there is nothing
   to share. (2026-07-31 EDT)
-- [ ] Add a stateful/sequential decode entry to `decompress/dispatch.zig` that
+- [x] Add a stateful/sequential decode entry to `decompress/dispatch.zig` that
   reuses an existing `Unpack20State`/`Unpack29State` (and the RAR5 equivalent)
   instead of constructing one per file. The reference gates on the solid flag:
   `if ((!Solid || !TablesRead3) && !ReadTables20())` — i.e. for a solid entry do
   NOT re-read tables, and do NOT reset the window.
-- [ ] Add the discard-output sink so validation streams without materialising
+- [x] Add the discard-output sink (`decompress/sink.zig`: Sink/BufferSink/DiscardSink,
+  plus `Window.emitTo`). Used today by solid replay and extraction; wiring
+  VALIDATION to hash straight from the window still needs incremental CRC32 +
+  BLAKE2sp, tracked in 4g below. Was: streams without materialising
   decoded files; keep CRC32/BLAKE2sp verification intact.
-- [ ] Wire `policy.zig` validation to iterate entries through one shared decoder
+- [x] Wire `policy.zig` validation to iterate entries through one shared decoder
   when the archive is solid.
-- [ ] Wire `root.zig` extraction: CLI extract-all uses the sequential path.
+- [x] Wire `root.zig` extraction: CLI extract-all uses the sequential path.
   Decide what index-based random access does on a solid archive (decode
   predecessors, or return a distinct "sequential access required" error).
-- [ ] Expose the discard/verify-only option through the C FFI too.
-- [ ] Acceptance: `tests/fixtures/known_gaps/rar2_v20_solid.rar` extracts 7/7
+- [ ] Expose the discard/verify-only option through the C FFI too. (Deferred
+  with 4g — the Zig-side sink exists, but there is nothing worth exposing until
+  validation actually streams.)
+
+#### 4g. Remaining from the solid design: streaming verification
+
+The sink plumbing landed; the memory win did not. `policy.zig` still allocates a
+buffer per compressed entry, because `integrity.crc32` and `integrity.blake2sp`
+are both one-shot over a contiguous slice, and the window hands out its bytes as
+one or TWO spans (the buffer is circular). Closing this is what turns the sink
+from an internal convenience into the thing Peter actually asked for — "streaming
+into the void while watching for errors" — and it is also the answer to
+validate's 2026-07-10 streaming request.
+
+- [ ] Incremental `crc32(seed, bytes)` — trivial, the polynomial state IS the
+  seed.
+- [ ] Incremental BLAKE2sp — needs a 512-byte staging buffer to keep the 8-way
+  round-robin leaf distribution intact across `update` calls.
+- [ ] `VerifySink` combining both; point `policy.zig` at it so validation never
+  materialises a decoded entry. Memory drops from "whole archive + whole decoded
+  file" to "window + hash state".
+- [ ] Then expose verify-only through the C FFI, and tell
+  `validate-archive-streaming` it landed (see §5).
+- [x] Acceptance: `tests/fixtures/known_gaps/rar2_v20_solid.rar` extracts 7/7
   byte-identical and validates VALID, then gets promoted into
   `tests/fixtures/`; plus a RAR5 solid fixture added to the corpus (generate
   with `rar a -s`, which works with the modern devshell rar).

@@ -1,4 +1,5 @@
 const std = @import("std");
+const Sink = @import("sink.zig").Sink;
 
 pub const Window = struct {
     buffer: []u8,
@@ -25,6 +26,19 @@ pub const Window = struct {
     pub fn initFromBits(allocator: std.mem.Allocator, dict_bits: u5) !Window {
         const dict_size: usize = @as(usize, 1) << dict_bits;
         return init(allocator, dict_size);
+    }
+
+    /// Rewind the window for a new, non-solid file, reusing the allocation.
+    ///
+    /// Deliberately does NOT re-zero the buffer. The reference does the same —
+    /// `memset(Window,0,MaxWinSize)` sits commented out in unrar's
+    /// `UnpInitData` — because `copyMatch` already refuses any distance greater
+    /// than `total_written`, so no stale byte from the previous file is
+    /// reachable. Zeroing would cost a full window memset per entry, which on an
+    /// archive of thousands of small files dwarfs the decoding itself.
+    pub fn reset(self: *Window) void {
+        self.write_pos = 0;
+        self.total_written = 0;
     }
 
     pub fn deinit(self: *Window, allocator: std.mem.Allocator) void {
@@ -162,6 +176,32 @@ pub const Window = struct {
         if (distance == 0 or distance > self.total_written) return 0;
         const pos = self.write_pos -% distance;
         return self.buffer[pos & self.mask];
+    }
+
+    /// Emit `count` bytes to a sink, starting `start_offset` bytes back from the
+    /// write cursor.
+    ///
+    /// This is the path decoded output leaves the window by. Because the buffer
+    /// is circular, a logically-contiguous run can straddle the wrap point, so
+    /// it is delivered as one or two whole spans rather than byte-at-a-time.
+    ///
+    /// Returns false if the request reaches further back than the window
+    /// physically holds. Those bytes have been overwritten, so returning them
+    /// would hand back whatever occupies the slots now — silently wrong output
+    /// rather than a refusal. `copyToOutput` predates this check and masks the
+    /// index instead, which is why new callers should prefer this.
+    pub fn emitTo(self: *const Window, out: Sink, start_offset: usize, count: usize) bool {
+        if (start_offset > self.buffer.len) return false;
+        if (count > start_offset) return false;
+        if (count == 0) return true;
+
+        const begin = (self.write_pos -% start_offset) & self.mask;
+        const first = @min(count, self.buffer.len - begin);
+        out.write(self.buffer[begin..][0..first]);
+        if (first < count) {
+            out.write(self.buffer[0 .. count - first]);
+        }
+        return true;
     }
 
     /// Copy `count` bytes from the window to an output slice, starting from
@@ -328,6 +368,118 @@ test "copyMatch with wrap-around copy" {
     // B was at physical 1, now overwritten with B (from distance 3 at that point)
     try testing.expectEqual(@as(u8, 'A'), win.buffer[0]);
     try testing.expectEqual(@as(u8, 'B'), win.buffer[1]);
+}
+
+const BufferSink = @import("sink.zig").BufferSink;
+
+test "emitTo delivers a contiguous run" {
+    var win = try Window.init(testing.allocator, 16);
+    defer win.deinit(testing.allocator);
+
+    for ("HELLO") |c| win.putByte(c);
+
+    var buf: [5]u8 = undefined;
+    var bs = BufferSink.init(&buf);
+    try testing.expect(win.emitTo(bs.sink(), 5, 5));
+    try testing.expectEqualSlices(u8, "HELLO", buf[0..bs.len]);
+}
+
+test "emitTo splits a run that straddles the wrap point" {
+    // 8-byte window, 12 bytes written: the last 5 bytes live at physical
+    // 7,0,1,2,3 — i.e. one byte before the wrap and four after. A single
+    // @memcpy cannot express that, so this is the case a naive implementation
+    // gets wrong.
+    var win = try Window.init(testing.allocator, 8);
+    defer win.deinit(testing.allocator);
+
+    for ("ABCDEFGHIJKL") |c| win.putByte(c);
+
+    var buf: [5]u8 = undefined;
+    var bs = BufferSink.init(&buf);
+    try testing.expect(win.emitTo(bs.sink(), 5, 5));
+    try testing.expectEqual(@as(usize, 5), bs.len);
+    try testing.expectEqualSlices(u8, "HIJKL", buf[0..5]);
+}
+
+test "emitTo emits a run ending exactly at the wrap boundary" {
+    var win = try Window.init(testing.allocator, 8);
+    defer win.deinit(testing.allocator);
+
+    for ("ABCDEFGH") |c| win.putByte(c);
+
+    var buf: [8]u8 = undefined;
+    var bs = BufferSink.init(&buf);
+    try testing.expect(win.emitTo(bs.sink(), 8, 8));
+    try testing.expectEqualSlices(u8, "ABCDEFGH", buf[0..8]);
+}
+
+test "emitTo refuses to reach past what the window still holds" {
+    // THE POINT OF emitTo. A 4-byte window that has seen 8 bytes no longer has
+    // the first four. copyToOutput masks the index and cheerfully returns the
+    // bytes that occupy those slots NOW — a wrong answer wearing a right
+    // answer's shape. emitTo declines instead.
+    var win = try Window.init(testing.allocator, 4);
+    defer win.deinit(testing.allocator);
+
+    for ("ABCDEFGH") |c| win.putByte(c);
+
+    var buf: [8]u8 = undefined;
+    var bs = BufferSink.init(&buf);
+    try testing.expect(!win.emitTo(bs.sink(), 8, 8));
+    try testing.expectEqual(@as(usize, 0), bs.len);
+
+    // And confirm the old path really does return the wrong bytes here, so the
+    // guard above is pinned to a real hazard rather than a hypothetical one.
+    var legacy: [8]u8 = undefined;
+    _ = win.copyToOutput(&legacy, 8, 8);
+    try testing.expect(!std.mem.eql(u8, "ABCDEFGH", &legacy));
+}
+
+test "emitTo rejects a count larger than the offset it starts at" {
+    // count > start_offset would read PAST the write cursor into bytes that
+    // have not been decoded yet.
+    var win = try Window.init(testing.allocator, 16);
+    defer win.deinit(testing.allocator);
+
+    for ("ABCD") |c| win.putByte(c);
+
+    var buf: [8]u8 = undefined;
+    var bs = BufferSink.init(&buf);
+    try testing.expect(!win.emitTo(bs.sink(), 2, 4));
+}
+
+test "emitTo of zero bytes succeeds and writes nothing" {
+    var win = try Window.init(testing.allocator, 16);
+    defer win.deinit(testing.allocator);
+
+    for ("ABCD") |c| win.putByte(c);
+
+    var buf: [4]u8 = undefined;
+    var bs = BufferSink.init(&buf);
+    try testing.expect(win.emitTo(bs.sink(), 0, 0));
+    try testing.expectEqual(@as(usize, 0), bs.len);
+}
+
+test "emitTo agrees with copyToOutput whenever the range is still resident" {
+    // Differential check across every offset/count pair that fits: the new path
+    // must not change behaviour for the cases the old one handled correctly.
+    var win = try Window.init(testing.allocator, 16);
+    defer win.deinit(testing.allocator);
+
+    for ("The quick brown fox jumps") |c| win.putByte(c);
+
+    var start_offset: usize = 1;
+    while (start_offset <= 16) : (start_offset += 1) {
+        var count: usize = 0;
+        while (count <= start_offset) : (count += 1) {
+            var a: [16]u8 = undefined;
+            var b: [16]u8 = undefined;
+            var bs = BufferSink.init(a[0..count]);
+            try testing.expect(win.emitTo(bs.sink(), start_offset, count));
+            _ = win.copyToOutput(b[0..count], start_offset, count);
+            try testing.expectEqualSlices(u8, b[0..count], a[0..count]);
+        }
+    }
 }
 
 test "copyMatch overlap pattern ABAB" {

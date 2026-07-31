@@ -16,23 +16,60 @@ const std = @import("std");
 ///   byte[0] bit 0 = bit position 7
 ///   byte[1] bit 7 = bit position 8
 ///   etc.
+/// Virtual zero bytes readable past the end of `data`.
+///
+/// The reference decoder never fails on a read past its input: `BitInput::InBuf`
+/// is over-allocated and `UnpReadBuf30` sets `ReadBorder = ReadTop - 30`, so a
+/// fixed-width `getbits()` near the end quietly reads slack bytes. Our reader
+/// used a hard bound instead, which broke a case that only shows up in solid
+/// archives: the end-of-block marker needs 1-2 bits, but reaching it costs a
+/// 16-bit PEEK. At the tail of an entry that peek failed, so the marker — and
+/// the "next entry starts a new table" bit it carries — was never read.
+///
+/// 30 is the reference's own slack; 32 rounds it up.
+pub const DEFAULT_PAD_BYTES: usize = 32;
+
 pub const BitReader = struct {
     data: []const u8,
     bit_pos: usize, // current bit position in the stream (for external tracking)
     buffer: u64, // MSB-justified accumulator
     bits_in_buffer: u7, // how many valid bits are in the buffer (0-64)
     byte_pos: usize, // next byte to load from data[]
+    /// Zero bytes readable past `data`. `refill` already leaves un-loaded low
+    /// bits at zero, so padding costs nothing but a wider bound check.
+    pad_bytes: usize,
 
+    /// Hard-bounded: a read past the last real bit fails. This stays the
+    /// default so truncation detection is not silently relaxed for decoders
+    /// that do not need slack — only v29 reads a marker at the tail of an entry.
     pub fn init(data: []const u8) BitReader {
+        return initPadded(data, 0);
+    }
+
+    /// `init` with an explicit slack size; see `DEFAULT_PAD_BYTES`.
+    pub fn initPadded(data: []const u8, pad_bytes: usize) BitReader {
         var br = BitReader{
             .data = data,
             .bit_pos = 0,
             .buffer = 0,
             .bits_in_buffer = 0,
             .byte_pos = 0,
+            .pad_bytes = pad_bytes,
         };
         br.refill();
         return br;
+    }
+
+    /// Total bits this reader will serve, real plus padding.
+    inline fn limitBits(self: *const BitReader) usize {
+        return (self.data.len + self.pad_bytes) * 8;
+    }
+
+    /// True once any padding byte has been consumed — i.e. the stream asked for
+    /// more than the archive actually contains. Callers that must distinguish
+    /// "finished" from "ran out" consult this rather than trusting a clean exit.
+    pub fn overran(self: *const BitReader) bool {
+        return self.bit_pos > self.data.len * 8;
     }
 
     /// Bulk-load bytes into the accumulator when bits_in_buffer <= 56.
@@ -68,7 +105,7 @@ pub const BitReader = struct {
         const count: u7 = n;
         if (count == 0) return 0;
 
-        if (self.bit_pos + @as(usize, count) > self.data.len * 8) return error.EndOfData;
+        if (self.bit_pos + @as(usize, count) > self.limitBits()) return error.EndOfData;
 
         if (count > self.bits_in_buffer) {
             self.refill();
@@ -80,7 +117,10 @@ pub const BitReader = struct {
 
         // Consume the bits
         self.buffer <<= @intCast(count);
-        self.bits_in_buffer -= count;
+        // Saturating: inside the padding region the buffer holds fewer real bits
+        // than we just served (the rest were the implicit zeros), so a plain
+        // subtraction would underflow this u7.
+        self.bits_in_buffer -= @min(count, self.bits_in_buffer);
         self.bit_pos += count;
 
         return result;
@@ -91,7 +131,7 @@ pub const BitReader = struct {
         const count: u7 = n;
         if (count == 0) return 0;
 
-        if (self.bit_pos + @as(usize, count) > self.data.len * 8) return error.EndOfData;
+        if (self.bit_pos + @as(usize, count) > self.limitBits()) return error.EndOfData;
 
         if (count > self.bits_in_buffer) {
             self.refill();
@@ -204,6 +244,70 @@ test "EndOfData at end of stream" {
     var br = BitReader.init(&data);
     _ = try br.readBits(8);
     try std.testing.expectError(error.EndOfData, br.readBit());
+}
+
+test "padded reader serves zeros past the end, then still stops" {
+    // The v29 case: the end-of-block marker needs 1-2 bits but reaching it costs
+    // a 16-bit peek. A hard-bounded reader fails that peek at an entry's tail,
+    // so the marker is never read. Padding makes the peek succeed with zeros in
+    // the slack — the real leading bits are unaffected.
+    const data = [_]u8{0xFF};
+    var br = BitReader.initPadded(&data, 2);
+
+    // A 16-bit peek with only 8 real bits: real 0xFF, then padding zeros.
+    try std.testing.expectEqual(@as(u32, 0xFF00), try br.peekBits(16));
+
+    _ = try br.readBits(8); // consume the real byte
+    try std.testing.expect(!br.overran());
+
+    // Padding is readable...
+    try std.testing.expectEqual(@as(u32, 0), try br.readBits(8));
+    try std.testing.expect(br.overran());
+    try std.testing.expectEqual(@as(u32, 0), try br.readBits(8));
+
+    // ...but bounded. Slack is not an infinite stream of zeros; a truncated
+    // archive must still run out rather than decode forever.
+    try std.testing.expectError(error.EndOfData, br.readBit());
+}
+
+test "default reader is hard-bounded (padding is opt-in)" {
+    // Truncation detection must not be relaxed for decoders that never needed
+    // slack, so `init` keeps the strict bound.
+    const data = [_]u8{0xFF};
+    var br = BitReader.init(&data);
+    try std.testing.expectEqual(@as(usize, 0), br.pad_bytes);
+    _ = try br.readBits(8);
+    try std.testing.expectError(error.EndOfData, br.readBit());
+    try std.testing.expectError(error.EndOfData, br.peekBits(16));
+}
+
+test "padded reader returns identical real bits to an unpadded one" {
+    // Padding must change ONLY what happens past the end. Differential check so
+    // a bug in the widened bound cannot quietly alter decoded data.
+    const data = [_]u8{ 0b1011_0010, 0b0110_1101, 0b1111_0000 };
+    var plain = BitReader.init(&data);
+    var padded = BitReader.initPadded(&data, 32);
+
+    // Stay inside the 24 real bits — past them the two readers are SUPPOSED to
+    // diverge, which is the whole point of padding.
+    var n: u5 = 1;
+    while (n <= 4) : (n += 1) {
+        var i: usize = 0;
+        while (i < 2) : (i += 1) {
+            try std.testing.expectEqual(try plain.readBits(n), try padded.readBits(n));
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 20), plain.bit_pos);
+    try std.testing.expectEqual(plain.bit_pos, padded.bit_pos);
+}
+
+test "overran distinguishes finished from ran-out" {
+    const data = [_]u8{ 0xAB, 0xCD };
+    var br = BitReader.initPadded(&data, 4);
+    _ = try br.readBits(16); // exactly the real data
+    try std.testing.expect(!br.overran());
+    _ = try br.readBit(); // one bit into the slack
+    try std.testing.expect(br.overran());
 }
 
 test "alignByte aligns to next byte boundary" {

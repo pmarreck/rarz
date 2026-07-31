@@ -4,6 +4,7 @@ const unpack50 = @import("unpack50.zig");
 const unpack29 = @import("unpack29.zig");
 const unpack20 = @import("unpack20.zig");
 const unpack15 = @import("unpack15.zig");
+const Sink = @import("sink.zig").Sink;
 
 pub const DecompressError = error{
     UnsupportedVersion,
@@ -15,6 +16,137 @@ pub const DecompressError = error{
     UnsupportedFilter,
     CorruptPpmData,
 };
+
+/// A decoder carried across the entries of a solid archive, hiding which
+/// unpack version is underneath.
+///
+/// WHY THIS TYPE EXISTS
+///   `rarz_extract_to_buffer(handle, index, ...)` is random access with a fresh
+///   decoder per call. That is the wrong shape for a solid archive, where every
+///   file is one slice of a single continuous stream and file N inherits the LZ
+///   window and Huffman tables from file N-1. The result was a FALSE POSITIVE —
+///   rarz reporting a perfectly valid archive INVALID, and in one RAR5 case
+///   returning an entry at exactly the right size with the wrong bytes.
+///
+///   Rejected alternative: decode entries `0..N` on every extraction. Correct,
+///   but O(n^2) — unusable on an archive of thousands of entries.
+pub const SolidSession = struct {
+    inner: Inner,
+    /// Window exponent this session was built with. A later entry needing a
+    /// larger dictionary cannot reuse the session's window.
+    dict_bits: u5,
+
+    const Inner = union(enum) {
+        v20: unpack20.Session,
+        v29: unpack29.Session,
+        v50: unpack50.Session,
+    };
+
+    pub fn initRar4(
+        allocator: std.mem.Allocator,
+        unpack_version: u8,
+        file_flags_raw: u16,
+    ) DecompressError!SolidSession {
+        const dict_bits = getDictBitsRar4(unpack_version, file_flags_raw);
+        return switch (unpack_version) {
+            29, 36 => .{
+                .inner = .{ .v29 = unpack29.Session.init(allocator, dict_bits) catch return error.OutOfMemory },
+                .dict_bits = dict_bits,
+            },
+            20, 26 => .{
+                .inner = .{ .v20 = unpack20.Session.init(allocator, dict_bits) catch return error.OutOfMemory },
+                .dict_bits = dict_bits,
+            },
+            else => error.UnsupportedVersion,
+        };
+    }
+
+    pub fn initRar5(
+        allocator: std.mem.Allocator,
+        compression: rar5_headers.CompressionInfo,
+    ) DecompressError!SolidSession {
+        const dict_bits = getDictBitsRar5(compression);
+        return .{
+            .inner = .{
+                .v50 = unpack50.Session.init(
+                    allocator,
+                    compression.algo_version == 70,
+                    dict_bits,
+                ) catch return error.OutOfMemory,
+            },
+            .dict_bits = dict_bits,
+        };
+    }
+
+    pub fn deinit(self: *SolidSession) void {
+        switch (self.inner) {
+            inline else => |*s| s.deinit(),
+        }
+    }
+
+    /// True when this session can serve an entry with the given format and
+    /// dictionary requirement. A mismatch means the caller must rebuild.
+    pub fn acceptsRar4(self: *const SolidSession, unpack_version: u8, file_flags_raw: u16) bool {
+        const want = getDictBitsRar4(unpack_version, file_flags_raw);
+        const version_ok = switch (self.inner) {
+            .v29 => unpack_version == 29 or unpack_version == 36,
+            .v20 => unpack_version == 20 or unpack_version == 26,
+            .v50 => false,
+        };
+        return version_ok and want == self.dict_bits;
+    }
+
+    pub fn acceptsRar5(self: *const SolidSession, compression: rar5_headers.CompressionInfo) bool {
+        return self.inner == .v50 and getDictBitsRar5(compression) == self.dict_bits;
+    }
+
+    /// Decode one entry, emitting its bytes to `out`.
+    ///
+    /// `solid` is the ENTRY's own flag, not the archive's: the first entry of a
+    /// solid group carries solid=false and starts the stream.
+    pub fn decodeFile(
+        self: *SolidSession,
+        packed_data: []const u8,
+        unpacked_size: u64,
+        solid: bool,
+        out: Sink,
+    ) DecompressError!void {
+        switch (self.inner) {
+            .v20 => |*s| s.decodeFile(packed_data, unpacked_size, solid, out) catch |err| {
+                return switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    error.EndOfData => error.EndOfData,
+                    error.InvalidTable => error.InvalidTable,
+                    error.InvalidData => error.CorruptData,
+                };
+            },
+            .v29 => |*s| s.decodeFile(packed_data, unpacked_size, solid, out) catch |err| {
+                return switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    error.EndOfData => error.EndOfData,
+                    error.InvalidTable => error.InvalidTable,
+                    error.UnsupportedFilter => error.UnsupportedFilter,
+                    error.CorruptPpmData => error.CorruptPpmData,
+                    else => error.CorruptData,
+                };
+            },
+            .v50 => |*s| s.decodeFile(packed_data, unpacked_size, solid, out) catch |err| {
+                return switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    error.EndOfData => error.EndOfData,
+                    error.InvalidTable => error.InvalidTable,
+                    else => error.CorruptData,
+                };
+            },
+        }
+    }
+};
+
+/// RAR5 encodes the window exponent as an offset from 17.
+fn getDictBitsRar5(compression: rar5_headers.CompressionInfo) u5 {
+    const raw_bits: u8 = @as(u8, compression.dict_bits) + 17;
+    return if (raw_bits > 31) 31 else @intCast(raw_bits);
+}
 
 /// Decompress a RAR5/7 compressed file entry.
 ///
@@ -32,11 +164,7 @@ pub fn decompressRar5(
 ) DecompressError![]u8 {
     if (compression.method == 0) return error.UnsupportedMethod; // store is handled directly
 
-    // RAR5 dict_bits field encodes the exponent offset from 17.
-    // Actual window size = 2^(dict_bits + 17).
-    // u5 max is 31, so cap at 31 for safety (2GB window).
-    const raw_bits: u8 = @as(u8, compression.dict_bits) + 17;
-    const dict_bits: u5 = if (raw_bits > 31) 31 else @intCast(raw_bits);
+    const dict_bits = getDictBitsRar5(compression);
 
     return unpack50.decompress(allocator, packed_data, unpacked_size, compression.algo_version, dict_bits) catch |err| {
         return switch (err) {

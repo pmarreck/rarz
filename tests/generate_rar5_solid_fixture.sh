@@ -78,11 +78,9 @@ random -b -c 4096 --seed 5002 > "$tree/noise.bin" 2>/dev/null || die "random fai
 printf 'nested payload for path handling\n' > "$tree/sub/nested.txt"
 
 # --- Generate ---------------------------------------------------------------
-# known_gaps/ until solid decoding lands. Interop Gate A treats tests/fixtures/
-# proper as "archives rarz must accept", and rarz currently reports this valid
-# archive INVALID. Promoting it out of known_gaps/ IS the acceptance test.
-mkdir -p "$FIXTURES/known_gaps"
-out="$FIXTURES/known_gaps/rar5_solid.rar"
+# Solid decoding landed 2026-07-31, so this belongs in tests/fixtures/ proper,
+# which Interop Gate A treats as "archives rarz must accept".
+out="$FIXTURES/rar5_solid.rar"
 rm -f "$out"
 ( cd "$tree" && rar a -s -m3 -r -idq "$project_root/$out" . ) \
 	|| die "rar failed to produce $out"

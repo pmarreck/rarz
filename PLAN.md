@@ -274,7 +274,28 @@ buffer (CLI extraction) or discard them while still running CRC/BLAKE2sp
   one design satisfies both. Tell them when it lands; they deprioritised it only
   because it looked separate.
 
+**RED baseline captured 2026-07-31 13:00 EDT** (ReleaseSafe CLI, vs the unrar
+oracle). Both fixtures test "All OK" under unrar:
+
+| fixture | `rarz t` | extraction |
+|---|---|---|
+| `known_gaps/rar2_v20_solid.rar` | INVALID (false positive) | fails wholesale |
+| `rar5_solid.rar` (new) | INVALID (false positive) | 1/6 ok, 4 missing, **1 silently WRONG** |
+
+`sub/c_quotes_a_twice.txt` comes back at exactly the right size (48616 B) with
+the wrong bytes — a size check would bless it. That is the confidently-wrong
+outcome, not merely a refusal.
+
 Work items:
+- [x] **RAR5 solid fixture built** — `tests/generate_rar5_solid_fixture.sh` →
+  `tests/fixtures/rar5_solid.rar`. Additive and idempotent, unlike
+  `generate_fixtures.sh` (which opens with `rm -rf tests/fixtures` and would
+  destroy the wine-produced RAR2 and nixos-23.11-produced RAR4 corpora). Content
+  is arranged so two files quote a third verbatim, forcing cross-file matches:
+  an archive whose files share nothing round-trips even with a window that
+  resets, so it could not falsify the bug. Generator asserts the archive really
+  is solid — `rar a -s` silently emits a NON-solid archive when there is nothing
+  to share. (2026-07-31 EDT)
 - [ ] Add a stateful/sequential decode entry to `decompress/dispatch.zig` that
   reuses an existing `Unpack20State`/`Unpack29State` (and the RAR5 equivalent)
   instead of constructing one per file. The reference gates on the solid flag:
@@ -356,6 +377,20 @@ structured-result design pending with validate: three distinct outcomes
   concise design with the smallest first API and concrete blockers. Start by
   tracing which parse/decompress paths genuinely need random access.
   Keep `policy.validate(data)` compatible.
+
+### 5b. `DEBUG BUILD` banner fires on every non-ReleaseFast build (Peter, 2026-07-31)
+
+`src/cli/main.c` guards the yellow `DEBUG BUILD` banner with `#ifndef NDEBUG`.
+Zig only defines `NDEBUG` for ReleaseFast and ReleaseSmall — **not** for
+ReleaseSafe — so the banner prints on every ReleaseSafe build, which is the
+fleet floor and what `./test` builds. The banner therefore says "debug" when the
+build is not debug: it is noise where it should be a signal, and Peter's brief
+has benchmark suites assert its absence.
+
+- [ ] Gate the banner on the ACTUAL optimize mode passed to `build.zig`, not on
+  the absence of `NDEBUG`. Failing test first: assert a ReleaseSafe CLI emits no
+  `DEBUG BUILD`, and that a Debug CLI still does (an absence-only assertion
+  passes vacuously if the banner is deleted outright).
 
 ### 6. Housekeeping
 - [ ] Mechatron Prime CI: `MECHATRON_PRIME_CI.md` is untracked; wire rarz onto

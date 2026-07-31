@@ -8,6 +8,11 @@ pub fn build(b: *std.Build) void {
 		"Optimization mode (default: ReleaseFast)",
 	) orelse .ReleaseFast;
 
+	// Single source of truth for the version: the package manifest. Copying it
+	// into a second literal here would let the two drift silently, and `--about`
+	// exists precisely so a user can tell us which build they are running.
+	const version = @import("build.zig.zon").version;
+
 	// Static library from Zig source (the core)
 	const lib = b.addLibrary(.{
 		.name = "rarz",
@@ -57,6 +62,22 @@ pub fn build(b: *std.Build) void {
 	exe.root_module.addIncludePath(b.path("include"));
 	exe.root_module.linkLibrary(lib);
 	exe.root_module.link_libc = true;
+
+	// Build identity, handed to the C CLI so `--about` can report it and so the
+	// DEBUG BUILD banner can be gated on the REAL optimize mode.
+	//
+	// The banner used to be guarded by `#ifndef NDEBUG`. Zig defines NDEBUG for
+	// ReleaseFast and ReleaseSmall only — NOT for ReleaseSafe, which is this
+	// project's floor and what ./test builds. So every ReleaseSafe run announced
+	// itself as a debug build. `RARZ_DEBUG_BUILD` is derived from `optimize`
+	// itself, which is the only thing that actually answers the question.
+	exe.root_module.addCMacro("RARZ_VERSION", b.fmt("\"{s}\"", .{version}));
+	exe.root_module.addCMacro("RARZ_TARGET", b.fmt("\"{s}-{s}\"", .{
+		@tagName(target.result.cpu.arch),
+		@tagName(target.result.os.tag),
+	}));
+	exe.root_module.addCMacro("RARZ_OPTIMIZE", b.fmt("\"{s}\"", .{@tagName(optimize)}));
+	exe.root_module.addCMacro("RARZ_DEBUG_BUILD", if (optimize == .Debug) "1" else "0");
 
 	// Link progrez library for progress indication
 	const progrez_dep = b.dependency("progrez", .{

@@ -63,9 +63,37 @@ static void format_bytes(char *buf, size_t buflen, uint64_t bytes) {
 /* Command enum + parser                                                      */
 /* ========================================================================== */
 
+/* Build identity, injected by build.zig. The fallbacks keep this file
+ * compilable by a plain `cc` for the portability path, where no build system is
+ * present to define them. RARZ_DEBUG_BUILD falls back to the NDEBUG convention
+ * ONLY in that standalone case — under build.zig it is derived from the actual
+ * optimize mode, because NDEBUG is not defined for ReleaseSafe and so cannot
+ * distinguish a debug build from a merely-not-ReleaseFast one. */
+#ifndef RARZ_VERSION
+#define RARZ_VERSION "0.0.0-standalone"
+#endif
+#ifndef RARZ_TARGET
+#define RARZ_TARGET "unknown-unknown"
+#endif
+#ifndef RARZ_OPTIMIZE
+#ifdef NDEBUG
+#define RARZ_OPTIMIZE "Release"
+#else
+#define RARZ_OPTIMIZE "Debug"
+#endif
+#endif
+#ifndef RARZ_DEBUG_BUILD
+#ifdef NDEBUG
+#define RARZ_DEBUG_BUILD 0
+#else
+#define RARZ_DEBUG_BUILD 1
+#endif
+#endif
+
 typedef enum {
 	CMD_UNKNOWN = -1,
 	CMD_HELP,
+	CMD_ABOUT,
 	CMD_TEST,
 	CMD_LIST,
 	CMD_VOLUMES,
@@ -75,6 +103,7 @@ typedef enum {
 
 static Command parse_command(const char *arg) {
 	if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) return CMD_HELP;
+	if (strcmp(arg, "--about") == 0) return CMD_ABOUT;
 	if (strcmp(arg, "t") == 0 || strcmp(arg, "test") == 0) return CMD_TEST;
 	if (strcmp(arg, "l") == 0 || strcmp(arg, "list") == 0 ||
 	    strcmp(arg, "v") == 0 || strcmp(arg, "list-verbose") == 0) return CMD_LIST;
@@ -104,6 +133,15 @@ static void print_usage(void) {
 	printf("    -o|--output <path>             Output path (dir: auto-name, file: use as-is)\n");
 	printf("    -v<size>                       Split into volumes (e.g. -v10m, -v700k, -v1g)\n");
 	printf("  rarz --help                      Show this help\n");
+	printf("  rarz --about                     Show version, platform and build mode\n");
+}
+
+/* One line, per Peter's CLI brief: app, version, platform/arch, build mode.
+ * The build mode is part of it deliberately — it is what lets a bug report say
+ * which binary produced a result, and it is what the banner test keys off. */
+static void print_about(void) {
+	printf("rarz %s (%s, %s) - clean-room RAR archive validator, extractor and writer\n",
+	       RARZ_VERSION, RARZ_TARGET, RARZ_OPTIMIZE);
 }
 
 /* ========================================================================== */
@@ -1536,8 +1574,13 @@ static int cmd_add(int argc, char **argv) {
 int main(int argc, char **argv) {
 	g_is_tty = isatty(fileno(stderr));
 
-#ifndef NDEBUG
-	fprintf(stderr, "\033[33mDEBUG BUILD\033[0m\n");
+#if RARZ_DEBUG_BUILD
+	/* Suppressible so suites that assert a clean stderr can still run a debug
+	 * build; benchmark suites assert BOTH that this text is absent and that the
+	 * mute is not set, so muting cannot be used to fake a release build. */
+	if (getenv("MUTE_DEBUG_STATUS") == NULL) {
+		fprintf(stderr, "\033[33mDEBUG BUILD\033[0m\n");
+	}
 #endif
 
 	/* No args or --help: show usage */
@@ -1551,6 +1594,10 @@ int main(int argc, char **argv) {
 	switch (cmd) {
 	case CMD_HELP:
 		print_usage();
+		return 0;
+
+	case CMD_ABOUT:
+		print_about();
 		return 0;
 
 	case CMD_TEST:

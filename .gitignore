@@ -1,4 +1,10 @@
+# Agent briefs. Both are symlinks to a canonical file OUTSIDE this repo
+# ("../Obsidian Vaults/..."), so committing them would hand every cloner a
+# dangling link. AGENTS.md was already ignored; CLAUDE.md is the same file.
 AGENTS.md
+CLAUDE.md
+# Symlink to the sibling mechatron-prime repo — same reasoning.
+MECHATRON_PRIME_CI.md
 jj_cheatsheet.md
 ZIG_RECENT_API_CHANGES_2025.md
 .codescan

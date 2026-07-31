@@ -38,6 +38,16 @@ fn crc32_arm(data: []const u8) u32 {
 /// Slicing-by-8: processes 8 bytes per iteration using 8 lookup tables.
 /// ~2-4x faster than the stdlib single-table byte-at-a-time approach.
 fn crc32_slice8(data: []const u8) u32 {
+	return crc32_slice8_raw(0xFFFFFFFF, data) ^ 0xFFFFFFFF;
+}
+
+/// Slicing-by-8 CRC32 stepping, WITHOUT the initial and final XOR.
+///
+/// Split out so the one-shot `crc32` and the incremental `Crc32` share exactly
+/// one implementation of the arithmetic. Two copies that agree only by
+/// inspection is how a chunked hash silently diverges from the whole-buffer one
+/// — and a wrong hash is not an error, it is a wrong verdict.
+fn crc32_slice8_raw(seed: u32, data: []const u8) u32 {
 	const tables = comptime blk: {
 		@setEvalBranchQuota(20000);
 		// Reflected polynomial for CRC32/ISO-HDLC
@@ -63,7 +73,7 @@ fn crc32_slice8(data: []const u8) u32 {
 		break :blk t;
 	};
 
-	var crc: u32 = 0xFFFFFFFF;
+	var crc: u32 = seed;
 	var pos: usize = 0;
 
 	// Process 8 bytes at a time
@@ -87,8 +97,35 @@ fn crc32_slice8(data: []const u8) u32 {
 		pos += 1;
 	}
 
-	return crc ^ 0xFFFFFFFF;
+	return crc;
 }
+
+// ============================================================================
+// Incremental hashing — for verifying decoded output without buffering it
+// ============================================================================
+
+/// Running CRC32 over data arriving in pieces.
+///
+/// The LZ window is circular, so a logically-contiguous run of decoded output
+/// reaches a consumer as one or TWO spans; and validation should never have to
+/// materialise a whole decoded file just to checksum it. Both need a CRC that
+/// survives being fed in chunks.
+///
+/// Cheap because CRC32's running state IS its output, modulo the final XOR:
+/// hold the un-finalised register between updates and apply `^ 0xFFFFFFFF` only
+/// at the end.
+pub const Crc32 = struct {
+	/// Un-finalised register. Starts at the standard CRC32 init value.
+	state: u32 = 0xFFFFFFFF,
+
+	pub fn update(self: *Crc32, data: []const u8) void {
+		self.state = crc32_slice8_raw(self.state, data);
+	}
+
+	pub fn final(self: *const Crc32) u32 {
+		return self.state ^ 0xFFFFFFFF;
+	}
+};
 
 // ============================================================================
 // CRC16 — CRC-16/ARC (IBM) variant used by RAR legacy headers
@@ -364,6 +401,94 @@ pub fn blake2sp(data: []const u8, out: *[32]u8) void {
 	root.final(out);
 }
 
+/// Running BLAKE2sp over data arriving in pieces.
+///
+/// Harder than the CRC because BLAKE2sp is a TREE hash: input is cut into
+/// 64-byte blocks and dealt round-robin to 8 leaf instances, block i going to
+/// leaf i mod 8. Which leaf a byte belongs to therefore depends on its absolute
+/// offset in the whole message, not on where a chunk boundary happens to fall.
+/// Feeding an arbitrary chunk straight to the leaves would re-deal every block
+/// after the first partial one.
+///
+/// So updates accumulate into a 512-byte (8 x 64) staging buffer and are dealt
+/// only in whole rounds, which keeps the assignment identical to the one-shot
+/// function regardless of how the caller splits its input. Getting this wrong
+/// yields a WRONG HASH rather than an error, so the tests sweep split points
+/// differentially against `blake2sp` rather than checking one arrangement.
+pub const Blake2sp = struct {
+	leaves: [PARALLELISM]Blake2sState,
+	/// Bytes held back because they do not yet complete a 512-byte round.
+	buf: [BUF_SIZE]u8 = undefined,
+	buf_len: usize = 0,
+
+	pub fn init() Blake2sp {
+		var self = Blake2sp{ .leaves = undefined };
+		for (&self.leaves, 0..) |*leaf, i| {
+			leaf.* = initLeaf(@intCast(i));
+		}
+		return self;
+	}
+
+	/// Deal one complete 512-byte round: 64 bytes to each leaf, in order.
+	fn dealFullRound(self: *Blake2sp, round: []const u8) void {
+		for (&self.leaves, 0..) |*leaf, i| {
+			leaf.update(round[i * BLOCK_SIZE ..][0..BLOCK_SIZE]);
+		}
+	}
+
+	pub fn update(self: *Blake2sp, data: []const u8) void {
+		var rest = data;
+
+		// Top up a partially-filled round first. Anything short of a full round
+		// has to keep waiting, because which leaf a byte belongs to depends on
+		// its offset in the WHOLE message, not in this chunk.
+		if (self.buf_len > 0) {
+			const need = BUF_SIZE - self.buf_len;
+			const take = @min(need, rest.len);
+			@memcpy(self.buf[self.buf_len..][0..take], rest[0..take]);
+			self.buf_len += take;
+			rest = rest[take..];
+			if (self.buf_len < BUF_SIZE) return;
+			self.dealFullRound(&self.buf);
+			self.buf_len = 0;
+		}
+
+		// Deal whole rounds straight from the caller's slice, no copying.
+		while (rest.len >= BUF_SIZE) {
+			self.dealFullRound(rest[0..BUF_SIZE]);
+			rest = rest[BUF_SIZE..];
+		}
+
+		// Hold the remainder for a later update, or for final().
+		if (rest.len > 0) {
+			@memcpy(self.buf[0..rest.len], rest);
+			self.buf_len = rest.len;
+		}
+	}
+
+	pub fn final(self: *Blake2sp, out: *[32]u8) void {
+		// The trailing partial round is dealt exactly as the one-shot does:
+		// by 64-byte blocks, with the last one short and the remaining leaves
+		// receiving nothing at all.
+		const remaining = self.buf[0..self.buf_len];
+		for (&self.leaves, 0..) |*leaf, i| {
+			const block_start = i * BLOCK_SIZE;
+			if (block_start < remaining.len) {
+				const end = @min(block_start + BLOCK_SIZE, remaining.len);
+				leaf.update(remaining[block_start..end]);
+			}
+		}
+
+		var root = initRoot();
+		var leaf_hash: [32]u8 = undefined;
+		for (&self.leaves) |*leaf| {
+			leaf.final(&leaf_hash);
+			root.update(&leaf_hash);
+		}
+		root.final(out);
+	}
+};
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -371,6 +496,150 @@ pub fn blake2sp(data: []const u8, out: *[32]u8) void {
 const testing = std.testing;
 
 // --- CRC32 tests ---
+
+test "Blake2sp incremental equals one-shot at EVERY split point" {
+	// BLAKE2sp deals 64-byte blocks round-robin to 8 leaves, so which leaf a
+	// byte lands on depends on its offset in the WHOLE message. A chunked
+	// implementation that re-deals from each chunk's start produces a different
+	// digest with no error — a wrong verdict, silently. Sweeping every split
+	// across more than two full 512-byte rounds exercises boundaries that fall
+	// mid-block, mid-round and exactly on a round edge.
+	var data: [1100]u8 = undefined;
+	for (&data, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+
+	var expected: [32]u8 = undefined;
+	blake2sp(&data, &expected);
+
+	var split: usize = 0;
+	while (split <= data.len) : (split += 1) {
+		var h = Blake2sp.init();
+		h.update(data[0..split]);
+		h.update(data[split..]);
+		var got: [32]u8 = undefined;
+		h.final(&got);
+		try testing.expectEqualSlices(u8, &expected, &got);
+	}
+}
+
+test "Blake2sp incremental equals one-shot when fed one byte at a time" {
+	// The pathological chunking: every update is shorter than a block, so the
+	// staging buffer is the only thing keeping leaf assignment correct.
+	var data: [600]u8 = undefined;
+	for (&data, 0..) |*b, i| b.* = @truncate(i *% 17 +% 3);
+
+	var expected: [32]u8 = undefined;
+	blake2sp(&data, &expected);
+
+	var h = Blake2sp.init();
+	for (data) |b| h.update(&[_]u8{b});
+	var got: [32]u8 = undefined;
+	h.final(&got);
+	try testing.expectEqualSlices(u8, &expected, &got);
+}
+
+test "Blake2sp incremental matches one-shot at sizes around the round boundary" {
+	// 512 is the round size; the interesting lengths are just under, exactly on,
+	// and just over it, plus the empty message.
+	const sizes = [_]usize{ 0, 1, 63, 64, 65, 511, 512, 513, 1023, 1024, 1025 };
+	var data: [1025]u8 = undefined;
+	for (&data, 0..) |*b, i| b.* = @truncate(i *% 131 +% 11);
+
+	for (sizes) |n| {
+		var expected: [32]u8 = undefined;
+		blake2sp(data[0..n], &expected);
+
+		// Two arrangements per size: one shot, and split at a third.
+		var whole = Blake2sp.init();
+		whole.update(data[0..n]);
+		var got_whole: [32]u8 = undefined;
+		whole.final(&got_whole);
+		try testing.expectEqualSlices(u8, &expected, &got_whole);
+
+		var thirds = Blake2sp.init();
+		thirds.update(data[0 .. n / 3]);
+		thirds.update(data[n / 3 .. 2 * n / 3]);
+		thirds.update(data[2 * n / 3 .. n]);
+		var got_thirds: [32]u8 = undefined;
+		thirds.final(&got_thirds);
+		try testing.expectEqualSlices(u8, &expected, &got_thirds);
+	}
+}
+
+test "Blake2sp empty updates do not disturb the digest" {
+	var data: [777]u8 = undefined;
+	for (&data, 0..) |*b, i| b.* = @truncate(i *% 23 +% 5);
+
+	var expected: [32]u8 = undefined;
+	blake2sp(&data, &expected);
+
+	var h = Blake2sp.init();
+	h.update(&.{});
+	h.update(data[0..300]);
+	h.update(&.{});
+	h.update(data[300..]);
+	h.update(&.{});
+	var got: [32]u8 = undefined;
+	h.final(&got);
+	try testing.expectEqualSlices(u8, &expected, &got);
+}
+
+test "Crc32 incremental equals one-shot at EVERY split point" {
+	// The load-bearing property. A chunked hash that disagrees with the
+	// whole-buffer one does not error — it returns a different number, which
+	// becomes a wrong VERDICT. So this is swept over every split rather than
+	// spot-checked at one.
+	const data = "The quick brown fox jumps over the lazy dog, then does it again.";
+	const expected = crc32(data);
+
+	var split: usize = 0;
+	while (split <= data.len) : (split += 1) {
+		var h = Crc32{};
+		h.update(data[0..split]);
+		h.update(data[split..]);
+		try testing.expectEqual(expected, h.final());
+	}
+}
+
+test "Crc32 incremental equals one-shot across THREE-way splits" {
+	// Two-way splits alone would not catch a bug in carrying state across more
+	// than one boundary, and the window can hand out two spans while validation
+	// adds more.
+	const data = "0123456789abcdefghijklmnopqrstuvwxyz0123456789";
+	const expected = crc32(data);
+
+	var i: usize = 0;
+	while (i <= data.len) : (i += 1) {
+		var j: usize = i;
+		while (j <= data.len) : (j += 1) {
+			var h = Crc32{};
+			h.update(data[0..i]);
+			h.update(data[i..j]);
+			h.update(data[j..]);
+			try testing.expectEqual(expected, h.final());
+		}
+	}
+}
+
+test "Crc32 handles empty updates and crosses the slice-by-8 boundary" {
+	// Zero-length spans are real: a run ending exactly at the window wrap emits
+	// one span and an empty second one.
+	const data = [_]u8{0xA5} ** 37; // not a multiple of 8, so both loops run
+	const expected = crc32(&data);
+
+	var h = Crc32{};
+	h.update(&.{});
+	h.update(data[0..8]); // exactly one bulk iteration
+	h.update(&.{});
+	h.update(data[8..9]); // one tail byte
+	h.update(data[9..]);
+	h.update(&.{});
+	try testing.expectEqual(expected, h.final());
+}
+
+test "Crc32 of nothing equals crc32 of empty" {
+	var h = Crc32{};
+	try testing.expectEqual(crc32(""), h.final());
+}
 
 test "crc32 of empty data" {
 	const result = crc32(&[_]u8{});

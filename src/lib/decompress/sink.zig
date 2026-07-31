@@ -22,6 +22,7 @@
 //! handle an error that can never occur.
 
 const std = @import("std");
+const integrity = @import("../integrity.zig");
 
 /// A destination for decoded bytes. `write` may be called several times per
 /// file: the window is circular, so a logically-contiguous run of output can
@@ -65,6 +66,47 @@ pub const BufferSink = struct {
         }
         @memcpy(self.buf[self.len..][0..bytes.len], bytes);
         self.len += bytes.len;
+    }
+};
+
+/// Hashes decoded bytes and throws them away.
+///
+/// This is the one Peter asked for: validation never needs the bytes, only the
+/// verdict, so it can "stream into the void while watching for errors". Before
+/// this, `policy.zig` allocated a buffer the size of every decoded entry purely
+/// to checksum it and free it again. Peak memory for validation drops from
+/// "whole archive + whole decoded file" to "window + hash state".
+///
+/// BLAKE2sp is optional because only RAR5 carries one, and its state is ~600
+/// bytes — worth not paying for on RAR4.
+pub const VerifySink = struct {
+    crc: integrity.Crc32 = .{},
+    blake: ?integrity.Blake2sp = null,
+    len: u64 = 0,
+
+    /// `want_blake` should be true only when the entry actually declares a
+    /// BLAKE2sp hash; otherwise the work is pure waste.
+    pub fn init(want_blake: bool) VerifySink {
+        return .{ .blake = if (want_blake) integrity.Blake2sp.init() else null };
+    }
+
+    pub fn sink(self: *VerifySink) Sink {
+        return .{ .ctx = self, .write_fn = writeImpl };
+    }
+
+    fn writeImpl(ctx: *anyopaque, bytes: []const u8) void {
+        const self: *VerifySink = @ptrCast(@alignCast(ctx));
+        self.crc.update(bytes);
+        if (self.blake) |*b| b.update(bytes);
+        self.len += bytes.len;
+    }
+
+    pub fn crc32(self: *const VerifySink) u32 {
+        return self.crc.final();
+    }
+
+    pub fn blake2sp(self: *VerifySink, out: *[32]u8) void {
+        self.blake.?.final(out);
     }
 };
 
@@ -136,6 +178,76 @@ test "BufferSink into a zero-length buffer overflows without writing" {
 
     try testing.expect(bs.overflowed);
     try testing.expectEqual(@as(usize, 0), bs.len);
+}
+
+test "VerifySink reproduces the one-shot hashes over split writes" {
+    // The window is circular, so a contiguous run of decoded output can reach a
+    // sink as two spans. If the sink's hashes did not survive that, validation
+    // would report a mismatch on a perfectly good archive.
+    var data: [1000]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @truncate(i *% 41 +% 13);
+
+    const want_crc = integrity.crc32(&data);
+    var want_blake: [32]u8 = undefined;
+    integrity.blake2sp(&data, &want_blake);
+
+    var split: usize = 0;
+    while (split <= data.len) : (split += 97) {
+        var vs = VerifySink.init(true);
+        const s = vs.sink();
+        s.write(data[0..split]);
+        s.write(data[split..]);
+
+        try testing.expectEqual(want_crc, vs.crc32());
+        var got_blake: [32]u8 = undefined;
+        vs.blake2sp(&got_blake);
+        try testing.expectEqualSlices(u8, &want_blake, &got_blake);
+        try testing.expectEqual(@as(u64, data.len), vs.len);
+    }
+}
+
+test "VerifySink without BLAKE2sp still checksums" {
+    // RAR4 entries carry no BLAKE2sp, and its state is ~600 bytes of pure waste
+    // there. Skipping it must not disturb the CRC.
+    var vs = VerifySink.init(false);
+    const s = vs.sink();
+    s.write("hello ");
+    s.write("world");
+
+    try testing.expectEqual(integrity.crc32("hello world"), vs.crc32());
+    try testing.expectEqual(@as(u64, 11), vs.len);
+}
+
+test "VerifySink over no data equals the empty-input hashes" {
+    var vs = VerifySink.init(true);
+    try testing.expectEqual(integrity.crc32(""), vs.crc32());
+
+    var want: [32]u8 = undefined;
+    integrity.blake2sp("", &want);
+    var got: [32]u8 = undefined;
+    vs.blake2sp(&got);
+    try testing.expectEqualSlices(u8, &want, &got);
+}
+
+test "VerifySink detects a single flipped bit" {
+    // Non-vacuity: the sink must DISAGREE when the bytes differ, or every
+    // assertion above is satisfiable by a constant.
+    var a: [300]u8 = undefined;
+    for (&a, 0..) |*b, i| b.* = @truncate(i);
+    var b_data = a;
+    b_data[150] ^= 0x01;
+
+    var va = VerifySink.init(true);
+    va.sink().write(&a);
+    var vb = VerifySink.init(true);
+    vb.sink().write(&b_data);
+
+    try testing.expect(va.crc32() != vb.crc32());
+    var ha: [32]u8 = undefined;
+    var hb: [32]u8 = undefined;
+    va.blake2sp(&ha);
+    vb.blake2sp(&hb);
+    try testing.expect(!std.mem.eql(u8, &ha, &hb));
 }
 
 test "DiscardSink counts without storing" {

@@ -219,7 +219,7 @@ fn validate_rar4_payload(data: []const u8, sig_offset: usize) ValidationResult {
 					// were reported VALID however damaged they were (0/6 against
 					// the unrar oracle, versus 6/6 for store-method).
 					const alloc = std.heap.page_allocator;
-					const decompressed = decodeEntryRar4(
+					var verify = decodeEntryRar4(
 						&solid_session,
 						alloc,
 						payload,
@@ -232,9 +232,8 @@ fn validate_rar4_payload(data: []const u8, sig_offset: usize) ValidationResult {
 						structural.error_message = "decompression failed during validation";
 						return structural;
 					};
-					defer alloc.free(decompressed);
 
-					if (integrity.crc32(decompressed) != f.file_crc) {
+					if (verify.crc32() != f.file_crc) {
 						structural.is_valid = false;
 						structural.error_message = "payload CRC32 mismatch";
 						return structural;
@@ -371,13 +370,17 @@ fn validate_rar5_structural(data: []const u8, sig_offset: usize, sig_len: u8) Va
 ///
 /// The session is rebuilt when an entry needs a different unpack version or a
 /// larger dictionary than the one it was sized for.
+/// Returns the running hashes rather than the bytes: validation wants the
+/// verdict, never the payload. Nothing the size of a decoded entry is allocated
+/// on this path — peak memory is the LZ window plus ~600 bytes of hash state.
 fn decodeEntryRar5(
     session: *?dispatch.SolidSession,
     allocator: std.mem.Allocator,
     packed_data: []const u8,
     unpacked_size: u64,
     compression: rar5_headers.CompressionInfo,
-) ![]u8 {
+    want_blake: bool,
+) !sink.VerifySink {
     if (session.*) |*s| {
         if (!s.acceptsRar5(compression)) {
             s.deinit();
@@ -388,13 +391,11 @@ fn decodeEntryRar5(
         session.* = try dispatch.SolidSession.initRar5(allocator, compression);
     }
 
-    const output = try allocator.alloc(u8, @intCast(unpacked_size));
-    errdefer allocator.free(output);
-    if (unpacked_size == 0) return output;
+    var vs = sink.VerifySink.init(want_blake);
+    if (unpacked_size == 0) return vs;
 
-    var bs = sink.BufferSink.init(output);
-    try session.*.?.decodeFile(packed_data, unpacked_size, compression.solid, bs.sink());
-    return output;
+    try session.*.?.decodeFile(packed_data, unpacked_size, compression.solid, vs.sink());
+    return vs;
 }
 
 /// RAR4 counterpart of `decodeEntryRar5`; see that function for why non-solid
@@ -407,7 +408,7 @@ fn decodeEntryRar4(
     unpack_version: u8,
     file_flags_raw: u16,
     solid: bool,
-) ![]u8 {
+) !sink.VerifySink {
     if (session.*) |*s| {
         if (!s.acceptsRar4(unpack_version, file_flags_raw)) {
             s.deinit();
@@ -418,13 +419,12 @@ fn decodeEntryRar4(
         session.* = try dispatch.SolidSession.initRar4(allocator, unpack_version, file_flags_raw);
     }
 
-    const output = try allocator.alloc(u8, @intCast(unpacked_size));
-    errdefer allocator.free(output);
-    if (unpacked_size == 0) return output;
+    // RAR4 has no BLAKE2sp — CRC32 is the only checksum the format carries.
+    var vs = sink.VerifySink.init(false);
+    if (unpacked_size == 0) return vs;
 
-    var bs = sink.BufferSink.init(output);
-    try session.*.?.decodeFile(packed_data, unpacked_size, solid, bs.sink());
-    return output;
+    try session.*.?.decodeFile(packed_data, unpacked_size, solid, vs.sink());
+    return vs;
 }
 
 // ============================================================================
@@ -533,44 +533,49 @@ fn validate_rar5_payload(data: []const u8, sig_offset: usize, sig_len: u8) Valid
 							const packed_data = data[payload_start..payload_end];
 							const alloc = std.heap.page_allocator;
 
-							const decompressed = decodeEntryRar5(
+							// Resolve the expected BLAKE2sp BEFORE decoding: the
+							// hash has to be computed as the bytes stream past,
+							// so we cannot wait until afterwards to decide
+							// whether we wanted it.
+							//
+							// The non-allocating `_raw` form also retires a
+							// silent-skip path — the old code called
+							// `parse_extra_records(...) catch { continue; }`,
+							// so a malformed extra record skipped BLAKE2sp
+							// verification entirely and the entry still passed.
+							// "Could not check" must never read as "nothing
+							// wrong".
+							const expected_blake = rar5_headers.extract_blake2sp_hash_raw(f.extra_data);
+
+							var verify = decodeEntryRar5(
 								&solid_session,
 								alloc,
 								packed_data,
 								f.unpacked_size,
 								f.compression,
+								expected_blake != null,
 							) catch {
 								structural.is_valid = false;
 								structural.error_message = "decompression failed during validation";
 								return structural;
 							};
-							defer alloc.free(decompressed);
 
 							// CRC32 check
 							if (f.has_crc32) {
-								const computed_crc = integrity.crc32(decompressed);
-								if (computed_crc != f.data_crc32.?) {
+								if (verify.crc32() != f.data_crc32.?) {
 									structural.is_valid = false;
 									structural.error_message = "payload CRC32 mismatch";
 									return structural;
 								}
 							}
 
-							// Check BLAKE2sp hash if present in extra records
-							if (f.extra_data) |extra_bytes| {
-								const extra_records = rar5_headers.parse_extra_records(extra_bytes, alloc) catch {
-									continue;
-								};
-								defer alloc.free(extra_records);
-
-								if (rar5_headers.extract_blake2sp_hash(extra_records)) |expected_hash| {
-									var computed_hash: [32]u8 = undefined;
-									integrity.blake2sp(decompressed, &computed_hash);
-									if (!std.mem.eql(u8, &computed_hash, &expected_hash)) {
-										structural.is_valid = false;
-										structural.error_message = "payload BLAKE2sp mismatch";
-										return structural;
-									}
+							if (expected_blake) |expected_hash| {
+								var computed_hash: [32]u8 = undefined;
+								verify.blake2sp(&computed_hash);
+								if (!std.mem.eql(u8, &computed_hash, &expected_hash)) {
+									structural.is_valid = false;
+									structural.error_message = "payload BLAKE2sp mismatch";
+									return structural;
 								}
 							}
 						}

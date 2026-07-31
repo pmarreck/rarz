@@ -75,8 +75,8 @@ coverage must be *precise* (never forgiving) with *actionable* error detail.
   RAR5; fixed in `00be71e`. Found by noticing a 30-truncation differential
   sweep was *vacuous for RAR4* — every fixture is RAR5. (2026-07-29 EDT)
 - [ ] **Precision pass 3b — remaining silent-skip paths.** Still to sweep:
-  `parse_extra_records ... catch { continue; }` (malformed extra record silently
-  skips BLAKE2sp verification), the multi-volume collector's
+  ~~`parse_extra_records ... catch { continue; }`~~ (DONE 2026-07-31, see 4g),
+  the multi-volume collector's
   `if (payload_end <= vol_data.len)` chunk-drop guard, and the second-walk
   `iter.next() catch break` in `validate_rar5_payload` / `validate_rar4_payload`.
   Failing test first for each.
@@ -361,25 +361,51 @@ Work items:
   with 4g — the Zig-side sink exists, but there is nothing worth exposing until
   validation actually streams.)
 
-#### 4g. Remaining from the solid design: streaming verification
+#### 4g. Streaming verification — DONE 2026-07-31 19:45 EDT
 
-The sink plumbing landed; the memory win did not. `policy.zig` still allocates a
-buffer per compressed entry, because `integrity.crc32` and `integrity.blake2sp`
-are both one-shot over a contiguous slice, and the window hands out its bytes as
-one or TWO spans (the buffer is circular). Closing this is what turns the sink
-from an internal convenience into the thing Peter actually asked for — "streaming
-into the void while watching for errors" — and it is also the answer to
-validate's 2026-07-10 streaming request.
+Validation no longer materialises decoded entries. This is what Peter asked for
+— "streaming into the void while watching for errors" — and it is the answer to
+validate's 2026-07-10 request. They confirmed 2026-07-31 that the OUTPUT side is
+their binding constraint: they mmap the archive, so holding it as `[]const u8` is
+cheap, and their RAM cost was exactly the per-entry decoded buffer.
 
-- [ ] Incremental `crc32(seed, bytes)` — trivial, the polynomial state IS the
-  seed.
-- [ ] Incremental BLAKE2sp — needs a 512-byte staging buffer to keep the 8-way
-  round-robin leaf distribution intact across `update` calls.
-- [ ] `VerifySink` combining both; point `policy.zig` at it so validation never
-  materialises a decoded entry. Memory drops from "whole archive + whole decoded
-  file" to "window + hash state".
-- [ ] Then expose verify-only through the C FFI, and tell
-  `validate-archive-streaming` it landed (see §5).
+The obstacle was never the decoder. It was that `integrity.crc32` and
+`integrity.blake2sp` were one-shot over a contiguous slice, while the LZ window
+is circular and hands out a logically-contiguous run as one or TWO spans.
+
+- [x] Incremental `integrity.Crc32` — the polynomial state IS the seed, so the
+  one-shot and incremental paths now share `crc32_slice8_raw`. Two copies that
+  agree only by inspection is how a chunked hash silently diverges.
+- [x] Incremental `integrity.Blake2sp` — 512-byte staging buffer keeps the 8-way
+  round-robin leaf assignment identical to the one-shot regardless of how the
+  caller splits input. Differential tests sweep EVERY split point over >2 full
+  rounds, plus one-byte-at-a-time; verified non-vacuous by corrupting the
+  implementation and confirming all four tests fail.
+- [x] `VerifySink` combining both; `policy.zig` now hashes straight from the
+  window and never materialises a decoded entry.
+
+  **Measured** (25 MB corpus, 6 x 4.3 MB entries, 3 runs each, peak RSS via
+  /proc VmHWM):
+
+  | archive | before | after | saved |
+  |---|---|---|---|
+  | non-solid | 16.5 MB | 12.3 MB | 4.2 MB (25%) |
+  | solid | 40.9 MB | 36.7 MB | 4.2 MB (10%) |
+
+  The saving is exactly one decoded entry (4308894 B = 4208 KB), reproducible
+  to +/-10 KB. Verdicts unchanged and still agree with unrar.
+- [x] **Bonus: retired a §3b silent-skip path.** The RAR5 BLAKE2sp check used
+  `parse_extra_records(...) catch { continue; }`, so a malformed extra record
+  skipped hash verification entirely and the entry still passed — "could not
+  check" reading as "nothing wrong". Streaming forced the expected hash to be
+  resolved BEFORE decoding (you cannot decide after the fact whether you wanted
+  a hash you were supposed to compute as bytes flowed past), and the
+  non-allocating `extract_blake2sp_hash_raw` has no such escape hatch.
+- [ ] Expose verify-only through the C FFI. Still open; nothing in-tree consumes
+  it yet, since `validate` imports the Zig module directly.
+
+---
+
 - [x] Acceptance: `tests/fixtures/known_gaps/rar2_v20_solid.rar` extracts 7/7
   byte-identical and validates VALID, then gets promoted into
   `tests/fixtures/`; plus a RAR5 solid fixture added to the corpus (generate

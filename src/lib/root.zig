@@ -332,7 +332,7 @@ export fn rarz_file_info(archive: ?*const ArchiveHandle, index: u32, out: ?*Rarz
 			.crc32 = f.file_crc,
 			.mtime = f.mtime,
 			.method = f.method,
-			.is_directory = @intFromBool((f.attributes & 0x10) != 0),
+			.is_directory = @intFromBool(rar4_headers.is_directory_entry(f)),
 			.is_encrypted = @intFromBool(fflags.password),
 			.host_os = f.host_os,
 			.split_before = @intFromBool(fflags.split_before),

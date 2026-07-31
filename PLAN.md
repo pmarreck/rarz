@@ -147,6 +147,22 @@ Work items, in order:
   (`02a4f4a`); a real third-party RAR4 now extracts with a tree and contents
   byte-identical to unrar.
 
+- [x] **RAR4 directory entries misdetected on Unix-written archives**
+  (2026-07-31 EDT). `is_directory` keyed on the DOS attribute bit `0x10`, which
+  is only meaningful on DOS/Windows hosts. RAR4 stores the HOST OS's native
+  attributes, so a Unix-created directory carries a mode word (0040755) whose
+  bit 4 is a permission bit, clear for 0755 — directory entries were classified
+  as regular FILES. Now uses the format's own marker,
+  `(flags & LHD_WINDOWMASK) == LHD_DIRECTORY` (0x00e0), per unrar arcread.cpp,
+  with the attribute check kept as a DOS/Windows-only fallback.
+
+  Invisible until now because every RAR4 fixture was either wine-written
+  (Windows host, so the attribute bit was set) or listed its directory entry
+  BEFORE its contents, in which case the parent was created on demand and the
+  misclassification had no visible effect. The new Unix-written v29 solid
+  fixture lists `sub` LAST, so rarz tried to create a file over an existing
+  directory: stderr error and exit 1 on a perfectly valid archive.
+
 ### 4d. ✅ RAR 2.x (v20) decoder — FIXED 2026-07-30
 
 First-ever differential test of `unpack20` against real archives. Corpus built

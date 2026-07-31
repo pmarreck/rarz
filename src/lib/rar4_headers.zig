@@ -153,6 +153,34 @@ pub fn parse_file_flags(raw: u16) FileFlags {
 	};
 }
 
+/// RAR4's directory marker: the dictionary-size field with every bit set.
+///
+/// Reference (unrar arcread.cpp):
+///     hd->Dir = (hd->Flags & LHD_WINDOWMASK) == LHD_DIRECTORY;
+/// with `LHD_WINDOWMASK == LHD_DIRECTORY == 0x00e0`. A directory has no data to
+/// keep a dictionary for, so the format reuses that field's all-ones value as
+/// the marker.
+///
+/// This replaced a check on the DOS attribute bit (`attributes & 0x10`), which
+/// is only meaningful for archives written on DOS/Windows. RAR4 stores the HOST
+/// OS's native attributes, so on a Unix-created archive that field holds a mode
+/// word — for a 0755 directory, bit 4 is a permission bit and happens to be
+/// clear. Directory entries in Unix-written RAR4 archives were therefore treated
+/// as regular FILES. Extraction still produced the right tree whenever the
+/// directory entry came before its contents (the parent was created on demand),
+/// so the bug only surfaced when it came last, and then only as a stderr error
+/// and a nonzero exit on a perfectly valid archive.
+pub fn is_directory_entry(f: FileHeader) bool {
+	const LHD_WINDOWMASK: u16 = 0x00e0;
+	const LHD_DIRECTORY: u16 = 0x00e0;
+	if ((f.block.flags & LHD_WINDOWMASK) == LHD_DIRECTORY) return true;
+	// Fallback for DOS/Windows-written archives, which additionally carry the
+	// FILE_ATTRIBUTE_DIRECTORY bit. Harmless elsewhere: on Unix hosts bit 4 is
+	// a group-execute permission, which cannot appear alone on a plain file
+	// without the flags marker also being set.
+	return f.host_os <= 1 and (f.attributes & 0x10) != 0;
+}
+
 /// Parse file-specific fields following the base block header.
 /// The reader should be positioned right after the base header (and data_size
 /// if LONG_BLOCK was set). The block parameter is the already-parsed base header.
@@ -382,6 +410,74 @@ test "parse_main_flags extracts bits correctly" {
 	try testing.expect(partial.password);
 	try testing.expect(!partial.protect);
 	try testing.expect(!partial.first_volume);
+}
+
+/// Build a minimal FileHeader for the directory-detection tests.
+fn dir_test_header(flags: u16, host_os: u8, attributes: u32) FileHeader {
+	return .{
+		.block = .{
+			.head_crc = 0,
+			.header_type = .file,
+			.flags = flags,
+			.head_size = 32,
+			.data_size = 0,
+			.header_offset = 0,
+		},
+		.packed_size = 0,
+		.unpacked_size = 0,
+		.host_os = host_os,
+		.file_crc = 0,
+		.mtime = 0,
+		.unpack_version = 29,
+		.method = 0,
+		.attributes = attributes,
+		.file_name = "sub",
+	};
+}
+
+test "is_directory_entry uses the format's own marker, not host attributes" {
+	// The bug this pins: detection keyed on the DOS attribute bit 0x10, which is
+	// only meaningful on DOS/Windows hosts. RAR4 stores the HOST OS's native
+	// attributes, so a Unix-created directory carries a mode word (0040755) in
+	// which bit 4 is a permission bit and is clear for 0755. Such entries were
+	// classified as regular FILES.
+	const unix_dir_mode: u32 = 0o040755;
+	try testing.expect((unix_dir_mode & 0x10) == 0); // the trap, stated outright
+
+    // Unix host (3), directory flags set, DOS attribute bit absent.
+	try testing.expect(is_directory_entry(dir_test_header(0x00e0, 3, unix_dir_mode)));
+}
+
+test "is_directory_entry: LHD_WINDOWMASK must be FULLY set" {
+	// 0x00e0 is the dictionary-size field; a directory is the all-ones value.
+	// Any partial value is a real dictionary size on a real file, so treating
+	// "any bit set" as a directory would misclassify most compressed entries.
+	var partial: u16 = 0x0020;
+	while (partial < 0x00e0) : (partial += 0x0020) {
+		try testing.expect(!is_directory_entry(dir_test_header(partial, 3, 0o100644)));
+	}
+	try testing.expect(is_directory_entry(dir_test_header(0x00e0, 3, 0o100644)));
+}
+
+test "is_directory_entry: DOS attribute fallback only on DOS/Windows hosts" {
+	// Windows host (0) with FILE_ATTRIBUTE_DIRECTORY but no flags marker.
+	try testing.expect(is_directory_entry(dir_test_header(0x0000, 0, 0x10)));
+	// Same attribute value on a Unix host is group-execute on a plain file,
+	// which must NOT be read as a directory.
+	try testing.expect(!is_directory_entry(dir_test_header(0x0000, 3, 0o100710)));
+}
+
+test "is_directory_entry: ordinary files are never directories" {
+	// Sweep the dictionary-size field across every non-directory value at each
+	// host OS, so this is a classifier over a SET rather than one example.
+	var host: u8 = 0;
+	while (host <= 5) : (host += 1) {
+		var dict: u16 = 0;
+		while (dict < 0x00e0) : (dict += 0x0020) {
+			const h = dir_test_header(dict | 0x8000, host, 0o100644);
+			try testing.expect(!is_directory_entry(h));
+		}
+	}
 }
 
 test "parse_file_flags extracts bits correctly" {

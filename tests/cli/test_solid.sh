@@ -106,8 +106,18 @@ for f in $SOLID_FIXTURES; do
 	rarz_dir=$(mktemp -d)
 	unrar_dir=$(mktemp -d)
 
-	"$RARZ" x "$f" "$rarz_dir" >/dev/null 2>&1
+	rarz_out=$("$RARZ" x "$f" "$rarz_dir" 2>&1)
 	rarz_rc=$?
+
+	# Extracting a VALID archive must succeed cleanly. Comparing only file
+	# CONTENT would let a nonzero exit and an error on stderr slide by, and a
+	# caller scripting around rarz sees the exit code, not the bytes.
+	if [ "$rarz_rc" -ne 0 ]; then
+		fail "$name: rarz extract exited $rarz_rc on a valid archive: $(echo "$rarz_out" | grep -i error | head -1)"
+	fi
+	if echo "$rarz_out" | grep -qi 'error'; then
+		fail "$name: rarz extract reported an error on a valid archive: $(echo "$rarz_out" | grep -i error | head -1)"
+	fi
 
 	if ! unrar x -o+ "$f" "$unrar_dir/" >/dev/null 2>&1; then
 		fail "$name: unrar extract failed"

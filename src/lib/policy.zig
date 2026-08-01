@@ -182,7 +182,23 @@ fn validate_rar4_payload(data: []const u8, sig_offset: usize) ValidationResult {
 	defer if (solid_session) |*s| s.deinit();
 
 	while (true) {
-		const maybe_block = iter.next() catch break;
+		// FAIL, don't stop. This is the payload walk; the structural walk above
+		// already parsed the same blocks, so an error here means the two
+		// disagree — and the only safe reading of that is "we cannot verify the
+		// rest", not "the rest is fine". Breaking silently left every remaining
+		// entry unchecked and still returned the structural VALID.
+		//
+		// Currently unreachable: both walks run the same iterator over the same
+		// bytes, so the structural pass would have failed first. Measured — 0
+		// hits across the whole fixture corpus, 8 byte-mutations and 8
+		// truncations of each, and the unit suite's exhaustive single-byte and
+		// every-position-truncation sweeps. It is hardened anyway because the
+		// failure direction of a stale assumption here is a silent PASS.
+		const maybe_block = iter.next() catch {
+			structural.is_valid = false;
+			structural.error_message = "block parse error during payload verification";
+			return structural;
+		};
 		const block = maybe_block orelse break;
 
 		switch (block) {
@@ -447,7 +463,14 @@ fn validate_rar5_payload(data: []const u8, sig_offset: usize, sig_len: u8) Valid
 	defer if (solid_session) |*s| s.deinit();
 
 	while (true) {
-		const maybe_block = iter.next() catch break;
+		// FAIL, don't stop — see the matching note in validate_rar4_payload.
+		// Stopping here left every remaining entry unverified while still
+		// returning the structural VALID.
+		const maybe_block = iter.next() catch {
+			structural.is_valid = false;
+			structural.error_message = "block parse error during payload verification";
+			return structural;
+		};
 		const block = maybe_block orelse break;
 
 		switch (block) {
@@ -652,7 +675,14 @@ pub fn validate_volumes(volumes: []const []const u8) ValidationResult {
 		var iter = rar5_headers.walk_blocks(vol_data[block_start..]);
 
 		while (true) {
-			const maybe_block = iter.next() catch break;
+			// FAIL, don't stop. Abandoning the walk mid-volume leaves the
+			// remaining files out of `chunks` entirely, and step 3 then verifies
+			// only what it happens to have collected and reports VALID. A file
+			// that vanished from consideration must not read as a file that
+			// passed.
+			const maybe_block = iter.next() catch {
+				return invalid_result(.rar50, "block parse error while collecting volume file chunks");
+			};
 			const block = maybe_block orelse break;
 
 			switch (block) {
@@ -663,7 +693,20 @@ pub fn validate_volumes(volumes: []const []const u8) ValidationResult {
 					const data_size = f.header.data_size orelse 0;
 					const payload_end = payload_start + @as(usize, @intCast(data_size));
 
-					if (payload_end <= vol_data.len) {
+					// PRECISION: a chunk declaring more payload than its volume
+					// physically holds means that volume is truncated. The old
+					// code simply did not append it — so the file silently left
+					// the verification set, the surviving chunks checked out,
+					// and the archive was reported VALID. Absence of evidence
+					// became evidence of correctness, on the exact input a
+					// file-integrity product exists to catch.
+					//
+					// The single-volume path has always failed this case; the
+					// multi-volume path did not.
+					if (payload_end > vol_data.len) {
+						return invalid_result(.rar50, "declared payload extends beyond end of volume (truncated)");
+					}
+					{
 						chunks.append(alloc, .{
 							.volume_idx = vi,
 							.data_ptr = vol_data[payload_start..payload_end].ptr,

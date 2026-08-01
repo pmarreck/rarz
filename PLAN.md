@@ -424,6 +424,50 @@ is circular and hands out a logically-contiguous run as one or TWO spans.
   resolved BEFORE decoding (you cannot decide after the fact whether you wanted
   a hash you were supposed to compute as bytes flowed past), and the
   non-allocating `extract_blake2sp_hash_raw` has no such escape hatch.
+#### Two defects in the first `rarz verify` (found 2026-08-01 while designing exit codes)
+
+- [x] **`verify` ignored multi-volume sets.** `cmd_verify` called `rarz_open` on
+  the single named file with no `discover_volumes`, unlike `cmd_test`. A
+  compressed entry continuing into the next volume therefore held only its
+  leading chunk, decoded as "failed", and `verify` contradicted both `rarz t` and
+  unrar on an intact set. `rarz_verify_file` gained a `unified_files` branch, and
+  that branch must come FIRST — a volume-set handle also has `rar5_files`
+  populated for its own volume, which is precisely the wrong thing to read.
+  Escaped review because the suite's target list contained no volume fixture,
+  despite three sitting in the corpus.
+- [x] **The short-decode check was documented but absent.**
+  `rarz_verify_result.bytes_verified` carried a comment saying the caller
+  compares it against the declared unpacked size. Nothing did. An entry whose
+  decoder stopped early would report verified whenever no checksum existed to
+  catch it. Now compared inside `rarz_verify_file`, before any checksum test.
+
+#### Verify-only exit-code contract (Peter's call, 2026-08-01)
+
+A bare non-zero cannot distinguish "this archive is damaged" from "I could not
+form an opinion", and those call for different responses — restore-from-backup
+versus a tooling gap. `rarz verify` therefore returns:
+
+| code | meaning |
+|---|---|
+| 0 | every entry verified against a stored checksum, all matched |
+| 1 | confirmed damage: checksum mismatch, or an unparseable archive |
+| 64 | `EX_USAGE` — missing/bad arguments |
+| 65 | `EX_DATAERR` — an entry carries NO checksum, so nothing could be verified |
+| 66 | `EX_NOINPUT` — archive missing or unreadable |
+| 69 | `EX_UNAVAILABLE` — an entry could not be decoded by this build |
+
+Precedence when several apply: damage > cannot-decode > no-checksum.
+
+Operational codes come from `sysexits.h` deliberately, so they cannot be
+confused with unrar's own scheme if a script swaps one tool for the other
+(measured: unrar returns 0 intact / 3 CRC error / 10 missing file).
+
+Reachability, measured across the corpus × 12 mutations each: **69 fires 46
+times** (corrupt archives that cannot be decoded — the distinction is live and
+tested). **65 never fires** — both RAR4 and RAR5 always store a CRC32. It is
+defined and documented but currently unreachable; no test asserts it, because a
+test that cannot run is worse than an honest gap.
+
 - [x] Expose verify-only through the C FFI — `rarz_verify_file` + the `rarz verify`
   command (2026-07-31 EDT). Was: still open; nothing in-tree consumes
   it yet, since `validate` imports the Zig module directly.

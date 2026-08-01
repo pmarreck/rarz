@@ -13,6 +13,14 @@
 #define isatty _isatty
 #define fileno _fileno
 #endif
+/* sysexits.h is BSD-derived and absent on Windows, so the three constants used
+ * here are defined directly. Values are the canonical ones from sysexits.h. */
+#define EX_USAGE       64
+#define EX_DATAERR     65
+#define EX_NOINPUT     66
+#define EX_UNAVAILABLE 69
+#define EX_OSERR       71
+
 #include "rarz.h"
 #include "progrez.h"
 
@@ -137,6 +145,15 @@ static void print_usage(void) {
 	printf("    -v<size>                       Split into volumes (e.g. -v10m, -v700k, -v1g)\n");
 	printf("  rarz --help                      Show this help\n");
 	printf("  rarz --about                     Show version, platform and build mode\n");
+	printf("\n");
+	printf("Exit codes for 'verify' (a bare non-zero cannot distinguish damage\n");
+	printf("from an inability to form an opinion, and those need different responses):\n");
+	printf("   0  every entry verified against a stored checksum, all matched\n");
+	printf("   1  confirmed damage: checksum mismatch, or an unparseable archive\n");
+	printf("  64  usage error (EX_USAGE)\n");
+	printf("  65  an entry carries no checksum, so nothing could be verified (EX_DATAERR)\n");
+	printf("  66  archive missing or unreadable (EX_NOINPUT)\n");
+	printf("  69  an entry could not be decoded by this build (EX_UNAVAILABLE)\n");
 }
 
 /* One line, per Peter's CLI brief: app, version, platform/arch, build mode.
@@ -818,29 +835,68 @@ static const char *verify_status_label(int32_t status) {
 	switch (status) {
 	case RARZ_VERIFY_OK:                return "OK";
 	case RARZ_VERIFY_CHECKSUM_MISMATCH: return "FAIL";
-	case RARZ_VERIFY_NO_CHECKSUM:       return "UNVERIFIED";
+	case RARZ_VERIFY_NO_CHECKSUM:       return "NOSUM";
 	case RARZ_VERIFY_UNSUPPORTED:       return "UNVERIFIED";
 	default:                            return "ERROR";
 	}
 }
 
 static int cmd_verify(const char *path) {
-	size_t len = 0;
-	uint8_t *data = read_file(path, &len);
-	if (!data) return 1;
+	/* Volume discovery, exactly as cmd_test does. Opening only the named file
+	 * would give a handle whose split entries hold just their leading chunk, so
+	 * a compressed file continuing into the next volume decodes as "failed" on
+	 * a perfectly intact set. */
+	volume_set vs = discover_volumes(path);
+	if (vs.count == 0) {
+		fprintf(stderr, "error: cannot discover volumes for '%s'\n", path);
+		return EX_NOINPUT;
+	}
 
-	rarz_archive *archive = rarz_open(data, len);
+	uint8_t **vol_bufs = calloc(vs.count, sizeof(uint8_t *));
+	size_t *vol_lens = calloc(vs.count, sizeof(size_t));
+	if (!vol_bufs || !vol_lens) {
+		fprintf(stderr, "error: out of memory\n");
+		free(vol_bufs); free(vol_lens);
+		free_volume_set(&vs);
+		return EX_OSERR;
+	}
+
+	for (int i = 0; i < vs.count; i++) {
+		vol_bufs[i] = read_file(vs.paths[i], &vol_lens[i]);
+		if (!vol_bufs[i]) {
+			for (int j = 0; j < i; j++) free(vol_bufs[j]);
+			free(vol_bufs); free(vol_lens);
+			free_volume_set(&vs);
+			return EX_NOINPUT;
+		}
+	}
+
+	rarz_archive *archive;
+	if (vs.count > 1) {
+		const uint8_t **const_bufs = (const uint8_t **)vol_bufs;
+		archive = rarz_open_volumes(const_bufs, vol_lens, (uint32_t)vs.count);
+	} else {
+		archive = rarz_open(vol_bufs[0], vol_lens[0]);
+	}
+
 	if (!archive) {
+		/* Unparseable is a verdict about the DATA, not an operational problem,
+		 * so it shares exit 1 with a checksum mismatch: the archive is not
+		 * intact either way. */
 		fprintf(stderr, "error: cannot open '%s': %s\n", path,
 		        rarz_last_error() ? rarz_last_error() : "unknown error");
-		free(data);
+		for (int i = 0; i < vs.count; i++) free(vol_bufs[i]);
+		free(vol_bufs); free(vol_lens);
+		free_volume_set(&vs);
 		return 1;
 	}
 
-	printf("Verifying archive: %s\n", path);
+	printf("Verifying archive: %s", path);
+	if (vs.count > 1) printf(" (%d volumes)", vs.count);
+	printf("\n");
 
 	uint32_t count = rarz_file_count(archive);
-	uint32_t verified = 0, failed = 0, unverified = 0, dirs = 0;
+	uint32_t verified = 0, failed = 0, unverified = 0, no_checksum = 0, dirs = 0;
 
 	for (uint32_t i = 0; i < count; i++) {
 		rarz_file_entry entry;
@@ -871,28 +927,59 @@ static int cmd_verify(const char *path) {
 			failed++;
 			printf("  %-10s %-48s CRC32 %08X != %08X\n", label, name,
 			       vr.crc32_actual, vr.crc32_expected);
+		} else if (status == RARZ_VERIFY_NO_CHECKSUM) {
+			/* Decoded cleanly and produced exactly the declared size, but the
+			 * archive stores nothing to compare against. Weaker evidence than a
+			 * checksum match, and reported as its own thing rather than folded
+			 * into OK. */
+			no_checksum++;
+			printf("  %-10s %-48s decoded %llu bytes, no checksum stored\n", label, name,
+			       (unsigned long long)vr.bytes_verified);
 		} else {
 			/* Cannot verify is NOT the same as verified-bad, and is reported
 			 * separately so a caller can tell a damaged archive from one this
 			 * build cannot decode. */
 			unverified++;
 			printf("  %-10s %-48s %s\n", label, name,
-			       rarz_last_error() ? rarz_last_error() : "no checksum stored");
+			       rarz_last_error() ? rarz_last_error() : "cannot decode");
 		}
 	}
 
 	printf("Verified %u file%s", verified, verified == 1 ? "" : "s");
 	if (dirs) printf(", %u director%s", dirs, dirs == 1 ? "y" : "ies");
 	if (failed) printf(", %u FAILED", failed);
-	if (unverified) printf(", %u unverified", unverified);
+	if (unverified) printf(", %u unverifiable", unverified);
+	if (no_checksum) printf(", %u without a checksum", no_checksum);
 	printf("\n");
 
 	rarz_close(archive);
-	free(data);
+	for (int i = 0; i < vs.count; i++) free(vol_bufs[i]);
+	free(vol_bufs);
+	free(vol_lens);
+	free_volume_set(&vs);
 
-	/* Unverified is not success: an entry we could not check must not report as
-	 * checked. Precision over forgiveness. */
-	return (failed == 0 && unverified == 0) ? 0 : 1;
+	/*
+	 * Exit codes. A bare non-zero cannot distinguish "this archive is damaged"
+	 * from "I could not form an opinion", and those call for different actions:
+	 * the first is a restore-from-backup, the second is a tooling gap.
+	 *
+	 *   0   every entry verified against a stored checksum, all matched
+	 *   1   confirmed damage (checksum mismatch, or an unparseable archive)
+	 *   64  EX_USAGE       missing/bad arguments
+	 *   65  EX_DATAERR     an entry carries NO checksum — nothing to verify
+	 *   66  EX_NOINPUT     archive missing or unreadable
+	 *   69  EX_UNAVAILABLE an entry could not be decoded by this build
+	 *
+	 * Precedence when several apply: confirmed damage outranks could-not-verify,
+	 * and being unable to decode outranks having nothing to compare against —
+	 * report the most serious finding. The operational codes come from
+	 * sysexits.h so they cannot be mistaken for unrar's own 0-11 scheme
+	 * (0 ok / 3 CRC error / 10 no input) if a script swaps one tool for the other.
+	 */
+	if (failed) return 1;
+	if (unverified) return EX_UNAVAILABLE;
+	if (no_checksum) return EX_DATAERR;
+	return 0;
 }
 
 /* ========================================================================== */
@@ -1709,7 +1796,7 @@ int main(int argc, char **argv) {
 	case CMD_VERIFY:
 		if (argc < 3) {
 			fprintf(stderr, "error: 'verify' requires an archive path\n");
-			return 1;
+			return EX_USAGE;
 		}
 		return cmd_verify(argv[2]);
 

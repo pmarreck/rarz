@@ -81,13 +81,24 @@ for set_name in $SETS; do
 	false_pass=0
 	stricter=0
 
-	# Sweep every volume in the set, truncating and mutating each.
+	# Copy the set ONCE and restore only the damaged volume between iterations.
+	# Re-copying every time made this suite 124s on its own — the sets run to
+	# several MB and there are 42 combinations.
+	d="$work/dmg_$set_name"
+	mkdir -p "$d"
+	find "$FIXTURES" -maxdepth 1 -name "${set_name}.part*.rar" -exec cp {} "$d/" \;
+
+	# Sweep every volume in the set, truncating and mutating each. Exactly ONE
+	# volume is damaged per iteration — restoring the previously damaged one is
+	# what keeps that true, since otherwise moving to the next volume would leave
+	# the last one broken and start testing compound damage instead.
+	last_damaged=""
 	while IFS= read -r vol; do
 		volname=$(basename "$vol")
 		for amount in 24 128 700; do
-			d="$work/dmg"
-			rm -rf "$d"; mkdir -p "$d"
-			find "$FIXTURES" -maxdepth 1 -name "${set_name}.part*.rar" -exec cp {} "$d/" \;
+			[ -n "$last_damaged" ] && cp "$FIXTURES/$last_damaged" "$d/$last_damaged"
+			cp "$FIXTURES/$volname" "$d/$volname"
+			last_damaged="$volname"
 			target="$d/$volname"
 			sz=$(stat -c%s "$target" 2>/dev/null || stat -f%z "$target")
 			[ "$sz" -gt "$amount" ] || continue

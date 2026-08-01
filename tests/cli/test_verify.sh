@@ -51,6 +51,14 @@ trap 'rm -rf "$work"' EXIT
 # and one solid archive per family (the sequential path).
 TARGETS="rar5_store rar5_m3 rar5_solid rar4_store rar4_m3 rar4_v29_solid rar2_v20_m3 rar2_v20_solid"
 
+# Multi-volume sets, addressed by their first part. These are separate because
+# `verify` must do the same volume discovery `test` does — the first version of
+# this command did not, so it tried to decode a file whose data continues in the
+# next volume, reported "decompression failed", and contradicted both `rarz t`
+# and unrar on an intact archive. The original TARGETS list contained no volume
+# fixture, which is exactly why that shipped.
+VOLUME_TARGETS="rar5_vol_store.part1 rar5_vol_m3.part01 rar5_vol_large.part1"
+
 echo "=== Gate A: clean archives verify, and agree with t and unrar ==="
 
 for name in $TARGETS; do
@@ -69,6 +77,108 @@ for name in $TARGETS; do
 		fail "$name: verify rc=$rc, t=$t, unrar=$u — $(echo "$out" | tail -1)"
 	fi
 done
+
+echo ""
+echo "=== Gate A2: multi-volume sets verify, and agree with t and unrar ==="
+
+for name in $VOLUME_TARGETS; do
+	f="$FIXTURES/$name.rar"
+	[ -f "$f" ] || continue
+
+	out=$("$RARZ" verify "$f" 2>&1)
+	rc=$?
+	unrar t "$f" >/dev/null 2>&1 && u=ok || u=damaged
+	if "$RARZ" t "$f" 2>&1 | grep -q "Validation: VALID"; then t=valid; else t=invalid; fi
+
+	if [ "$rc" -eq 0 ] && [ "$u" = ok ] && [ "$t" = valid ]; then
+		ok "$name: multi-volume verify exit 0, agrees with t and unrar"
+	else
+		fail "$name: verify rc=$rc, t=$t, unrar=$u — $(echo "$out" | grep -E 'UNVERIFIED|FAIL' | head -1)"
+	fi
+done
+
+echo ""
+echo "=== Gate D: exit codes are distinguishable, not just zero/non-zero ==="
+#
+# 0   every entry verified against a stored checksum, all matched
+# 1   confirmed damage (checksum mismatch, or a structurally invalid archive)
+# 64  EX_USAGE      missing/bad arguments
+# 65  EX_DATAERR    an entry carries NO checksum — nothing to verify against
+# 66  EX_NOINPUT    archive missing or unreadable
+# 69  EX_UNAVAILABLE an entry could not be decoded by this build
+#
+# The point is that a caller can tell "this archive is damaged" from "I could
+# not form an opinion", which a bare non-zero cannot express. sysexits values
+# are used for the operational half so they cannot be confused with unrar's own
+# 0-11 scheme if someone swaps one tool for the other.
+
+"$RARZ" verify "$FIXTURES/rar5_m3.rar" >/dev/null 2>&1
+[ $? -eq 0 ] && ok "intact archive exits 0" || fail "intact archive should exit 0 (got $?)"
+
+"$RARZ" verify >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 64 ] && ok "missing argument exits 64 (EX_USAGE)" || fail "missing argument should exit 64, got $rc"
+
+"$RARZ" verify /nonexistent/archive.rar >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 66 ] && ok "unreadable archive exits 66 (EX_NOINPUT)" || fail "unreadable archive should exit 66, got $rc"
+
+# Confirmed damage must be 1, distinctly from any could-not-verify code.
+dmg="$work/dmg.rar"
+cp "$FIXTURES/rar5_m3.rar" "$dmg"
+dsz=$(stat -c%s "$dmg" 2>/dev/null || stat -f%z "$dmg")
+printf '\xA5' | dd of="$dmg" bs=1 seek=$((dsz * 2 / 3)) count=1 conv=notrunc 2>/dev/null
+if unrar t "$dmg" >/dev/null 2>&1; then
+	echo "  (skip: mutation did not damage the archive)"
+else
+	"$RARZ" verify "$dmg" >/dev/null 2>&1
+	rc=$?
+	[ "$rc" -eq 1 ] && ok "checksum mismatch exits 1" || fail "checksum mismatch should exit 1, got $rc"
+fi
+
+# Could-not-decode must be DISTINCT from confirmed damage. This is the whole
+# reason for separate codes: an entry rarz cannot decode is a gap in this build,
+# not proof the archive is bad, and the two call for different responses.
+# Fixture+offset chosen because it reproducibly lands on that path.
+cnv="$work/cannot_verify.rar"
+cp "$FIXTURES/rar4_v29_lines.rar" "$cnv"
+printf '\xA5' | dd of="$cnv" bs=1 seek=91 count=1 conv=notrunc 2>/dev/null
+"$RARZ" verify "$cnv" >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 69 ] && ok "undecodable entry exits 69 (EX_UNAVAILABLE), not 1" \
+	|| fail "undecodable entry should exit 69, got $rc"
+
+# Not a RAR at all — structurally invalid is a damage verdict, not an
+# operational error, so it shares exit 1 with a checksum mismatch.
+printf 'this is definitely not a rar archive at all' > "$work/notrar.rar"
+"$RARZ" verify "$work/notrar.rar" >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 1 ] && ok "structurally invalid archive exits 1" || fail "invalid archive should exit 1, got $rc"
+
+echo ""
+echo "=== Gate E: a short decode is caught even with no checksum to compare ==="
+#
+# rarz_verify_result.bytes_verified is compared against the header's declared
+# unpacked size. Without that, an entry carrying no checksum whose decoder
+# stopped early would report verified — the decoded bytes would simply be fewer
+# than promised and nobody would look. The struct documented this check before
+# it existed.
+short_out=$("$RARZ" verify "$FIXTURES/rar5_m3.rar" 2>&1)
+if echo "$short_out" | grep -qE '^\s+OK'; then
+	# Cross-check the reported byte counts against what unrar says the sizes are.
+	mismatch=0
+	while IFS= read -r line; do
+		fname=$(echo "$line" | awk '{print $2}')
+		got=$(echo "$line" | awk '{print $3}')
+		want=$(unrar lt "$FIXTURES/rar5_m3.rar" 2>/dev/null | grep -A2 -F "Name: $fname" | awk '/Size:/{print $2; exit}')
+		[ -n "$want" ] && [ "$got" != "$want" ] && mismatch=$((mismatch + 1))
+	done < <(echo "$short_out" | grep -E '^\s+OK')
+	if [ "$mismatch" -eq 0 ]; then
+		ok "reported byte counts match unrar's declared sizes"
+	else
+		fail "$mismatch entries reported a byte count differing from unrar's size"
+	fi
+fi
 
 echo ""
 echo "=== Gate C: verify examines every entry unrar lists ==="

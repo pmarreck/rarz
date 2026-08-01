@@ -902,6 +902,105 @@ export fn rarz_verify_file(
 	// const across the FFI; see rarz_extract_to_buffer for the full rationale.
 	const mut: *ArchiveHandle = @constCast(a);
 
+	// Multi-volume: entries are reassembled from chunks spread across volumes.
+	// This branch must come FIRST — a handle opened over a volume set also has
+	// rar5_files populated for its own volume, and using that would decode only
+	// the leading chunk of a split file and report "decompression failed" on a
+	// perfectly intact set.
+	if (a.unified_files) |files| {
+		if (index >= files.len) {
+			setLastError("file index out of range");
+			return VERIFY_ERROR;
+		}
+		const uf = files[index];
+		const volumes = a.volumes orelse {
+			setLastError("corrupt archive handle");
+			return VERIFY_ERROR;
+		};
+
+		if (uf.is_directory) {
+			res.is_directory = 1;
+			res.status = VERIFY_OK;
+			clearLastError();
+			return VERIFY_OK;
+		}
+		if (uf.packed_chunks.len == 0) {
+			setLastError("file has no packed data");
+			return VERIFY_ERROR;
+		}
+
+		var vs = sink.VerifySink.init(false);
+		const alloc = std.heap.page_allocator;
+
+		if (uf.compression.method == 0) {
+			// Store: hash each chunk in order, no decoder and no reassembly.
+			for (uf.packed_chunks) |chunk| {
+				const vol = volumes[chunk.volume_index];
+				vs.sink().write(vol.data[chunk.offset..][0..chunk.length]);
+			}
+		} else {
+			// Compressed: the packed stream itself spans volumes, so it has to
+			// be contiguous before the decoder can read it. This is the one
+			// place verification still allocates, and it allocates the PACKED
+			// size, not the decoded size.
+			var total_packed: usize = 0;
+			for (uf.packed_chunks) |chunk| total_packed += chunk.length;
+
+			const combined = alloc.alloc(u8, total_packed) catch {
+				setLastError("out of memory");
+				return VERIFY_ERROR;
+			};
+			defer alloc.free(combined);
+
+			var wpos: usize = 0;
+			for (uf.packed_chunks) |chunk| {
+				const vol = volumes[chunk.volume_index];
+				@memcpy(combined[wpos..][0..chunk.length], vol.data[chunk.offset..][0..chunk.length]);
+				wpos += chunk.length;
+			}
+
+			const decompressed = dispatch.decompressRar5(
+				alloc,
+				combined,
+				uf.unpacked_size,
+				uf.compression,
+			) catch {
+				setLastError("decompression failed");
+				res.status = VERIFY_UNSUPPORTED;
+				return VERIFY_UNSUPPORTED;
+			};
+			defer alloc.free(decompressed);
+			vs.sink().write(decompressed);
+		}
+
+		res.bytes_verified = vs.len;
+		// PRECISION: fewer bytes than the header declares means the decoder
+		// stopped early. With a checksum the CRC would catch it; without one
+		// this is the ONLY signal, so it is checked before anything else.
+		if (vs.len != uf.unpacked_size) {
+			setLastError("decoded size does not match the size declared in the header");
+			res.status = VERIFY_CHECKSUM_MISMATCH;
+			return VERIFY_CHECKSUM_MISMATCH;
+		}
+		res.has_crc32 = @intFromBool(uf.has_crc32);
+		if (uf.has_crc32) {
+			res.crc32_expected = uf.data_crc32.?;
+			res.crc32_actual = vs.crc32();
+			if (res.crc32_expected != res.crc32_actual) {
+				setLastError("payload CRC32 mismatch");
+				res.status = VERIFY_CHECKSUM_MISMATCH;
+				return VERIFY_CHECKSUM_MISMATCH;
+			}
+		} else {
+			res.status = VERIFY_NO_CHECKSUM;
+			clearLastError();
+			return VERIFY_NO_CHECKSUM;
+		}
+		res.status = VERIFY_OK;
+		clearLastError();
+		return VERIFY_OK;
+	}
+
 	if (a.rar5_files) |files| {
 		if (index >= files.len) {
 			setLastError("file index out of range");
@@ -938,6 +1037,14 @@ export fn rarz_verify_file(
 		}
 
 		res.bytes_verified = vs.len;
+		// PRECISION: fewer bytes than the header declares means the decoder
+		// stopped early. With a checksum the CRC would catch it; without one
+		// this is the ONLY signal, so it is checked before anything else.
+		if (vs.len != f.unpacked_size) {
+			setLastError("decoded size does not match the size declared in the header");
+			res.status = VERIFY_CHECKSUM_MISMATCH;
+			return VERIFY_CHECKSUM_MISMATCH;
+		}
 		res.has_crc32 = @intFromBool(f.has_crc32);
 		if (f.has_crc32) {
 			res.crc32_expected = f.data_crc32.?;
@@ -1004,6 +1111,13 @@ export fn rarz_verify_file(
 		}
 
 		res.bytes_verified = vs.len;
+		// See the RAR5 path: a short decode is the only signal when no checksum
+		// exists, and a cheap cross-check when one does.
+		if (vs.len != f.unpacked_size) {
+			setLastError("decoded size does not match the size declared in the header");
+			res.status = VERIFY_CHECKSUM_MISMATCH;
+			return VERIFY_CHECKSUM_MISMATCH;
+		}
 		res.has_crc32 = 1;
 		res.crc32_expected = f.file_crc;
 		res.crc32_actual = vs.crc32();

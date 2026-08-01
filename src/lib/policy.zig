@@ -31,6 +31,17 @@ pub const ValidationResult = struct {
 
 const encode_vint = reader_mod.encode_vint;
 
+/// How far to scan for a RAR signature behind a self-extracting stub.
+///
+/// Matches the reference's `MAXSFXSIZE` (unrar `rardefs.hpp`), which allocates a
+/// buffer of exactly this size and scans it byte-by-byte for the signature.
+///
+/// `validate()` previously passed 0 here, disabling a scan that `detect_format`
+/// already implements and that §5 of RAR_SPECIFICATION.md requires. A stub
+/// prepended to a good archive produced "no recognized RAR signature" — a damage
+/// claim about an archive unrar tests clean.
+const MAX_SFX_SCAN: usize = 0x400000;
+
 /// Write a u16 in little-endian into a buffer at the given offset.
 fn write_u16_le(buf: []u8, offset: usize, val: u16) void {
 	std.mem.writeInt(u16, buf[offset..][0..2], val, .little);
@@ -171,7 +182,10 @@ fn validate_rar4_payload(data: []const u8, sig_offset: usize) ValidationResult {
 	// First do structural validation
 	var structural = validate_rar4_structural(data, sig_offset);
 	if (!structural.is_valid) return structural;
-	if (structural.has_encrypted_content) return structural;
+	// NOTE: deliberately no archive-wide bail-out on encryption. Encryption is a
+	// PER-ENTRY property; skipping the whole archive because one entry is
+	// encrypted abandoned checks we could run on every other entry. See the
+	// matching note in validate_rar5_payload.
 
 	// Now walk again to check payload CRCs for store-method files
 	var iter = rar4_headers.walk_blocks(data[sig_offset..]);
@@ -206,6 +220,10 @@ fn validate_rar4_payload(data: []const u8, sig_offset: usize) ValidationResult {
 				const fflags = rar4_headers.parse_file_flags(f.block.flags);
 				// Split files: the CRC covers the whole file, not this chunk.
 				if (fflags.split_before or fflags.split_after) continue;
+				// Encrypted ENTRY: its payload cannot be checked without the
+				// password. Skip this entry only — every other entry in the
+				// archive is still verified.
+				if (fflags.password) continue;
 				if (f.packed_size == 0) continue; // directory / empty entry
 
 				const header_end = f.block.header_offset + f.block.head_size;
@@ -451,7 +469,20 @@ fn validate_rar5_payload(data: []const u8, sig_offset: usize, sig_len: u8) Valid
 	// First do structural validation
 	var structural = validate_rar5_structural(data, sig_offset, sig_len);
 	if (!structural.is_valid) return structural;
-	if (structural.has_encrypted_content) return structural;
+	// NO archive-wide bail-out on encryption.
+	//
+	// This used to be `if (structural.has_encrypted_content) return structural;`
+	// — returning a result whose is_valid was already true. Encryption is a
+	// PER-ENTRY property, so one encrypted entry silenced payload verification
+	// for every other entry in the archive, including unencrypted ones whose
+	// CRC32 we could check perfectly well:
+	//
+	//     unrar t -pSECRET  ->  plain.txt - checksum error, Total errors: 1
+	//     rarz t            ->  VALID
+	//
+	// A false pass on PROVEN damage in READABLE data. Encrypted entries are now
+	// skipped individually, below, and everything else is still verified.
+	if (!structural.is_valid) return structural;
 
 	// Walk again to verify payload CRCs for store-method files
 	const block_start = sig_offset + sig_len;
@@ -477,6 +508,10 @@ fn validate_rar5_payload(data: []const u8, sig_offset: usize, sig_len: u8) Valid
 			.file => |f| {
 				// Skip split files — payload CRC covers the full file, not chunks
 				if (f.header.flags.split_before or f.header.flags.split_after) continue;
+				// Encrypted ENTRY: its payload cannot be checked without the
+				// password. Skip this entry only — every other entry in the
+				// archive is still verified.
+				if (rar5_headers.extra_has_encryption(f.extra_data)) continue;
 
 				// PRECISION OVER FORGIVENESS: an entry claiming N > 0 unpacked
 				// bytes must declare packed bytes we can actually read, or its
@@ -650,7 +685,7 @@ pub fn validate_volumes(volumes: []const []const u8) ValidationResult {
 	// Step 1: Structural validation of each volume, all must be RAR5
 	var total_block_count: u32 = 0;
 	for (volumes) |vol_data| {
-		const fmt = detect_mod.detect_format(vol_data, 0);
+		const fmt = detect_mod.detect_format(vol_data, MAX_SFX_SCAN);
 		const family = fmt.family orelse {
 			return invalid_result(null, "no recognized RAR signature in volume");
 		};
@@ -670,7 +705,7 @@ pub fn validate_volumes(volumes: []const []const u8) ValidationResult {
 	defer chunks.deinit(alloc);
 
 	for (volumes, 0..) |vol_data, vi| {
-		const fmt = detect_mod.detect_format(vol_data, 0);
+		const fmt = detect_mod.detect_format(vol_data, MAX_SFX_SCAN);
 		const block_start = fmt.signature_offset + fmt.signature_len;
 		var iter = rar5_headers.walk_blocks(vol_data[block_start..]);
 
@@ -910,7 +945,7 @@ pub fn validate_volumes(volumes: []const []const u8) ValidationResult {
 /// 3. Payload validation — verifies CRC32/BLAKE2sp of file content
 pub fn validate(data: []const u8) ValidationResult {
 	// Step 1: Detect format
-	const fmt = detect_mod.detect_format(data, 0);
+	const fmt = detect_mod.detect_format(data, MAX_SFX_SCAN);
 
 	const family = fmt.family orelse {
 		return invalid_result(null, "no recognized RAR signature");
@@ -1876,6 +1911,102 @@ test "validate handles every single-byte corruption of a compressed RAR5 archive
 		const result = validate(corrupted[0..archive_len]);
 		_ = result; // must not crash
 	}
+}
+
+test "mixed encryption: damage in an UNENCRYPTED entry must be caught" {
+	// One encrypted entry used to disable payload verification for the WHOLE
+	// archive:
+	//
+	//     if (structural.has_encrypted_content) return structural;  // is_valid=true
+	//
+	// So an unencrypted entry with a smashed payload — a CRC32 we can check
+	// perfectly well — sailed through because a DIFFERENT entry happened to be
+	// encrypted. Measured against the oracle:
+	//
+	//     unrar t -pSECRET  ->  plain.txt - checksum error, Total errors: 1
+	//     rarz t            ->  VALID
+	//
+	// That is a false pass on PROVEN damage in READABLE data, strictly worse
+	// than the wholly-encrypted case where nothing was checkable at all.
+	//
+	// A wholly-encrypted fixture cannot catch this; the archive needs both kinds
+	// of entry, which is why an audit over single-mode archives missed it.
+	const pristine: []const u8 = @embedFile("rar5_encrypted_mixed");
+
+	// Intact: the encrypted entry is unverifiable, but nothing is DAMAGED.
+	try testing.expect(validate(pristine).is_valid);
+
+	// Smash bytes across the archive; wherever the unencrypted entry's payload
+	// is hit, that must be detected. Sweeping avoids hard-coding an offset that
+	// a regenerated fixture would invalidate.
+	var buf: [4096]u8 = undefined;
+	try testing.expect(pristine.len <= buf.len);
+
+	var caught: usize = 0;
+	var attempts: usize = 0;
+	var off: usize = 100;
+	while (off + 16 < pristine.len) : (off += 16) {
+		@memcpy(buf[0..pristine.len], pristine);
+		for (buf[off..][0..16]) |*b| b.* ^= 0xFF;
+		attempts += 1;
+		if (!validate(buf[0..pristine.len]).is_valid) caught += 1;
+	}
+
+	// The archive is ~1.2 KB and mostly payload, so a bail-out-on-encryption
+	// implementation catches almost nothing here. Requiring a clear majority
+	// keeps this from passing on header-CRC hits alone.
+	try testing.expect(attempts > 8);
+	try testing.expect(caught * 2 > attempts);
+}
+
+test "SFX prefix: a self-extracting archive must be recognised, not rejected" {
+	// `validate()` called `detect_format(data, 0)`, disabling the SFX prefix
+	// scan that the same function already implements and that §5 of the spec
+	// requires. A stub prepended to a perfectly good archive produced:
+	//
+	//     unrar t  ->  All OK
+	//     rarz t   ->  INVALID: no recognized RAR signature
+	//
+	// i.e. a damage claim about an archive that is not damaged. Self-extracting
+	// RARs are common in the wild.
+	const inner: []const u8 = @embedFile("rar5_store");
+
+	var buf: [65536]u8 = undefined;
+	const prefix_len = 46;
+	try testing.expect(inner.len + prefix_len <= buf.len);
+
+	// A plausible stub: bytes that are not a RAR signature.
+	for (buf[0..prefix_len]) |*b| b.* = 'M';
+	@memcpy(buf[prefix_len..][0..inner.len], inner);
+
+	const result = validate(buf[0 .. prefix_len + inner.len]);
+	try testing.expect(result.is_valid);
+	try testing.expectEqual(detect_mod.RarFamily.rar50, result.family.?);
+}
+
+test "SFX prefix: damage inside the embedded archive is still caught" {
+	// The prefix scan must not become a way to skip past corruption. Same
+	// construction as above, with the archive's payload smashed.
+	const inner: []const u8 = @embedFile("rar5_store");
+
+	var buf: [65536]u8 = undefined;
+	const prefix_len = 46;
+	for (buf[0..prefix_len]) |*b| b.* = 'M';
+	@memcpy(buf[prefix_len..][0..inner.len], inner);
+
+	const total = prefix_len + inner.len;
+	var caught: usize = 0;
+	var attempts: usize = 0;
+	var off: usize = prefix_len + 40;
+	while (off + 16 < total) : (off += 32) {
+		var probe: [65536]u8 = undefined;
+		@memcpy(probe[0..total], buf[0..total]);
+		for (probe[off..][0..16]) |*b| b.* ^= 0xFF;
+		attempts += 1;
+		if (!validate(probe[0..total]).is_valid) caught += 1;
+	}
+	try testing.expect(attempts > 4);
+	try testing.expect(caught * 2 > attempts);
 }
 
 test "RAR 1.4: a signature followed by garbage must NOT be VALID" {

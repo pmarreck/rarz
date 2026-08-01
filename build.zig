@@ -125,6 +125,8 @@ pub fn build(b: *std.Build) void {
 	// have encoded the same field-offset bug they exist to catch.
 	unit_tests.root_module.addAnonymousImport("rar4_store", .{ .root_source_file = b.path("tests/fixtures/rar4_store.rar") });
 	unit_tests.root_module.addAnonymousImport("rar4_m3", .{ .root_source_file = b.path("tests/fixtures/rar4_m3.rar") });
+	unit_tests.root_module.addAnonymousImport("rar5_encrypted_mixed", .{ .root_source_file = b.path("tests/fixtures/rar5_encrypted_mixed.rar") });
+	unit_tests.root_module.addAnonymousImport("rar5_store", .{ .root_source_file = b.path("tests/fixtures/rar5_store.rar") });
 	// Minimal v29-compressed archives — 87 and 162 bytes. Small enough to trace
 	// bit-by-bit against the reference decoder when unpack29 misbehaves.
 	unit_tests.root_module.addAnonymousImport("rar4_v29_min", .{ .root_source_file = b.path("tests/fixtures/rar4_v29_min.rar") });

@@ -608,7 +608,8 @@ export fn rarz_extract_to_buffer(
 		// See the RAR4 path for why this cast is sound: the cache is a memo on a
 		// heap-allocated handle that is only *declared* const across the FFI.
 		const mut5: *ArchiveHandle = @constCast(a);
-		const written5 = extractRar5Entry(mut5, files, index, buf[0..out_len]) catch |err| {
+		var bs5 = sink.BufferSink.init(buf[0..@intCast(f.unpacked_size)]);
+		decodeRar5Entry(mut5, files, index, bs5.sink()) catch |err| {
 			setLastError(switch (err) {
 				error.OutOfMemory => "out of memory",
 				else => "decompression failed",
@@ -616,7 +617,7 @@ export fn rarz_extract_to_buffer(
 			return -3;
 		};
 		clearLastError();
-		return @intCast(written5);
+		return @intCast(bs5.len);
 	}
 
 	if (a.rar4_files) |files| {
@@ -658,7 +659,8 @@ export fn rarz_extract_to_buffer(
 		// here keeps `const rarz_archive *` in the published header intact —
 		// solid support should not force every C caller to change.
 		const mut: *ArchiveHandle = @constCast(a);
-		const written = extractRar4Entry(mut, files, index, buf[0..out_len]) catch |err| {
+		var bs = sink.BufferSink.init(buf[0..@intCast(f.unpacked_size)]);
+		decodeRar4Entry(mut, files, index, bs.sink()) catch |err| {
 			setLastError(switch (err) {
 				error.OutOfMemory => "out of memory",
 				error.UnsupportedFilter => "entry uses an unsupported filter; contents cannot be verified",
@@ -667,7 +669,7 @@ export fn rarz_extract_to_buffer(
 			return -3;
 		};
 		clearLastError();
-		return @intCast(written);
+		return @intCast(bs.len);
 	}
 
 	setLastError("file index out of range");
@@ -683,14 +685,19 @@ fn rar5PayloadRange(a: *ArchiveHandle, f: rar5_headers.FileBlock) ?struct { star
 	return .{ .start = start, .end = end };
 }
 
-/// RAR5 counterpart of `extractRar4Entry`; see that function for the caching and
+/// RAR5 counterpart of `decodeRar4Entry`; see that function for the caching and
 /// replay rationale.
-fn extractRar5Entry(
+///
+/// Takes a `Sink` rather than a buffer so extraction and verify-only share one
+/// path: extraction passes a `BufferSink`, verification a `VerifySink` that
+/// hashes and discards. Two copies of the solid replay logic would be two places
+/// for it to drift.
+fn decodeRar5Entry(
 	a: *ArchiveHandle,
 	files: []rar5_headers.FileBlock,
 	index: u32,
-	buf: []u8,
-) !usize {
+	out: sink.Sink,
+) !void {
 	const alloc = std.heap.page_allocator;
 	const target = files[index];
 
@@ -730,19 +737,17 @@ fn extractRar5Entry(
 	}
 
 	const range = rar5PayloadRange(a, target) orelse return error.CorruptData;
-	var bs = sink.BufferSink.init(buf[0..@intCast(target.unpacked_size)]);
 	a.solid_session.?.decodeFile(
 		a.data[range.start..range.end],
 		target.unpacked_size,
 		target.compression.solid,
-		bs.sink(),
+		out,
 	) catch |err| {
 		// The session's position is now unknown, so it must not be reused.
 		a.resetSolidSession();
 		return err;
 	};
 	a.solid_next_index = index + 1;
-	return bs.len;
 }
 
 /// Byte range of a RAR4 entry's packed payload within the archive buffer.
@@ -762,12 +767,12 @@ fn rar4PayloadRange(a: *ArchiveHandle, f: rar4_headers.FileHeader) ?struct { sta
 ///
 /// Replaying from index 0 on every call would also be correct but O(n^2); on an
 /// archive of thousands of entries that is the difference between usable and not.
-fn extractRar4Entry(
+fn decodeRar4Entry(
 	a: *ArchiveHandle,
 	files: []rar4_headers.FileHeader,
 	index: u32,
-	buf: []u8,
-) !usize {
+	out: sink.Sink,
+) !void {
 	const alloc = std.heap.page_allocator;
 	const target = files[index];
 
@@ -817,19 +822,203 @@ fn extractRar4Entry(
 	}
 
 	const range = rar4PayloadRange(a, target) orelse return error.CorruptData;
-	var bs = sink.BufferSink.init(buf[0..@intCast(target.unpacked_size)]);
 	a.solid_session.?.decodeFile(
 		a.data[range.start..range.end],
 		target.unpacked_size,
 		rar4_headers.parse_file_flags(target.block.flags).solid,
-		bs.sink(),
+		out,
 	) catch |err| {
 		// The session's position is now unknown, so it must not be reused.
 		a.resetSolidSession();
 		return err;
 	};
 	a.solid_next_index = index + 1;
-	return bs.len;
+}
+
+// ============================================================================
+// Verify-only: decode an entry and check its checksums, without materialising it
+// ============================================================================
+
+/// Outcome codes for `rarz_verify_file`, mirrored in include/rarz.h.
+const VERIFY_OK: i32 = 0;
+const VERIFY_CHECKSUM_MISMATCH: i32 = 1;
+const VERIFY_NO_CHECKSUM: i32 = 2;
+const VERIFY_UNSUPPORTED: i32 = 3;
+const VERIFY_ERROR: i32 = 4;
+
+/// Result of verifying one entry. Extern layout — part of the C ABI.
+const RarzVerifyResult = extern struct {
+	status: i32,
+	/// Decoded bytes actually hashed. Compared against the header's declared
+	/// unpacked size by the caller; a short count on a status-OK entry would
+	/// mean the decoder stopped early.
+	bytes_verified: u64,
+	crc32_expected: u32,
+	crc32_actual: u32,
+	has_crc32: u8,
+	/// 1 when a BLAKE2sp was present AND matched. RAR4 never carries one.
+	checked_blake2sp: u8,
+	is_directory: u8,
+	_pad: u8 = 0,
+};
+
+/// Verify one entry by decoding it into a hashing sink and comparing against the
+/// checksums stored in its header. Nothing the size of the decoded entry is
+/// allocated.
+///
+/// This is the verify-only path a C consumer previously could not reach: to
+/// check entry N it had to allocate `unpacked_size` bytes and call
+/// `rarz_extract_to_buffer`, paying for bytes it meant to discard. Peak memory
+/// here is the LZ window plus the hash state, whatever the entry's size.
+///
+/// On a solid archive, verifying entries in order costs ONE pass — the decoder
+/// cache on the handle is keyed by next-expected-index, so each entry continues
+/// the shared stream instead of replaying its predecessors.
+export fn rarz_verify_file(
+	archive: ?*const ArchiveHandle,
+	index: u32,
+	out_result: ?*RarzVerifyResult,
+) i32 {
+	const a = archive orelse {
+		setLastError("null archive handle");
+		return VERIFY_ERROR;
+	};
+	const res = out_result orelse {
+		setLastError("null result pointer");
+		return VERIFY_ERROR;
+	};
+
+	res.* = .{
+		.status = VERIFY_ERROR,
+		.bytes_verified = 0,
+		.crc32_expected = 0,
+		.crc32_actual = 0,
+		.has_crc32 = 0,
+		.checked_blake2sp = 0,
+		.is_directory = 0,
+	};
+
+	// The cache is a memo on a heap-allocated handle that is only *declared*
+	// const across the FFI; see rarz_extract_to_buffer for the full rationale.
+	const mut: *ArchiveHandle = @constCast(a);
+
+	if (a.rar5_files) |files| {
+		if (index >= files.len) {
+			setLastError("file index out of range");
+			return VERIFY_ERROR;
+		}
+		const f = files[index];
+
+		if (f.is_directory) {
+			res.is_directory = 1;
+			res.status = VERIFY_OK;
+			clearLastError();
+			return VERIFY_OK;
+		}
+
+		const expected_blake = rar5_headers.extract_blake2sp_hash_raw(f.extra_data);
+		var vs = sink.VerifySink.init(expected_blake != null);
+
+		if (f.compression.method == 0) {
+			// Store: no decoder involved, hash the raw payload.
+			const range = rar5PayloadRange(mut, f) orelse {
+				setLastError("declared payload extends beyond end of archive (truncated)");
+				return VERIFY_ERROR;
+			};
+			vs.sink().write(a.data[range.start..range.end]);
+		} else {
+			decodeRar5Entry(mut, files, index, vs.sink()) catch |err| {
+				setLastError(switch (err) {
+					error.OutOfMemory => "out of memory",
+					else => "decompression failed",
+				});
+				res.status = VERIFY_UNSUPPORTED;
+				return VERIFY_UNSUPPORTED;
+			};
+		}
+
+		res.bytes_verified = vs.len;
+		res.has_crc32 = @intFromBool(f.has_crc32);
+		if (f.has_crc32) {
+			res.crc32_expected = f.data_crc32.?;
+			res.crc32_actual = vs.crc32();
+		}
+		if (expected_blake) |expected| {
+			var got: [32]u8 = undefined;
+			vs.blake2sp(&got);
+			if (!std.mem.eql(u8, &got, &expected)) {
+				setLastError("payload BLAKE2sp mismatch");
+				res.status = VERIFY_CHECKSUM_MISMATCH;
+				return VERIFY_CHECKSUM_MISMATCH;
+			}
+			res.checked_blake2sp = 1;
+		}
+		if (f.has_crc32 and res.crc32_expected != res.crc32_actual) {
+			setLastError("payload CRC32 mismatch");
+			res.status = VERIFY_CHECKSUM_MISMATCH;
+			return VERIFY_CHECKSUM_MISMATCH;
+		}
+		// PRECISION: an entry with nothing to check must not read as verified.
+		if (!f.has_crc32 and expected_blake == null) {
+			res.status = VERIFY_NO_CHECKSUM;
+			clearLastError();
+			return VERIFY_NO_CHECKSUM;
+		}
+		res.status = VERIFY_OK;
+		clearLastError();
+		return VERIFY_OK;
+	}
+
+	if (a.rar4_files) |files| {
+		if (index >= files.len) {
+			setLastError("file index out of range");
+			return VERIFY_ERROR;
+		}
+		const f = files[index];
+
+		if (rar4_headers.is_directory_entry(f)) {
+			res.is_directory = 1;
+			res.status = VERIFY_OK;
+			clearLastError();
+			return VERIFY_OK;
+		}
+
+		var vs = sink.VerifySink.init(false); // RAR4 carries no BLAKE2sp
+
+		if (f.method == 0) {
+			const range = rar4PayloadRange(mut, f) orelse {
+				setLastError("declared payload extends beyond end of archive (truncated)");
+				return VERIFY_ERROR;
+			};
+			vs.sink().write(a.data[range.start..range.end]);
+		} else {
+			decodeRar4Entry(mut, files, index, vs.sink()) catch |err| {
+				setLastError(switch (err) {
+					error.OutOfMemory => "out of memory",
+					error.UnsupportedFilter => "entry uses an unsupported filter; contents cannot be verified",
+					else => "decompression failed",
+				});
+				res.status = VERIFY_UNSUPPORTED;
+				return VERIFY_UNSUPPORTED;
+			};
+		}
+
+		res.bytes_verified = vs.len;
+		res.has_crc32 = 1;
+		res.crc32_expected = f.file_crc;
+		res.crc32_actual = vs.crc32();
+		if (res.crc32_expected != res.crc32_actual) {
+			setLastError("payload CRC32 mismatch");
+			res.status = VERIFY_CHECKSUM_MISMATCH;
+			return VERIFY_CHECKSUM_MISMATCH;
+		}
+		res.status = VERIFY_OK;
+		clearLastError();
+		return VERIFY_OK;
+	}
+
+	setLastError("archive has no verifiable entries");
+	return VERIFY_ERROR;
 }
 
 /// C-compatible file entry struct for archive creation (input).

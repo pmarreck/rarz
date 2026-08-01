@@ -3,7 +3,9 @@ ver=1.2
 annotate=[
 	src/lib/decompress/sink.zig = Output sinks for decoders: Sink vtable, BufferSink (caller buffer, flags overflow), DiscardSink (counts+drops, warms solid windows)
 	tests/cli/test_build_banner.sh = --about surface + invariant 'DEBUG BUILD banner present <=> --about reports Debug'
+	tests/cli/test_precision_volumes.sh = Multi-volume precision: unrar-damaged => rarz must never report VALID (differential truncation sweep)
 	tests/cli/test_solid.sh = Solid-archive acceptance: extraction byte-identical to unrar, VALID verdict, and corruption still detected (differential vs unrar)
+	tests/cli/test_verify.sh = rarz verify: per-entry verify-only via FFI; agreement, entry coverage, and per-entry damage localisation
 	tests/fixtures/invalid = intentionally-invalid fixtures (kept out of all-valid Interop Gate A scans)
 	tests/generate_rar4_solid_fixture.sh = One-time generator: RAR4/v29 solid fixture via rar 6.21 (nixos-23.11); asserts solid AND v29
 	tests/generate_rar5_solid_fixture.sh = One-time generator: RAR5 solid fixture with cross-file matches; asserts output really is solid

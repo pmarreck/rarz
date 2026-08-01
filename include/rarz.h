@@ -214,6 +214,53 @@ int32_t rarz_volume_data(const rarz_volumes *handle, uint32_t index,
 /** Free volume creation result. */
 void rarz_volumes_free(rarz_volumes *handle);
 
+/* ========================================================================== */
+/* Verify-only entry verification                                             */
+/* ========================================================================== */
+
+/** Entry verified: every checksum it carries matched. */
+#define RARZ_VERIFY_OK                0
+/** Entry decoded, but a stored checksum did not match. */
+#define RARZ_VERIFY_CHECKSUM_MISMATCH 1
+/** Entry decoded, but carries no checksum — nothing could be verified.
+ *  Deliberately NOT reported as OK: "nothing to check" is not "nothing wrong". */
+#define RARZ_VERIFY_NO_CHECKSUM       2
+/** Entry could not be decoded (unsupported filter, corrupt stream, ...).
+ *  Distinct from MISMATCH: this is "cannot verify", not "verified bad". */
+#define RARZ_VERIFY_UNSUPPORTED       3
+/** Bad arguments, index out of range, or a truncated declaration. */
+#define RARZ_VERIFY_ERROR             4
+
+typedef struct {
+	int32_t  status;           /* one of RARZ_VERIFY_*                        */
+	uint64_t bytes_verified;   /* decoded bytes actually hashed               */
+	uint32_t crc32_expected;   /* valid when has_crc32                        */
+	uint32_t crc32_actual;     /* valid when has_crc32                        */
+	uint8_t  has_crc32;
+	uint8_t  checked_blake2sp; /* 1 when a BLAKE2sp was present AND matched   */
+	uint8_t  is_directory;     /* directory entries have no payload to verify */
+	uint8_t  _pad;
+} rarz_verify_result;
+
+/**
+ * Verify one entry by decoding it and checking the checksums stored in its
+ * header, WITHOUT materialising the decoded bytes.
+ *
+ * Use this instead of rarz_extract_to_buffer when you want a verdict rather
+ * than the contents: extraction forces you to allocate unpacked_size bytes for
+ * data you intend to discard, whereas this streams the decoder's output into a
+ * hash. Peak memory is the LZ window plus the hash state, whatever the size of
+ * the entry.
+ *
+ * On a SOLID archive, verifying entries in ascending index order costs a single
+ * pass over the shared stream. Verifying out of order still returns correct
+ * results, but may replay predecessors to rebuild the window.
+ *
+ * Returns the same value written to out_result->status.
+ */
+int32_t rarz_verify_file(const rarz_archive *archive, uint32_t index,
+                          rarz_verify_result *out_result);
+
 #ifdef __cplusplus
 }
 #endif

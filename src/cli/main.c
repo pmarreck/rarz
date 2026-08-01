@@ -95,6 +95,7 @@ typedef enum {
 	CMD_HELP,
 	CMD_ABOUT,
 	CMD_TEST,
+	CMD_VERIFY,
 	CMD_LIST,
 	CMD_VOLUMES,
 	CMD_EXTRACT,
@@ -105,6 +106,7 @@ static Command parse_command(const char *arg) {
 	if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) return CMD_HELP;
 	if (strcmp(arg, "--about") == 0) return CMD_ABOUT;
 	if (strcmp(arg, "t") == 0 || strcmp(arg, "test") == 0) return CMD_TEST;
+	if (strcmp(arg, "verify") == 0) return CMD_VERIFY;
 	if (strcmp(arg, "l") == 0 || strcmp(arg, "list") == 0 ||
 	    strcmp(arg, "v") == 0 || strcmp(arg, "list-verbose") == 0) return CMD_LIST;
 	if (strcmp(arg, "vol") == 0 || strcmp(arg, "volumes") == 0) return CMD_VOLUMES;
@@ -121,7 +123,8 @@ static void print_usage(void) {
 	printf("rarz - clean-room reimplementation RAR archive toolkit and CLI (Peter Marreck, 2026-02-21)\n");
 	printf("RAR format and original/primary implementation by Alexander Roshal\n\n");
 	printf("Usage:\n");
-	printf("  rarz t|test <archive>            Test archive integrity\n");
+	printf("  rarz t|test <archive>            Test archive integrity (one verdict)\n");
+	printf("  rarz verify <archive>            Verify every entry, report each by name\n");
 	printf("  rarz l|list|v|list-verbose <archive>\n");
 	printf("                                   List archive contents\n");
 	printf("  rarz vol|volumes <archive>       Show detected archive volume set\n");
@@ -794,6 +797,102 @@ static int cmd_test(const char *path) {
 	free(data);
 	free_volume_set(&vs);
 	return ret;
+}
+
+/* ========================================================================== */
+/* cmd_verify                                                                 */
+/* ========================================================================== */
+
+/*
+ * Per-entry verification, deliberately distinct from `test`.
+ *
+ * `test` answers one question about the archive: intact or not. `verify`
+ * decodes every entry and reports each result individually, so the operator
+ * learns WHICH file is damaged rather than only that something is.
+ *
+ * It goes through rarz_verify_file, which never materialises decoded output --
+ * this is the C CLI dogfooding the verify-only FFI, the same way it dogfoods
+ * every other entry point.
+ */
+static const char *verify_status_label(int32_t status) {
+	switch (status) {
+	case RARZ_VERIFY_OK:                return "OK";
+	case RARZ_VERIFY_CHECKSUM_MISMATCH: return "FAIL";
+	case RARZ_VERIFY_NO_CHECKSUM:       return "UNVERIFIED";
+	case RARZ_VERIFY_UNSUPPORTED:       return "UNVERIFIED";
+	default:                            return "ERROR";
+	}
+}
+
+static int cmd_verify(const char *path) {
+	size_t len = 0;
+	uint8_t *data = read_file(path, &len);
+	if (!data) return 1;
+
+	rarz_archive *archive = rarz_open(data, len);
+	if (!archive) {
+		fprintf(stderr, "error: cannot open '%s': %s\n", path,
+		        rarz_last_error() ? rarz_last_error() : "unknown error");
+		free(data);
+		return 1;
+	}
+
+	printf("Verifying archive: %s\n", path);
+
+	uint32_t count = rarz_file_count(archive);
+	uint32_t verified = 0, failed = 0, unverified = 0, dirs = 0;
+
+	for (uint32_t i = 0; i < count; i++) {
+		rarz_file_entry entry;
+		char name[4096];
+		name[0] = '\0';
+		if (rarz_file_info(archive, i, &entry) == 0 && entry.name && entry.name_len > 0) {
+			size_t n = entry.name_len < sizeof(name) - 1 ? entry.name_len : sizeof(name) - 1;
+			memcpy(name, entry.name, n);
+			name[n] = '\0';
+		} else {
+			snprintf(name, sizeof(name), "<entry %u>", i);
+		}
+
+		rarz_verify_result vr;
+		int32_t status = rarz_verify_file(archive, i, &vr);
+
+		if (vr.is_directory) {
+			dirs++;
+			continue;
+		}
+
+		const char *label = verify_status_label(status);
+		if (status == RARZ_VERIFY_OK) {
+			verified++;
+			printf("  %-10s %-48s %10llu bytes\n", label, name,
+			       (unsigned long long)vr.bytes_verified);
+		} else if (status == RARZ_VERIFY_CHECKSUM_MISMATCH) {
+			failed++;
+			printf("  %-10s %-48s CRC32 %08X != %08X\n", label, name,
+			       vr.crc32_actual, vr.crc32_expected);
+		} else {
+			/* Cannot verify is NOT the same as verified-bad, and is reported
+			 * separately so a caller can tell a damaged archive from one this
+			 * build cannot decode. */
+			unverified++;
+			printf("  %-10s %-48s %s\n", label, name,
+			       rarz_last_error() ? rarz_last_error() : "no checksum stored");
+		}
+	}
+
+	printf("Verified %u file%s", verified, verified == 1 ? "" : "s");
+	if (dirs) printf(", %u director%s", dirs, dirs == 1 ? "y" : "ies");
+	if (failed) printf(", %u FAILED", failed);
+	if (unverified) printf(", %u unverified", unverified);
+	printf("\n");
+
+	rarz_close(archive);
+	free(data);
+
+	/* Unverified is not success: an entry we could not check must not report as
+	 * checked. Precision over forgiveness. */
+	return (failed == 0 && unverified == 0) ? 0 : 1;
 }
 
 /* ========================================================================== */
@@ -1606,6 +1705,13 @@ int main(int argc, char **argv) {
 			return 1;
 		}
 		return cmd_test(argv[2]);
+
+	case CMD_VERIFY:
+		if (argc < 3) {
+			fprintf(stderr, "error: 'verify' requires an archive path\n");
+			return 1;
+		}
+		return cmd_verify(argv[2]);
 
 	case CMD_LIST:
 		if (argc < 3) {

@@ -74,12 +74,35 @@ coverage must be *precise* (never forgiving) with *actionable* error detail.
 - [x] **Precision pass 3a — RAR4 truncation.** Same clean-EOF blind spot as
   RAR5; fixed in `00be71e`. Found by noticing a 30-truncation differential
   sweep was *vacuous for RAR4* — every fixture is RAR5. (2026-07-29 EDT)
-- [ ] **Precision pass 3b — remaining silent-skip paths.** Still to sweep:
-  ~~`parse_extra_records ... catch { continue; }`~~ (DONE 2026-07-31, see 4g),
-  the multi-volume collector's
-  `if (payload_end <= vol_data.len)` chunk-drop guard, and the second-walk
-  `iter.next() catch break` in `validate_rar5_payload` / `validate_rar4_payload`.
-  Failing test first for each.
+- [x] **Precision pass 3b — silent-skip paths, all four closed** (2026-07-31 EDT).
+  Each converted from a silent skip to an explicit failure:
+  1. `parse_extra_records ... catch { continue; }` — a malformed extra record
+     skipped BLAKE2sp verification and the entry still passed. Closed as a
+     side-effect of 4g (streaming forces the expected hash to be resolved
+     before decoding, and the non-allocating `_raw` form has no escape hatch).
+  2. The multi-volume collector's `if (payload_end <= vol_data.len)` chunk-drop
+     guard — a chunk declaring more payload than its volume holds was simply not
+     appended, so the FILE left the verification set, the survivors checked out,
+     and the archive read VALID.
+  3. + 4. The second-walk `iter.next() catch break` in `validate_rar4_payload`
+     and `validate_rar5_payload` — stopping there left every remaining entry
+     unchecked while still returning the structural VALID. A fifth site, the
+     volume chunk-collection walk, had the same shape and got the same fix.
+
+  **Honest finding: 2-4 were unreachable.** Instrumented every site and measured
+  0 hits across the whole fixture corpus, 8 byte-mutations and 8 truncations of
+  each archive, and the unit suite's exhaustive single-byte-corruption and
+  every-position-truncation sweeps. The structural walk runs first and rejects
+  those inputs before the payload walk sees them. So this is hardening against
+  future drift, not a live-bug fix — but the failure direction of a stale
+  assumption here is a silent PASS, which is not a thing to leave lying around.
+  The control that the change is safe is that the entire suite stays green: no
+  legitimate archive relied on any of the skips.
+
+  New `tests/cli/test_precision_volumes.sh` pins the reachable property
+  differentially: 42 damaged volume sets, **0 reported VALID** (25 agreed with
+  unrar, 17 rarz-stricter — all cases where bytes were genuinely removed and
+  unrar tolerates it).
 
 ### 4b. 🔴 RELEASE BLOCKER — RAR4 support is materially broken (found 2026-07-30)
 
@@ -357,7 +380,7 @@ Work items:
 - [x] Wire `root.zig` extraction: CLI extract-all uses the sequential path.
   Decide what index-based random access does on a solid archive (decode
   predecessors, or return a distinct "sequential access required" error).
-- [ ] Expose the discard/verify-only option through the C FFI too. (Deferred
+- [x] Expose the discard/verify-only option through the C FFI too. (Was: deferred
   with 4g — the Zig-side sink exists, but there is nothing worth exposing until
   validation actually streams.)
 
@@ -401,7 +424,8 @@ is circular and hands out a logically-contiguous run as one or TWO spans.
   resolved BEFORE decoding (you cannot decide after the fact whether you wanted
   a hash you were supposed to compute as bytes flowed past), and the
   non-allocating `extract_blake2sp_hash_raw` has no such escape hatch.
-- [ ] Expose verify-only through the C FFI. Still open; nothing in-tree consumes
+- [x] Expose verify-only through the C FFI — `rarz_verify_file` + the `rarz verify`
+  command (2026-07-31 EDT). Was: still open; nothing in-tree consumes
   it yet, since `validate` imports the Zig module directly.
 
 ---

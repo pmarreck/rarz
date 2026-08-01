@@ -898,6 +898,21 @@ static int cmd_verify(const char *path) {
 	uint32_t count = rarz_file_count(archive);
 	uint32_t verified = 0, failed = 0, unverified = 0, no_checksum = 0, dirs = 0;
 
+	/* Nothing to enumerate means nothing was examined, which must not report as
+	 * success. This is how a RAR 1.4 archive arrived here: the library has no
+	 * parser for it, so it yielded zero entries and `verify` printed
+	 * "Verified 0 files" and exited 0 on a file it had not looked at. */
+	if (count == 0) {
+		printf("  %-10s no entries could be enumerated in this archive\n", "UNVERIFIED");
+		printf("Verified 0 files, 1 unverifiable\n");
+		rarz_close(archive);
+		for (int i = 0; i < vs.count; i++) free(vol_bufs[i]);
+		free(vol_bufs);
+		free(vol_lens);
+		free_volume_set(&vs);
+		return EX_UNAVAILABLE;
+	}
+
 	for (uint32_t i = 0; i < count; i++) {
 		rarz_file_entry entry;
 		char name[4096];

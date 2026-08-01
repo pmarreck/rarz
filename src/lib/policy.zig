@@ -918,13 +918,32 @@ pub fn validate(data: []const u8) ValidationResult {
 
 	// Step 2+3: Validate based on family
 	return switch (family) {
+		// RAR 1.4 has no parser here, so nothing about the file has been
+		// examined. That must REFUSE, not pass.
+		//
+		// This branch used to return `.is_valid = true` with the note "No
+		// structural parser for RAR 1.4 yet" — so a RAR 1.4 signature followed
+		// by pure noise was reported VALID while unrar reported it damaged. Of
+		// every silent-skip path in this file that was the worst, because it
+		// blessed the entire format sight-unseen.
+		//
+		// RAR 1.4 is genuinely different, not merely old: its file header has
+		// its own layout (SIZEOF_FILEHEAD14) and its checksum is a 16-bit
+		// HASH_RAR14, not a CRC32 — a distinct algorithm with no final XOR
+		// (unrar hash.cpp: `if (Type==HASH_RAR14) CurCRC32=0;` and Result
+		// without the `^0xffffffff`). Parsing it as RAR4 would read the wrong
+		// fields, so refusing is also the only currently-correct answer.
+		//
+		// INVALID overstates the case for an intact RAR 1.4 archive, and the
+		// could-not-verify outcome in PLAN 4c is where this belongs once it
+		// exists. Until then, refusing to bless beats a false pass: the
+		// dangerous direction is blessing something bad.
 		.rar14 => .{
-			// No structural parser for RAR 1.4 yet
-			.is_valid = true,
+			.is_valid = false,
 			.family = .rar14,
 			.has_encrypted_content = false,
-	
-			.error_message = null,
+
+			.error_message = "RAR 1.4 archives are not supported; contents cannot be verified",
 			.block_count = 0,
 			.file_count = 0,
 		},
@@ -1018,15 +1037,26 @@ test "validate returns invalid for unrecognized data" {
 	try testing.expect(result.error_message != null);
 }
 
-// --- Test 2: validate returns valid signature for RAR 1.4 data ---
+// --- Test 2: RAR 1.4 is DETECTED but not blessed ---
 
-test "validate returns valid signature for RAR 1.4 data" {
+test "validate detects the RAR 1.4 family without claiming the archive is valid" {
+	// This test previously asserted `result.is_valid` and was named "returns
+	// valid signature for RAR 1.4 data" — conflating "the signature is
+	// recognised" with "the archive is intact". That conflation is what let
+	// validate() bless every RAR 1.4 file without reading a byte of it, and the
+	// test would have blocked the fix.
+	//
+	// Recognising the family is genuinely useful and is still asserted. The
+	// verdict is the part that was wrong.
 	const data = detect_mod.RAR14_SIG ++ [_]u8{ 0x00, 0x00, 0x00, 0x00 };
 	const result = validate(&data);
-	try testing.expect(result.is_valid);
 
 	try testing.expectEqual(detect_mod.RarFamily.rar14, result.family.?);
 	try testing.expectEqual(@as(u32, 0), result.block_count);
+
+	// Nothing was parsed, so nothing may be claimed.
+	try testing.expect(!result.is_valid);
+	try testing.expect(result.error_message != null);
 }
 
 // --- Test 3: validate returns valid structural for well-formed RAR4 archive ---
@@ -1846,6 +1876,37 @@ test "validate handles every single-byte corruption of a compressed RAR5 archive
 		const result = validate(corrupted[0..archive_len]);
 		_ = result; // must not crash
 	}
+}
+
+test "RAR 1.4: a signature followed by garbage must NOT be VALID" {
+	// The worst failure this project can produce, and it was live: the family
+	// switch in validate() returned `.is_valid = true` for .rar14 with the
+	// comment "No structural parser for RAR 1.4 yet". So every RAR 1.4 archive
+	// was blessed without a single byte being examined, and 200 bytes of random
+	// noise behind a valid signature passed while unrar reported it damaged.
+	//
+	// "No parser yet" is a reason to REFUSE, never a reason to pass.
+	var buf: [204]u8 = undefined;
+	@memcpy(buf[0..4], "RE~^"); // RAR 1.4 signature
+	// Deterministic non-archive filler.
+	for (buf[4..], 0..) |*b, i| b.* = @truncate(i *% 197 +% 31);
+
+	const result = validate(&buf);
+	try testing.expect(!result.is_valid);
+	try testing.expect(result.error_message != null);
+}
+
+test "RAR 1.4: bare signature with no data must NOT be VALID" {
+	const result = validate("RE~^");
+	try testing.expect(!result.is_valid);
+}
+
+test "RAR 1.4: even a plausible-looking body must NOT be VALID while unparsed" {
+	// Zeros are the shape a naive "is it all readable?" check would accept.
+	var buf: [64]u8 = [_]u8{0} ** 64;
+	@memcpy(buf[0..4], "RE~^");
+	const result = validate(&buf);
+	try testing.expect(!result.is_valid);
 }
 
 test "validate handles truncation at every position of a valid RAR5 archive" {

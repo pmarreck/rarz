@@ -104,6 +104,31 @@ coverage must be *precise* (never forgiving) with *actionable* error detail.
   unrar, 17 rarz-stricter — all cases where bytes were genuinely removed and
   unrar tolerates it).
 
+### 4a. 🔴 RAR 1.4 was blessed sight-unseen (found 2026-08-01, from Peter asking whether exit 65 applies to rar < 4)
+
+`validate()`'s family switch returned `.is_valid = true` for `.rar14` with the
+comment "No structural parser for RAR 1.4 yet". So **every RAR 1.4 archive was
+reported VALID without a single byte being examined** — a signature followed by
+200 bytes of random noise passed while unrar reported it damaged.
+
+Of every silent-skip path in this file this was the worst: the others declined to
+check one entry, this one blessed an entire format.
+
+- [x] `.rar14` now refuses (2026-08-01 EDT). `rarz t` reports INVALID; `rarz
+  verify` returns 69 (EX_UNAVAILABLE) via a new guard for "zero entries could be
+  enumerated", which is how the archive reached "Verified 0 files, exit 0".
+- [x] An existing unit test, "validate returns valid signature for RAR 1.4 data",
+  asserted the bug and would have blocked the fix. Its NAME carried the defect:
+  it conflated "the signature is recognised" with "the archive is intact".
+  Rewritten to assert family detection AND refusal. This is the ~9th instance of
+  the rule from `f3e45d5`: a test written from the same understanding that
+  produced the code cannot falsify it.
+- [ ] POST-1.0: actually parse RAR 1.4. It is genuinely different, not merely
+  old — its file header has its own layout (`SIZEOF_FILEHEAD14`) and its checksum
+  is a **16-bit `HASH_RAR14`**, not a CRC32: a distinct algorithm with no final
+  XOR (unrar `hash.cpp`, `if (Type==HASH_RAR14) CurCRC32=0;` and a Result without
+  `^0xffffffff`). Parsing it as RAR4 would read the wrong fields.
+
 ### 4b. 🔴 RELEASE BLOCKER — RAR4 support is materially broken (found 2026-07-30)
 
 Evidence, against a real 12 KB RAR4 (`unrar l` = RAR 1.5, 3 entries), plus a
@@ -464,9 +489,25 @@ confused with unrar's own scheme if a script swaps one tool for the other
 
 Reachability, measured across the corpus × 12 mutations each: **69 fires 46
 times** (corrupt archives that cannot be decoded — the distinction is live and
-tested). **65 never fires** — both RAR4 and RAR5 always store a CRC32. It is
-defined and documented but currently unreachable; no test asserts it, because a
-test that cannot run is worse than an honest gap.
+tested).
+
+**65 never fires on our corpus, but the earlier claim that it is unreachable was
+wrong** (corrected 2026-08-01 after Peter asked whether it applies to rar < 4).
+"RAR4 and RAR5 always store a CRC32" is false for RAR5: the reference sets
+`hd->FileHash.Type = HASH_NONE` and only upgrades it to `HASH_CRC32` when the
+`FHFL_CRC32` file flag is present (unrar `arcread.cpp:826-831`). The checksum is
+**optional in the format**; the `rar` encoder simply always writes it, which is
+why no fixture reaches the branch. Our `f.has_crc32` already models this
+correctly — only the reachability claim was wrong.
+
+Worth noting: unrar's own `HashValue::operator==` **returns true when either side
+is `HASH_NONE`** (`hash.cpp:31`), so unrar treats a missing hash as a pass. We
+deliberately diverge and report 65. unrar does surface the distinction in its UI,
+printing `?` instead of `OK` for such entries (`extract.cpp:955`).
+
+Still no test for 65, because no producer we have emits such an archive; a
+hand-built fixture would be asserting our own understanding of the flag rather
+than a real producer's output.
 
 - [x] Expose verify-only through the C FFI — `rarz_verify_file` + the `rarz verify`
   command (2026-07-31 EDT). Was: still open; nothing in-tree consumes

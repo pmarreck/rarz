@@ -129,6 +129,66 @@ check one entry, this one blessed an entire format.
   XOR (unrar `hash.cpp`, `if (Type==HASH_RAR14) CurCRC32=0;` and a Result without
   `^0xffffffff`). Parsing it as RAR4 would read the wrong fields.
 
+### 4h. Validation result shape — three dimensions (DESIGN DEFERRED, Peter 2026-08-02)
+
+**Status: detect-and-report shipped; full compliance deferred.**
+
+An independent adversarial review of the proposed three-dimension design
+(`outcome` / `depth` / `reason`, drafted in `RAR_SPECIFICATION.md` §5.1) found it
+could not express a real case, and that a richer per-entry vocabulary already
+ships in this repo. Peter's call: report the situation truthfully now, defer full
+compliance.
+
+**Shipped (2026-08-02):**
+- Encrypted entries are skipped INDIVIDUALLY; every other entry is verified
+  (`04515ce`). This fixed a false pass on proven damage.
+- `ValidationResult.unverified_entry_count` — how many entries could not be
+  checked. Before it, "2 of 2 encrypted, nothing checked" and "1 of 2 encrypted,
+  the other verified" produced identical results. Available to `validate` now
+  (it imports the Zig module directly).
+- CLI note reworded: "encrypted content not verified" read as "nothing was
+  verified", false for a mixed archive.
+
+**Deferred — what full compliance still requires:**
+- [ ] A `could_not_verify` outcome distinct from valid/invalid. Four cases force
+  it: `-p` mixed encryption, `-hp` encrypted headers, RAR 1.4, unsupported VM
+  filters. Three of those currently render as **FAIL in validate on archives
+  unrar tests clean**.
+- [ ] Resolve the review's findings BEFORE implementing §5.1. It is drafted but
+  **known-flawed**; do not build it as written:
+  - The design forbids `verified_damaged` + a skip reason, so "one entry damaged,
+    one unverifiable" — the exact mixed-encryption archive — is inexpressible.
+  - The three dimensions are not orthogonal: ~83% of the 3×4×5 cross-product is
+    illegal and `reason` alone determines the other two. It is a sum type spelled
+    three times, with drift guarded only by prose across 32 assignment sites.
+  - Wrong granularity. These are per-ENTRY facts. `rarz_verify_result`
+    (`include/rarz.h`) already carries `NO_CHECKSUM` (inexpressible in the triple)
+    and `bytes_verified` (coverage, which the triple has no dimension for).
+  - Proposed alternative: per-entry evidence ledger + DERIVED archive rollup,
+    `is_valid` as a method not a field, plus a coverage invariant
+    (`sum(bytes_covered) + headers + service == archive_len`) as an oracle-free
+    check that catches skipped regions nobody enumerated a reason for.
+- [ ] `unverified_entry_count` is not exposed through the C FFI.
+  `RarzValidationResult` is returned BY VALUE, so appending a field would have an
+  old caller allocate a 32-byte return slot while the new library writes more —
+  stack corruption, not a compatible expansion. If the C CLI needs it, add
+  `rarz_validate_v2()` and bump `rarz_abi_version()`; never widen the existing
+  return.
+- [ ] Entries with NO stored checksum pass silently in `policy.zig`
+  (`validate_rar5_payload`), while `rarz_verify_file` correctly returns
+  `NO_CHECKSUM` for the same entry. Two contracts in one repo disagreeing about
+  the same bytes.
+- [ ] RAR5 SERVICE block data areas (recovery record, quick-open index, comment)
+  are never read — only their header CRC is checked. Damage inside a recovery
+  record goes undetected (unrar agrees, so not a differential failure), but
+  validate documents `.full` as "every byte verified", which is then false.
+
+**Mixed-encryption archives are uncommon in the wild** — `rar` will not produce
+one in a single invocation; it takes two `rar a` calls with different `-p`
+settings. That rarity is why deferring is reasonable, and also why our own audit
+missed the bug: every archive it generated was uniformly encrypted or uniformly
+not.
+
 ### 4b. 🔴 RELEASE BLOCKER — RAR4 support is materially broken (found 2026-07-30)
 
 Evidence, against a real 12 KB RAR4 (`unrar l` = RAR 1.5, 3 entries), plus a

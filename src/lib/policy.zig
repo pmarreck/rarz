@@ -23,6 +23,21 @@ pub const ValidationResult = struct {
 	error_message: ?[]const u8,
 	block_count: u32,
 	file_count: u32,
+
+	/// Entries whose payload could NOT be checked, and were therefore skipped.
+	/// Today that means encrypted entries; no password support exists.
+	///
+	/// Exists because `is_valid` plus `has_encrypted_content` cannot distinguish
+	/// "2 of 2 entries encrypted, nothing checked" from "1 of 2 encrypted, the
+	/// other verified" — both looked identical. This does not claim a verdict;
+	/// it states what was skipped, which is the minimum the project's no-silent-
+	/// skip invariant requires.
+	///
+	/// INTERIM. The full fix is the could-not-verify outcome in
+	/// RAR_SPECIFICATION.md §5.1; see PLAN.md §4h. Defaults to 0 because a path
+	/// that skips nothing correctly reports nothing skipped — but any NEW skip
+	/// path must increment this, or it reintroduces the silent skip.
+	unverified_entry_count: u32 = 0,
 };
 
 // ============================================================================
@@ -222,8 +237,12 @@ fn validate_rar4_payload(data: []const u8, sig_offset: usize) ValidationResult {
 				if (fflags.split_before or fflags.split_after) continue;
 				// Encrypted ENTRY: its payload cannot be checked without the
 				// password. Skip this entry only — every other entry in the
-				// archive is still verified.
-				if (fflags.password) continue;
+				// archive is still verified — and COUNT it, so the result can
+				// say what went unchecked instead of quietly omitting it.
+				if (fflags.password) {
+					structural.unverified_entry_count += 1;
+					continue;
+				}
 				if (f.packed_size == 0) continue; // directory / empty entry
 
 				const header_end = f.block.header_offset + f.block.head_size;
@@ -510,8 +529,12 @@ fn validate_rar5_payload(data: []const u8, sig_offset: usize, sig_len: u8) Valid
 				if (f.header.flags.split_before or f.header.flags.split_after) continue;
 				// Encrypted ENTRY: its payload cannot be checked without the
 				// password. Skip this entry only — every other entry in the
-				// archive is still verified.
-				if (rar5_headers.extra_has_encryption(f.extra_data)) continue;
+				// archive is still verified — and COUNT it, so the result can
+				// say what went unchecked instead of quietly omitting it.
+				if (rar5_headers.extra_has_encryption(f.extra_data)) {
+					structural.unverified_entry_count += 1;
+					continue;
+				}
 
 				// PRECISION OVER FORGIVENESS: an entry claiming N > 0 unpacked
 				// bytes must declare packed bytes we can actually read, or its
@@ -1911,6 +1934,35 @@ test "validate handles every single-byte corruption of a compressed RAR5 archive
 		const result = validate(corrupted[0..archive_len]);
 		_ = result; // must not crash
 	}
+}
+
+test "mixed encryption: the result says HOW MANY entries went unverified" {
+	// Detecting the situation is not the same as reporting it. Before this,
+	// `policy.validate` returned the identical result for
+	//   "2 of 2 entries encrypted, nothing checked"  and
+	//   "1 of 2 entries encrypted, the other verified"
+	// — both `is_valid=true, has_encrypted_content=true`. A consumer could not
+	// tell a fully-opaque archive from a mostly-checked one.
+	//
+	// Full compliance (the could-not-verify outcome of RAR_SPECIFICATION §5.1)
+	// is deferred; see PLAN.md. This count is the honest interim: it does not
+	// claim a verdict, it states what was skipped.
+	const mixed: []const u8 = @embedFile("rar5_encrypted_mixed");
+
+	const r = validate(mixed);
+	try testing.expect(r.is_valid);
+	try testing.expect(r.has_encrypted_content);
+	// Exactly one of the two entries is encrypted.
+	try testing.expectEqual(@as(u32, 1), r.unverified_entry_count);
+	try testing.expectEqual(@as(u32, 2), r.file_count);
+}
+
+test "no encryption: nothing is reported as unverified" {
+	// The count must not be noise: an ordinary archive verifies every entry.
+	const plain: []const u8 = @embedFile("rar5_store");
+	const r = validate(plain);
+	try testing.expect(r.is_valid);
+	try testing.expectEqual(@as(u32, 0), r.unverified_entry_count);
 }
 
 test "mixed encryption: damage in an UNENCRYPTED entry must be caught" {

@@ -99,10 +99,139 @@ If signature byte 6 is greater than `1` but less than `5`, treat as future/unsup
 - Optional SFX data may exist before signature; parser must scan forward up to configured max prefix.
 - All multibyte fixed-width integers are little-endian unless explicitly varint (`vint`).
 - Unknown block handling depends on flags (`skip if unknown` semantics).
-- Validate in layers:
-  - `signature` (magic only),
-  - `structural` (header/block walk + header checksums),
-  - `full` (payload integrity/decode checks where possible).
+- Validation must report what it could NOT check, never silently omit it. A
+  three-dimension model is drafted in §5.1 but is not implemented; see PLAN.md §4h.
+
+## 5.1 Validation contract — three orthogonal dimensions
+
+> **STATUS: DRAFT, NOT IMPLEMENTED, AND KNOWN-FLAWED. Do not build as written.**
+> An independent review found this design cannot express a real case (an archive
+> both damaged AND partly unverifiable), that the three dimensions are not actually
+> orthogonal, and that the granularity is wrong — these are per-ENTRY facts and a
+> richer per-entry vocabulary already ships in `include/rarz.h`. See PLAN.md §4h for
+> the full findings and the proposed alternative. Retained here as the record of
+> intent, not as a specification to implement.
+
+It exists because a single boolean cannot express the difference between "I
+checked and it is good" and "I did not check", and every wrong verdict rarz has
+shipped came from that conflation.
+
+Governing rule, from the fleet-wide *VALIDATION CATEGORY RULES* (2026-01-25):
+
+> If a code path decides "I can't run this deep check here" — for any reason —
+> the verdict surface MUST tell the user. OK is reserved for "every applicable
+> check ran and passed." Never use OK as a fall-through for "we didn't run the
+> check."
+
+The three dimensions are independent. Do not collapse them.
+
+### Dimension 1 — `outcome`: what we concluded
+
+| value | meaning |
+|---|---|
+| `verified_intact` | Every applicable check ran and passed. |
+| `verified_damaged` | A check ran and failed. Real damage. |
+| `could_not_verify` | A decisive check did not run. Says nothing about whether the archive is good. |
+
+### Dimension 2 — `depth`: how far checking actually reached
+
+| value | meaning |
+|---|---|
+| `none` | Nothing examined. |
+| `signature` | RAR magic recognised, nothing beyond. |
+| `structural` | Blocks walked, header checksums verified. |
+| `payload` | Payload decoded, stored checksums verified. |
+
+`depth` is a statement about work performed, not a quality tier. It stays
+meaningful when `outcome` is `could_not_verify`: an encrypted archive whose
+headers all check out is `could_not_verify` at `structural` depth, and that
+structural result is genuinely useful.
+
+### Dimension 3 — `reason`: why checking stopped short of `payload`
+
+`none` when it did not. Otherwise:
+
+| value | trigger |
+|---|---|
+| `encrypted_no_password` | `-p`: data encrypted, headers readable and checked |
+| `encrypted_headers` | `-hp`: headers encrypted, blocks cannot be walked |
+| `unsupported_format` | Format recognised but unparsed here (RAR 1.4) |
+| `unsupported_filter` | Entry uses a filter this build cannot reproduce |
+
+### Legal combinations
+
+- `verified_intact` ⇒ `depth = payload`, `reason = none`.
+  An archive is only intact if the decisive check ran.
+  (Exception: an archive with zero file entries reaches `structural` and is
+  `verified_intact` at that depth, because no payload check is *applicable*.)
+- `verified_damaged` ⇒ `reason = none`. Damage is a finding, not a skip.
+  `depth` records where the failure was found.
+- `could_not_verify` ⇒ `reason != none`, always. A skip without a stated reason
+  is the silent skip the governing rule forbids.
+
+### Mapping to `validate`'s four verdict tiers
+
+rarz reports facts; `validate` owns the tier vocabulary (OK / INFO / WARN /
+FAIL). The mapping is:
+
+| rarz `outcome` | validate tier |
+|---|---|
+| `verified_intact` | **OK** |
+| `verified_damaged` | **FAIL** |
+| `could_not_verify` | **WARN**, carrying `reason` as the warning text and `depth` as the reported depth |
+
+`could_not_verify` is never OK and never FAIL. Not OK because no decisive check
+ran; not FAIL because nothing was proven damaged.
+
+### Legacy fields
+
+`is_valid` and `has_encrypted_content` predate this model and are retained with
+**unchanged semantics** so consumers migrate on their own schedule. Note that
+`is_valid` means "not proven damaged", not "verified good" — precisely the
+ambiguity `outcome` retires. New code reads `outcome`.
+
+### 5.1.1 Migration ledger — what each path must start reporting
+
+The three dimensions are only worth having if every path sets them honestly. A
+path that leaves `outcome` at a default is the silent skip wearing a new
+costume. This table is the checklist; it is not done until every row is.
+
+Legend: **set** = already reports all three correctly · **TODO** = still
+inferring from `is_valid` alone.
+
+| path | current verdict | must become | status |
+|---|---|---|---|
+| RAR5 payload, all checks pass | `is_valid=true` | `verified_intact` / `payload` / `none` | TODO |
+| RAR5 payload CRC32 or BLAKE2sp mismatch | `is_valid=false` | `verified_damaged` / `payload` / `none` | TODO |
+| RAR5 header CRC mismatch | `is_valid=false` | `verified_damaged` / `structural` / `none` | TODO |
+| RAR5 truncated (no end-of-archive block) | `is_valid=false` | `verified_damaged` / `structural` / `none` | TODO |
+| RAR5 `-p` encrypted data | `is_valid=true` + `has_encrypted_content` | `could_not_verify` / `structural` / `encrypted_no_password` | TODO |
+| RAR5 `-hp` encrypted headers | `is_valid=false` ← **wrong today** | `could_not_verify` / `signature` / `encrypted_headers` | TODO |
+| RAR4 payload, all checks pass | `is_valid=true` | `verified_intact` / `payload` / `none` | TODO |
+| RAR4 payload CRC32 mismatch | `is_valid=false` | `verified_damaged` / `payload` / `none` | TODO |
+| RAR4 store-method entry verified | `is_valid=true` | `verified_intact` / `payload` / `none` | TODO |
+| RAR4/v29 unsupported VM filter | `is_valid=false` ← **wrong today** | `could_not_verify` / `structural` / `unsupported_filter` | TODO |
+| RAR4 `-p` encrypted data | `is_valid=true` + `has_encrypted_content` | `could_not_verify` / `structural` / `encrypted_no_password` | TODO |
+| RAR 1.4 (no parser) | `is_valid=false` ← **over-strict today** | `could_not_verify` / `signature` / `unsupported_format` | TODO |
+| RAR 1.5 / v15 decoder (untested) | decodes; CRC decides | `verified_intact`/`verified_damaged` / `payload` | TODO |
+| RAR2 / v20, v26 multimedia | decodes; CRC decides | `verified_intact`/`verified_damaged` / `payload` | TODO |
+| Multi-volume, all volumes present | `is_valid=true` | `verified_intact` / `payload` / `none` | TODO |
+| Multi-volume, a volume truncated | `is_valid=false` | `verified_damaged` / `structural` / `none` | TODO |
+| No recognised signature | `is_valid=false` | `verified_damaged` / `none` / `none` | TODO |
+
+Three rows are marked **wrong today** because the current two-state result has
+nowhere to put "could not check", so they fall into `is_valid=false` and
+`validate` renders them FAIL — a damage claim about archives that unrar tests
+clean. Those are the rows that make this migration a correctness fix rather than
+a refactor.
+
+Decoders themselves (`unpack15/20/29/50`) do not set these dimensions; they
+report success or a typed error, and `policy.zig` maps that to the dimensions.
+The one thing a decoder must do is distinguish "this stream is corrupt" from
+"this build cannot handle this stream" — `error.UnsupportedFilter` versus
+`error.CorruptData` — because that distinction is what picks `verified_damaged`
+over `could_not_verify`. Any decoder that collapses the two forces a wrong
+verdict no amount of policy mapping can repair.
 
 ## 6. RAR 1.5-4.x Binary Layout
 
@@ -257,17 +386,26 @@ Contains archive-end flags such as next-volume indication.
 - Password-check fields are present optionally and checksummed.
 
 ## 8.2 Implementation policy for `validate` integration
-Mirror existing `validate` encrypted-content policy:
-- If content is encrypted and no usable key is available:
-  - return `is_valid=true`, `validation_depth=.structural`, `has_encrypted_content=true` if structure is sound.
-- If decryption succeeds with empty password (optional future feature):
-  - allow `.full` and mark `circumvented_trivial_protection=true`.
-- If encryption metadata is malformed or header checksums fail:
-  - invalid.
 
-This matches the current PDF policy pattern in `validate`:
-- encrypted with unknown password => structural-only,
-- empty-password decrypt success => full + trivial-protection malformation marker.
+Expressed in the §5.1 dimensions:
+
+- Data encrypted, headers readable (`-p`), structure sound:
+  `outcome = could_not_verify`, `depth = structural`,
+  `reason = encrypted_no_password`. → validate: **WARN**.
+- Headers encrypted (`-hp`), so blocks cannot be walked:
+  `outcome = could_not_verify`, `depth = signature`,
+  `reason = encrypted_headers`. → validate: **WARN**.
+  This must NOT be reported as damage: an `-hp` archive that unrar tests clean
+  is a good archive we cannot read.
+- Encryption metadata malformed, or header checksums fail:
+  `outcome = verified_damaged`. A failed check is a finding, not a skip.
+- Structure damaged in a way visible without decryption (truncation, payload
+  declared past end of file): `verified_damaged` even when encrypted. Encryption
+  blocks the payload check, not the structural ones.
+
+Empty-password decryption is not implemented; if added it would produce
+`verified_intact` at `payload` depth plus an INFO-tier annotation, matching how
+validate treats a PDF whose /Encrypt uses an empty user password.
 
 ## 9. Integrity Semantics And Corruption Detection
 
@@ -283,8 +421,10 @@ When unencrypted and algorithm support exists:
 - verify per-file integrity marker (CRC32 and/or BLAKE2sp depending on version/flags),
 - verify decode pipeline for compressed entries.
 
-When unsupported compression path exists:
-- classify as `structural` unless parser can prove invalidity.
+When an unsupported compression path exists:
+- `outcome = could_not_verify`, `depth = structural`, `reason = unsupported_filter`.
+  Never `verified_intact` (no decisive check ran) and never `verified_damaged`
+  (nothing was proven wrong) — see §5.1.
 
 ## 9.3 Corruption opacity classification
 For this project’s test taxonomy:
@@ -349,7 +489,8 @@ Profiles to cover at minimum:
 - `rar3_headers.zig`: legacy header parsing/checking.
 - `rar5_headers.zig`: RAR5 block parser + extras parser.
 - `integrity.zig`: CRC16/CRC32/BLAKE2sp adapters.
-- `policy.zig`: maps parser outcomes to `signature|structural|full`.
+- `policy.zig`: maps parser outcomes to the three dimensions of §5.1
+  (`outcome`, `depth`, `reason`).
 
 No dynamic allocation from untrusted lengths without max clamps.
 

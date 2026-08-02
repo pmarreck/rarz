@@ -767,7 +767,10 @@ static int cmd_test(const char *path) {
 			printf("Format: %s\n", format_name(result.family));
 			if (result.has_encrypted) {
 				printf("Encrypted: yes\n");
-				printf("Note: encrypted content not verified (use --password for full check)\n");
+				/* "encrypted content not verified" read as "nothing was verified", which is
+		 * false for an archive where only SOME entries are encrypted — the rest
+		 * ARE checked. `rarz verify` reports the exact per-entry split. */
+		printf("Note: encrypted entries were not verified; any unencrypted entries were (use \x27rarz verify\x27 for a per-entry report)\n");
 			}
 
 			if (!result.is_valid) {
@@ -800,7 +803,10 @@ static int cmd_test(const char *path) {
 	printf("Format: %s\n", format_name(result.family));
 	if (result.has_encrypted) {
 		printf("Encrypted: yes\n");
-		printf("Note: encrypted content not verified (use --password for full check)\n");
+		/* "encrypted content not verified" read as "nothing was verified", which is
+		 * false for an archive where only SOME entries are encrypted — the rest
+		 * ARE checked. `rarz verify` reports the exact per-entry split. */
+		printf("Note: encrypted entries were not verified; any unencrypted entries were (use \x27rarz verify\x27 for a per-entry report)\n");
 	}
 
 	if (!result.is_valid) {

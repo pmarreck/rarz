@@ -52,7 +52,23 @@ const UnifiedFile = struct {
 	is_encrypted: bool,
 	total_packed_size: u64,
 	packed_chunks: []PackedChunk,
+	/// RAR4 compression descriptor. Null for RAR5 entries, where `compression`
+	/// is authoritative instead. RAR4 describes an entry by
+	/// (unpack_version, method, raw flags) and has no CompressionInfo, so the
+	/// two families cannot share one field.
+	rar4: ?Rar4Compression = null,
 };
+
+const Rar4Compression = struct {
+	unpack_version: u8,
+	method: u8,
+	flags_raw: u16,
+};
+
+/// RAR4 stores the method as the ASCII digits '0'..'5', but `parse_file_header`
+/// already normalises it (`method_raw -% 0x30`), so store is 0 by the time it
+/// reaches here — the same value RAR5 uses.
+const RAR4_METHOD_STORE: u8 = 0;
 
 // ============================================================================
 // Archive Handle (opaque to C callers)
@@ -1018,12 +1034,19 @@ export fn rarz_verify_file(
 				wpos += chunk.length;
 			}
 
-			const decompressed = dispatch.decompressRar5(
+			const decompressed = (if (uf.rar4) |r4| dispatch.decompressRar4(
+				alloc,
+				combined,
+				uf.unpacked_size,
+				r4.unpack_version,
+				r4.method,
+				r4.flags_raw,
+			) else dispatch.decompressRar5(
 				alloc,
 				combined,
 				uf.unpacked_size,
 				uf.compression,
-			) catch {
+			)) catch {
 				setLastError("decompression failed");
 				res.status = VERIFY_UNSUPPORTED;
 				return VERIFY_UNSUPPORTED;
@@ -1600,6 +1623,118 @@ fn collectRar4Files(alloc: std.mem.Allocator, block_data: []const u8) ![]rar4_he
 /// Collect files from multiple RAR5 volumes into a unified file list.
 /// Split files (same name across volumes with split_before/split_after) are merged
 /// into a single UnifiedFile with multiple packed chunks.
+/// Merge RAR4 file blocks across volumes into whole-file entries.
+///
+/// Mirrors `collectRar5FilesUnified`. Like RAR5, the authoritative whole-file
+/// CRC lives in the part where the file COMPLETES (split_after == false);
+/// earlier parts carry a per-segment value. Confirmed against the producer:
+/// `unrar lt` prints `Pack-CRC32` for the leading parts of a split RAR4 file
+/// and a plain `CRC32` only on the completing one.
+fn collectRar4FilesUnified(alloc: std.mem.Allocator, volumes: []const VolumeData) ![]UnifiedFile {
+	const FileWithVolume = struct {
+		fh: rar4_headers.FileHeader,
+		volume_index: u32,
+		packed_data_offset: usize,
+	};
+
+	var all: std.ArrayList(FileWithVolume) = .empty;
+	defer all.deinit(alloc);
+
+	for (volumes, 0..) |vol, vi| {
+		var iter = rar4_headers.walk_blocks(vol.data[vol.block_data_offset..]);
+		while (true) {
+			const block = iter.next() catch break;
+			if (block == null) break;
+			switch (block.?) {
+				.file => |fh| {
+					const header_end = vol.block_data_offset + fh.block.header_offset + fh.block.head_size;
+					try all.append(alloc, .{
+						.fh = fh,
+						.volume_index = @intCast(vi),
+						.packed_data_offset = header_end,
+					});
+				},
+				else => {},
+			}
+		}
+	}
+
+	var unified: std.ArrayList(UnifiedFile) = .empty;
+	errdefer unified.deinit(alloc);
+
+	var i: usize = 0;
+	while (i < all.items.len) {
+		const first = all.items[i];
+		const first_flags = rar4_headers.parse_file_flags(first.fh.block.flags);
+		if (first_flags.split_before) {
+			i += 1; // continuation, consumed by a previous merge
+			continue;
+		}
+
+		var chunks: std.ArrayList(PackedChunk) = .empty;
+		errdefer chunks.deinit(alloc);
+		try chunks.append(alloc, .{
+			.volume_index = first.volume_index,
+			.offset = first.packed_data_offset,
+			.length = @intCast(first.fh.packed_size),
+		});
+		var total_packed: u64 = first.fh.packed_size;
+		var last_fh = first.fh;
+
+		var j: usize = i + 1;
+		if (first_flags.split_after) {
+			while (j < all.items.len) {
+				const cont = all.items[j];
+				const cf = rar4_headers.parse_file_flags(cont.fh.block.flags);
+				if (!cf.split_before) break;
+				if (!std.mem.eql(u8, first.fh.file_name, cont.fh.file_name)) break;
+				try chunks.append(alloc, .{
+					.volume_index = cont.volume_index,
+					.offset = cont.packed_data_offset,
+					.length = @intCast(cont.fh.packed_size),
+				});
+				total_packed += cont.fh.packed_size;
+				last_fh = cont.fh;
+				j += 1;
+				if (!cf.split_after) break;
+			}
+		}
+
+		try unified.append(alloc, .{
+			.name = first.fh.file_name,
+			.unpacked_size = first.fh.unpacked_size,
+			// CompressionInfo is RAR5-shaped and cannot hold a RAR4 method
+			// (0x30-0x35 in a u3). Only the store-vs-compressed distinction is
+			// consulted on the shared path, so carry exactly that; the real
+			// RAR4 descriptor lives in `.rar4` below.
+			.compression = .{
+				.algo_version = 0,
+				.solid = first_flags.solid,
+				.method = if (first.fh.method == RAR4_METHOD_STORE) 0 else 1,
+				.dict_bits = 0,
+				.dict_frac_bits = 0,
+			},
+			.data_crc32 = last_fh.file_crc,
+			.mtime = first.fh.mtime,
+			.is_directory = rar4_headers.is_directory_entry(first.fh),
+			.host_os = first.fh.host_os,
+			.has_crc32 = true, // RAR4 always stores one
+			.is_encrypted = first_flags.password,
+			.total_packed_size = total_packed,
+			.packed_chunks = try chunks.toOwnedSlice(alloc),
+			.rar4 = .{
+				.unpack_version = first.fh.unpack_version,
+				.method = first.fh.method,
+				.flags_raw = first.fh.block.flags,
+			},
+		});
+
+		i = if (j > i) j else i + 1;
+	}
+
+	return unified.toOwnedSlice(alloc);
+}
+
 fn collectRar5FilesUnified(alloc: std.mem.Allocator, volumes: []const VolumeData) ![]UnifiedFile {
 	// First pass: collect all file blocks from all volumes with their volume index
 	const FileWithVolume = struct {
@@ -1762,9 +1897,9 @@ export fn rarz_open_volumes(
 	};
 	handle.family = family;
 
-	if (family != .rar50) {
+	if (family != .rar50 and family != .rar15) {
 		handle.deinit();
-		setLastError("multi-volume only supported for RAR5");
+		setLastError("multi-volume only supported for RAR4 and RAR5");
 		return null;
 	}
 
@@ -1788,7 +1923,10 @@ export fn rarz_open_volumes(
 	handle.volumes = vol_data;
 
 	// Build unified file list
-	handle.unified_files = collectRar5FilesUnified(alloc, vol_data) catch {
+	handle.unified_files = (if (family == .rar15)
+		collectRar4FilesUnified(alloc, vol_data)
+	else
+		collectRar5FilesUnified(alloc, vol_data)) catch {
 		handle.deinit();
 		setLastError("failed to collect multi-volume files");
 		return null;

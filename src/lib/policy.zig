@@ -689,6 +689,201 @@ const VolumeFileChunk = struct {
 	split_after: bool,
 };
 
+/// One RAR4 file chunk within a volume. RAR4 carries no BLAKE2sp and its
+/// compression is described by (unpack_version, method, raw flags) rather than
+/// RAR5's CompressionInfo, so it needs its own chunk type.
+const Rar4VolumeChunk = struct {
+	data_ptr: [*]const u8,
+	data_len: usize,
+	name: []const u8,
+	unpacked_size: u64,
+	unpack_version: u8,
+	method: u8,
+	flags_raw: u16,
+	file_crc: u32,
+	split_before: bool,
+	split_after: bool,
+};
+
+/// Validate a multi-volume RAR4 (1.5-4.x) archive.
+///
+/// Mirrors the RAR5 path: structurally validate every volume, then concatenate
+/// each split file's packed chunks across volumes and check the reassembled
+/// content against its stored CRC32.
+///
+/// Like RAR5, the authoritative whole-file CRC lives in the part where the file
+/// COMPLETES (split_after == false); earlier parts carry a per-segment value.
+/// Verified against the producer: `unrar lt` reports `Pack-CRC32` for the
+/// leading parts and a plain `CRC32` only on the completing one.
+fn validate_volumes_rar4(volumes: []const []const u8) ValidationResult {
+	const alloc = std.heap.page_allocator;
+
+	var total_block_count: u32 = 0;
+	var unverified: u32 = 0;
+	for (volumes) |vol_data| {
+		const fmt = detect_mod.detect_format(vol_data, MAX_SFX_SCAN);
+		const family = fmt.family orelse {
+			return invalid_result(null, "no recognized RAR signature in volume");
+		};
+		if (family != .rar15) {
+			return invalid_result(family, "volume set mixes RAR families");
+		}
+		const structural = validate_rar4_structural(vol_data, fmt.signature_offset);
+		if (!structural.is_valid) return structural;
+		total_block_count += structural.block_count;
+	}
+
+	var chunks: std.ArrayList(Rar4VolumeChunk) = .empty;
+	defer chunks.deinit(alloc);
+
+	for (volumes) |vol_data| {
+		const fmt = detect_mod.detect_format(vol_data, MAX_SFX_SCAN);
+		const sig_offset = fmt.signature_offset;
+		var iter = rar4_headers.walk_blocks(vol_data[sig_offset..]);
+
+		while (true) {
+			// FAIL, don't stop — see the RAR5 path. Abandoning the walk
+			// mid-volume drops the remaining files from `chunks` entirely, and
+			// the merge below would then verify only what it happened to
+			// collect and report VALID.
+			const maybe_block = iter.next() catch {
+				return invalid_result(.rar15, "block parse error while collecting volume file chunks");
+			};
+			const block = maybe_block orelse break;
+
+			switch (block) {
+				.file => |f| {
+					const fflags = rar4_headers.parse_file_flags(f.block.flags);
+					if (rar4_headers.is_directory_entry(f)) continue;
+					// Encrypted entry: counted, not silently dropped.
+					if (fflags.password) {
+						unverified += 1;
+						continue;
+					}
+					if (f.packed_size == 0) continue;
+
+					const payload_start = sig_offset + f.block.header_offset + f.block.head_size;
+					const payload_end = payload_start + f.packed_size;
+					// A chunk declaring more payload than its volume holds means
+					// that volume is truncated. Dropping it would remove the file
+					// from the verification set and report VALID.
+					if (payload_end > vol_data.len) {
+						return invalid_result(.rar15, "declared payload extends beyond end of volume (truncated)");
+					}
+					chunks.append(alloc, .{
+						.data_ptr = vol_data[payload_start..payload_end].ptr,
+						.data_len = @intCast(f.packed_size),
+						.name = f.file_name,
+						.unpacked_size = f.unpacked_size,
+						.unpack_version = f.unpack_version,
+						.method = f.method,
+						.flags_raw = f.block.flags,
+						.file_crc = f.file_crc,
+						.split_before = fflags.split_before,
+						.split_after = fflags.split_after,
+					}) catch {
+						return invalid_result(.rar15, "out of memory collecting file chunks");
+					};
+				},
+				.end_archive => break,
+				else => {},
+			}
+		}
+	}
+
+	var file_count: u32 = 0;
+	var i: usize = 0;
+	while (i < chunks.items.len) {
+		const first = chunks.items[i];
+		if (first.split_before) {
+			i += 1; // consumed by the merge below
+			continue;
+		}
+		file_count += 1;
+
+		// Find where this file completes.
+		var total_packed: usize = first.data_len;
+		var j: usize = i + 1;
+		if (first.split_after) {
+			while (j < chunks.items.len) {
+				const cont = chunks.items[j];
+				if (!cont.split_before) break;
+				if (!std.mem.eql(u8, first.name, cont.name)) break;
+				total_packed += cont.data_len;
+				j += 1;
+				if (!cont.split_after) break;
+			}
+		}
+		const last = chunks.items[j - 1];
+
+		if (total_packed == 0) {
+			i = j;
+			continue;
+		}
+
+		// Contiguous packed bytes: the decoder and the CRC both need the file's
+		// stream whole, and it physically spans volumes.
+		const concat = alloc.alloc(u8, total_packed) catch {
+			return invalid_result(.rar15, "out of memory merging split file");
+		};
+		defer alloc.free(concat);
+		var offset: usize = 0;
+		var k: usize = i;
+		while (k < j) : (k += 1) {
+			const c = chunks.items[k];
+			@memcpy(concat[offset..][0..c.data_len], c.data_ptr[0..c.data_len]);
+			offset += c.data_len;
+		}
+
+		if (first.method == 0) {
+			if (integrity.crc32(concat) != last.file_crc) {
+				return rar4_volume_failure(total_block_count, file_count, unverified, "payload CRC32 mismatch");
+			}
+		} else {
+			// A split file cannot share a solid session with its neighbours here
+			// (its stream is reassembled), so decode it standalone.
+			const decompressed = dispatch.decompressRar4(
+				alloc,
+				concat,
+				first.unpacked_size,
+				first.unpack_version,
+				first.method,
+				first.flags_raw,
+			) catch {
+				return rar4_volume_failure(total_block_count, file_count, unverified, "decompression failed during validation");
+			};
+			defer alloc.free(decompressed);
+			if (integrity.crc32(decompressed) != last.file_crc) {
+				return rar4_volume_failure(total_block_count, file_count, unverified, "payload CRC32 mismatch");
+			}
+		}
+
+		i = j;
+	}
+
+	return .{
+		.is_valid = true,
+		.family = .rar15,
+		.has_encrypted_content = unverified > 0,
+		.error_message = null,
+		.block_count = total_block_count,
+		.file_count = file_count,
+		.unverified_entry_count = unverified,
+	};
+}
+
+fn rar4_volume_failure(blocks: u32, files: u32, unverified: u32, msg: []const u8) ValidationResult {
+	return .{
+		.is_valid = false,
+		.family = .rar15,
+		.has_encrypted_content = unverified > 0,
+		.error_message = msg,
+		.block_count = blocks,
+		.file_count = files,
+		.unverified_entry_count = unverified,
+	};
+}
+
 /// Validate a multi-volume RAR5 archive.
 ///
 /// Validates structural integrity of each volume, then concatenates split file
@@ -712,8 +907,15 @@ pub fn validate_volumes(volumes: []const []const u8) ValidationResult {
 		const family = fmt.family orelse {
 			return invalid_result(null, "no recognized RAR signature in volume");
 		};
+		// RAR4 volume sets (.part01.rar / .r00 …) are among the most common
+		// archives in the wild. Returning INVALID for them claimed positive
+		// evidence of corruption that did not exist, on archives unrar tests
+		// clean — a missing capability reported as the user's data being bad.
+		if (family == .rar15) {
+			return validate_volumes_rar4(volumes);
+		}
 		if (family != .rar50) {
-			return invalid_result(family, "multi-volume validation only supported for RAR5");
+			return invalid_result(family, "multi-volume validation only supported for RAR4 and RAR5");
 		}
 
 		// Structural validation

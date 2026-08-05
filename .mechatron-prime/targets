@@ -1,0 +1,3 @@
+# Release artifact and its independent ReleaseSafe test derivation.
+packages.x86_64-linux.default
+checks.x86_64-linux.default

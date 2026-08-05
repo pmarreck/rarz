@@ -846,6 +846,12 @@ const VERIFY_NO_CHECKSUM: i32 = 2;
 const VERIFY_UNSUPPORTED: i32 = 3;
 const VERIFY_ERROR: i32 = 4;
 
+/// Archive-level outcomes for `rarz_verify_archive`, mirrored in include/rarz.h.
+const ARCHIVE_VERIFY_VERIFIED: i32 = 0;
+const ARCHIVE_VERIFY_DAMAGED: i32 = 1;
+const ARCHIVE_VERIFY_INCOMPLETE: i32 = 2;
+const ARCHIVE_VERIFY_ERROR: i32 = 3;
+
 /// Result of verifying one entry. Extern layout — part of the C ABI.
 const RarzVerifyResult = extern struct {
 	status: i32,
@@ -860,6 +866,34 @@ const RarzVerifyResult = extern struct {
 	checked_blake2sp: u8,
 	is_directory: u8,
 	_pad: u8 = 0,
+};
+
+/// Lossless archive rollup of the per-entry verify evidence.
+///
+/// Counts are kept separate so mixed archives remain expressible: one damaged
+/// entry and one unsupported entry is damaged overall while still reporting
+/// the unsupported evidence. The accounting invariant prevents a new entry
+/// path from disappearing from the consumer's view.
+const RarzVerifyArchiveSummary = extern struct {
+	status: i32,
+	entry_count: u32,
+	verified_entry_count: u32,
+	damaged_entry_count: u32,
+	unsupported_entry_count: u32,
+	no_checksum_entry_count: u32,
+	error_entry_count: u32,
+	directory_count: u32,
+	format_supported: u8,
+	_pad: [3]u8 = .{ 0, 0, 0 },
+
+	fn accountedEntryCount(self: RarzVerifyArchiveSummary) u32 {
+		return self.verified_entry_count +
+			self.damaged_entry_count +
+			self.unsupported_entry_count +
+			self.no_checksum_entry_count +
+			self.error_entry_count +
+			self.directory_count;
+	}
 };
 
 /// Verify one entry by decoding it into a hashing sink and comparing against the
@@ -1014,6 +1048,11 @@ export fn rarz_verify_file(
 			clearLastError();
 			return VERIFY_OK;
 		}
+		if (rar5_headers.extra_has_encryption(f.extra_data)) {
+			setLastError("entry is encrypted; contents cannot be verified without a password");
+			res.status = VERIFY_UNSUPPORTED;
+			return VERIFY_UNSUPPORTED;
+		}
 
 		const expected_blake = rar5_headers.extract_blake2sp_hash_raw(f.extra_data);
 		var vs = sink.VerifySink.init(expected_blake != null);
@@ -1133,6 +1172,70 @@ export fn rarz_verify_file(
 
 	setLastError("archive has no verifiable entries");
 	return VERIFY_ERROR;
+}
+
+/// Verify every entry and publish a complete, additive archive summary.
+///
+/// Return value equals `out_summary.status`. A damaged result takes precedence
+/// over incomplete evidence, while every incomplete count remains visible.
+/// This function does not invoke an external decoder or oracle.
+export fn rarz_verify_archive(
+	archive: ?*const ArchiveHandle,
+	out_summary: ?*RarzVerifyArchiveSummary,
+) i32 {
+	const a = archive orelse {
+		setLastError("null archive handle");
+		return ARCHIVE_VERIFY_ERROR;
+	};
+	const summary = out_summary orelse {
+		setLastError("null archive summary pointer");
+		return ARCHIVE_VERIFY_ERROR;
+	};
+
+	summary.* = .{
+		.status = ARCHIVE_VERIFY_VERIFIED,
+		.entry_count = rarz_file_count(a),
+		.verified_entry_count = 0,
+		.damaged_entry_count = 0,
+		.unsupported_entry_count = 0,
+		.no_checksum_entry_count = 0,
+		.error_entry_count = 0,
+		.directory_count = 0,
+		.format_supported = @intFromBool(a.family != .rar14),
+	};
+
+	// RAR 1.4 is recognised but has no parser. Zero enumerated entries is an
+	// incomplete result for that family, not a vacuous success.
+	if (summary.format_supported == 0) {
+		summary.status = ARCHIVE_VERIFY_INCOMPLETE;
+		clearLastError();
+		return summary.status;
+	}
+
+	for (0..summary.entry_count) |index| {
+		var entry_result: RarzVerifyResult = undefined;
+		const entry_status = rarz_verify_file(a, @intCast(index), &entry_result);
+		if (entry_result.is_directory != 0) {
+			summary.directory_count += 1;
+			continue;
+		}
+		switch (entry_status) {
+			VERIFY_OK => summary.verified_entry_count += 1,
+			VERIFY_CHECKSUM_MISMATCH => summary.damaged_entry_count += 1,
+			VERIFY_NO_CHECKSUM => summary.no_checksum_entry_count += 1,
+			VERIFY_UNSUPPORTED => summary.unsupported_entry_count += 1,
+			else => summary.error_entry_count += 1,
+		}
+	}
+
+	std.debug.assert(summary.accountedEntryCount() == summary.entry_count);
+	if (summary.damaged_entry_count > 0 or summary.error_entry_count > 0) {
+		summary.status = ARCHIVE_VERIFY_DAMAGED;
+	} else if (summary.unsupported_entry_count > 0 or summary.no_checksum_entry_count > 0) {
+		summary.status = ARCHIVE_VERIFY_INCOMPLETE;
+	}
+	clearLastError();
+	return summary.status;
 }
 
 /// C-compatible file entry struct for archive creation (input).
@@ -1939,6 +2042,70 @@ test "rarz_validate returns valid for archive with file" {
 	try testing.expectEqual(@as(i32, 50), result.family);
 	try testing.expectEqual(@as(u32, 1), result.file_count);
 	try testing.expectEqual(@as(u32, 3), result.block_count); // main + file + end
+}
+
+test "rarz_verify_archive accounts for every pristine and payload-mutated entry" {
+	const pristine: []const u8 = @embedFile("rar5_store");
+	const pristine_archive = rarz_open(pristine.ptr, pristine.len) orelse return error.TestUnexpectedResult;
+	defer rarz_close(pristine_archive);
+
+	var pristine_summary: RarzVerifyArchiveSummary = undefined;
+	try testing.expectEqual(ARCHIVE_VERIFY_VERIFIED, rarz_verify_archive(pristine_archive, &pristine_summary));
+	try testing.expectEqual(pristine_summary.entry_count, pristine_summary.accountedEntryCount());
+	try testing.expectEqual(
+		pristine_summary.entry_count,
+		pristine_summary.verified_entry_count + pristine_summary.directory_count,
+	);
+	try testing.expectEqual(@as(u32, 0), pristine_summary.damaged_entry_count);
+	try testing.expectEqual(@as(u32, 0), pristine_summary.unsupported_entry_count);
+
+	// The fixture is store-method, so every packed payload byte is covered by
+	// that entry's CRC32. Classify a SET spanning each payload rather than
+	// pinning one lucky offset. Five positions model sparse sniper shots while
+	// keeping this unit test fast; larger guns belong in the CLI mutation gate.
+	const files = pristine_archive.rar5_files orelse return error.TestUnexpectedResult;
+	const mutated = try testing.allocator.alloc(u8, pristine.len);
+	defer testing.allocator.free(mutated);
+	var mutation_count: usize = 0;
+	for (files) |f| {
+		if (f.is_directory or f.unpacked_size == 0) continue;
+		const range = rar5PayloadRange(pristine_archive, f) orelse return error.TestUnexpectedResult;
+		const payload_len = range.end - range.start;
+		const offsets = [_]usize{
+			range.start,
+			range.start + payload_len / 4,
+			range.start + payload_len / 2,
+			range.start + (payload_len * 3) / 4,
+			range.end - 1,
+		};
+		for (offsets) |offset| {
+			@memcpy(mutated, pristine);
+			mutated[offset] ^= 0x01;
+			const archive = rarz_open(mutated.ptr, mutated.len) orelse return error.TestUnexpectedResult;
+			defer rarz_close(archive);
+
+			var summary: RarzVerifyArchiveSummary = undefined;
+			try testing.expectEqual(ARCHIVE_VERIFY_DAMAGED, rarz_verify_archive(archive, &summary));
+			try testing.expectEqual(summary.entry_count, summary.accountedEntryCount());
+			try testing.expectEqual(@as(u32, 1), summary.damaged_entry_count);
+			mutation_count += 1;
+		}
+	}
+	try testing.expect(mutation_count >= 15);
+}
+
+test "rarz_verify_archive keeps mixed encryption incomplete rather than valid or damaged" {
+	const mixed: []const u8 = @embedFile("rar5_encrypted_mixed");
+	const archive = rarz_open(mixed.ptr, mixed.len) orelse return error.TestUnexpectedResult;
+	defer rarz_close(archive);
+
+	var summary: RarzVerifyArchiveSummary = undefined;
+	try testing.expectEqual(ARCHIVE_VERIFY_INCOMPLETE, rarz_verify_archive(archive, &summary));
+	try testing.expectEqual(@as(u32, 2), summary.entry_count);
+	try testing.expectEqual(summary.entry_count, summary.accountedEntryCount());
+	try testing.expectEqual(@as(u32, 1), summary.verified_entry_count);
+	try testing.expectEqual(@as(u32, 0), summary.damaged_entry_count);
+	try testing.expectEqual(@as(u32, 1), summary.unsupported_entry_count);
 }
 
 test "rarz_extract_to_buffer extracts stored file" {

@@ -1,5 +1,13 @@
 # PLAN
 
+## Mecha Validate v1 RAR gate (2026-08-04 23:45 EDT)
+
+- [x] Publish a consumer-facing result contract that distinguishes verified-good, verified-damaged, unverified, and unsupported evidence without breaking the existing C ABI. `rarz_verify_archive` keeps a lossless count rollup and accounting invariant. (2026-08-05 00:01 EDT)
+- [x] Publish an evidence-backed version/feature matrix for RAR 1.4/1.5, 2.x, 3/4, 5/7; stored/compressed/solid/split/encrypted/recovery/filter/service/header/payload cases. See `docs/MECHA_VALIDATE_V1_RAR_GATE.md`. (2026-08-05 00:01 EDT)
+- [x] Prove one remaining false-classification slice over sets of pristine and deterministically mutated fixtures (sniper/boltgun/shotgun), with UnRAR confined to the dev/test oracle role. The bounded first slice covers a 25-shot RAR5 store sniper set plus mixed encryption; larger guns remain below. (2026-08-05 00:01 EDT)
+- [x] Run the full suite, build, applicable mutation/oracle gates, and exact Mechatron Prime targets before promoting a consumer SHA. `./test`, `./build`, `packages.x86_64-linux.default`, and `checks.x86_64-linux.default` all passed. (2026-08-05 00:12 EDT)
+- Curiosity poke: a byte mutation may produce a different valid archive; classifier metrics must separate undetected corruption from legitimately surviving valid mutations.
+
 ## ACTIVE QUEUE (2026-07-29 — thelio-nixos, git-only, Mecha Validate release push)
 
 Context: new main dev machine (thelio-nixos = mechatron-prime, our own CI); jj
@@ -659,9 +667,9 @@ has benchmark suites assert its absence.
   passes vacuously if the banner is deleted outright).
 
 ### 6. Housekeeping
-- [ ] Mechatron Prime CI: `MECHATRON_PRIME_CI.md` is untracked; wire rarz onto
-  the Thelio runner (`mechatron-ci` skill owns targets/webhook/badge) now that
-  Garnix is gone.
+- [x] Mechatron Prime CI: committed exact package/check targets and installed
+  the canonical dynamic badge; both targets passed locally. Webhook provisioning
+  remains a host-level fleet operation, outside this code unit. (2026-08-05 00:12 EDT)
 - [ ] Trash/process the 3 inbox notes once each is handled.
 
 ## CI migration off Garnix (2026-07-08 EST — Garnix shutting down 2026-07-15)

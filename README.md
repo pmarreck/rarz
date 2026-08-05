@@ -1,6 +1,6 @@
 # rarz
 
-[![CI](https://github.com/pmarreck/rarz/actions/workflows/ci.yml/badge.svg)](https://github.com/pmarreck/rarz/actions/workflows/ci.yml)
+[![Mechatron Prime CI](https://img.shields.io/endpoint?url=https%3A%2F%2Fthelio-nixos.tail66c90.ts.net%2Fbadges%2Frarz.json&style=for-the-badge)](https://thelio-nixos.tail66c90.ts.net/mechatron-prime/)
 
 A clean-room RAR archive toolkit: parser, validator, extractor, and writer.
 
@@ -12,7 +12,7 @@ Written in Zig with a C FFI and drop-in C CLI.
 
 **Compression** — creates RAR5 archives with LZ77 + Huffman compression at levels m0 (store) through m5 (best). Output is extractable by rarz and mainstream RAR extractors.
 
-**Parsing & validation** — full structural parsing and multi-depth validation for RAR 1.4, RAR 1.5-4.x, and RAR5+ archives.
+**Parsing & validation** — evidence-backed payload validation for the committed RAR2/v20, RAR3/4/v29, and RAR5/v50 corpus. RAR 1.4 is recognised but explicitly incomplete. See [`docs/MECHA_VALIDATE_V1_RAR_GATE.md`](docs/MECHA_VALIDATE_V1_RAR_GATE.md) for the exact matrix.
 
 ## Architecture
 
@@ -85,9 +85,14 @@ for (uint32_t i = 0; i < count; i++) {
     printf("%.*s (%llu bytes)\n", entry.name_len, entry.name, entry.unpacked_size);
 }
 
-// Validate
-rarz_validation_result r = rarz_validate(data, len);
-// r.depth: 0=signature, 1=structural, 2=full
+// Verify every entry and retain incomplete evidence separately from damage
+rarz_verify_archive_summary summary;
+int32_t status = rarz_verify_archive(ar, &summary);
+if (status == RARZ_ARCHIVE_VERIFY_DAMAGED) {
+    fprintf(stderr, "%u damaged entries\n", summary.damaged_entry_count);
+} else if (status == RARZ_ARCHIVE_VERIFY_INCOMPLETE) {
+    fprintf(stderr, "%u unsupported entries\n", summary.unsupported_entry_count);
+}
 
 // Extract (handles both stored and compressed files)
 uint8_t buf[4096];

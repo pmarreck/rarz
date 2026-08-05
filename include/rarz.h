@@ -261,6 +261,48 @@ typedef struct {
 int32_t rarz_verify_file(const rarz_archive *archive, uint32_t index,
                           rarz_verify_result *out_result);
 
+/** Every enumerated entry was verified against stored integrity evidence. */
+#define RARZ_ARCHIVE_VERIFY_VERIFIED   0
+/** At least one entry was proven damaged. Other incomplete counts still apply. */
+#define RARZ_ARCHIVE_VERIFY_DAMAGED    1
+/** No damage was proven, but at least one entry or the format was unverifiable. */
+#define RARZ_ARCHIVE_VERIFY_INCOMPLETE 2
+/** The call itself was invalid; no archive verdict was produced. */
+#define RARZ_ARCHIVE_VERIFY_ERROR      3
+
+/**
+ * Lossless archive rollup of `rarz_verify_file` evidence.
+ *
+ * Accounting invariant:
+ *   verified + damaged + unsupported + no_checksum + error + directories
+ *     == entry_count
+ *
+ * Counts remain separate even when the overall status is DAMAGED, so a mixed
+ * archive such as "one damaged entry, one encrypted entry" is expressible.
+ */
+typedef struct {
+	int32_t  status; /* one of RARZ_ARCHIVE_VERIFY_* */
+	uint32_t entry_count;
+	uint32_t verified_entry_count;
+	uint32_t damaged_entry_count;
+	uint32_t unsupported_entry_count;
+	uint32_t no_checksum_entry_count;
+	uint32_t error_entry_count;
+	uint32_t directory_count;
+	uint8_t  format_supported;
+	uint8_t  _pad[3];
+} rarz_verify_archive_summary;
+
+/**
+ * Verify all entries without materialising decoded payloads.
+ *
+ * Returns the same value written to out_summary->status. Damage takes
+ * precedence over incomplete evidence, while every count remains available.
+ * RAR 1.4 is currently reported INCOMPLETE with format_supported=0.
+ */
+int32_t rarz_verify_archive(const rarz_archive *archive,
+							rarz_verify_archive_summary *out_summary);
+
 #ifdef __cplusplus
 }
 #endif

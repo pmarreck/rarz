@@ -1,6 +1,8 @@
 # Dirtree: Stateful directory trees in the CLI for humans and LLMs. https://github.com/pmarreck/dirtree
 ver=1.2
 annotate=[
+	docs/MECHA_VALIDATE_V1_RAR_GATE.md = Measured Mecha Validate v1 support matrix, consumer summary contract, classifier evidence, and blockers
+	include/rarz.h = Stable C ABI for detection, archive inspection, validation summaries, verification, extraction, and creation
 	src/lib/decompress/sink.zig = Output sinks for decoders: Sink vtable, BufferSink (caller buffer, flags overflow), DiscardSink (counts+drops, warms solid windows)
 	tests/cli/test_build_banner.sh = --about surface + invariant 'DEBUG BUILD banner present <=> --about reports Debug'
 	tests/cli/test_precision_volumes.sh = Multi-volume precision: unrar-damaged => rarz must never report VALID (differential truncation sweep)

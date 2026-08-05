@@ -239,7 +239,12 @@ typedef struct {
 	uint8_t  has_crc32;
 	uint8_t  checked_blake2sp; /* 1 when a BLAKE2sp was present AND matched   */
 	uint8_t  is_directory;     /* directory entries have no payload to verify */
-	uint8_t  _pad;
+	/*
+	 * 1 when this entry's content is encrypted. Reported beside the status
+	 * rather than folded into it: an encrypted entry and a failed decode both
+	 * return RARZ_VERIFY_UNSUPPORTED, and only this field separates them.
+	 */
+	uint8_t  is_encrypted;
 } rarz_verify_result;
 
 /**
@@ -291,6 +296,23 @@ typedef struct {
 	uint32_t directory_count;
 	uint8_t  format_supported;
 	uint8_t  _pad[3];
+	/**
+	 * Entries whose CONTENT is encrypted. Deliberately NOT part of the
+	 * accounting invariant above: encryption is a property of an entry, not an
+	 * outcome, so an encrypted entry is ALSO counted in exactly one outcome
+	 * bucket (today `unsupported`; `verified` if a password API ever lands).
+	 *
+	 * Without this, `unsupported_entry_count` cannot say WHY an entry went
+	 * unverified — a failed decode and an encrypted entry land in the same
+	 * bucket. Derive the archive's encryption class from it:
+	 *
+	 *   content = entry_count - directory_count
+	 *   encrypted == 0        -> no encryption
+	 *   encrypted == content  -> wholly encrypted
+	 *   otherwise             -> MIXED: some entries were verified, some
+	 *                            cannot be without a password
+	 */
+	uint32_t encrypted_entry_count;
 } rarz_verify_archive_summary;
 
 /**

@@ -125,7 +125,16 @@ pub fn build(b: *std.Build) void {
 	// have encoded the same field-offset bug they exist to catch.
 	unit_tests.root_module.addAnonymousImport("rar4_store", .{ .root_source_file = b.path("tests/fixtures/rar4_store.rar") });
 	unit_tests.root_module.addAnonymousImport("rar4_m3", .{ .root_source_file = b.path("tests/fixtures/rar4_m3.rar") });
+	// Encryption CLASSIFIER corpus (tests/generate_encryption_fixtures.sh). The
+	// question "is this archive mixed-encryption?" is a classifier over
+	// archives, so it is tested over the whole set — none/mixed/all in both
+	// families — not against one lucky example that a stuck answer would pass.
 	unit_tests.root_module.addAnonymousImport("rar5_encrypted_mixed", .{ .root_source_file = b.path("tests/fixtures/rar5_encrypted_mixed.rar") });
+	unit_tests.root_module.addAnonymousImport("rar4_encrypted_none", .{ .root_source_file = b.path("tests/fixtures/rar4_encrypted_none.rar") });
+	unit_tests.root_module.addAnonymousImport("rar4_encrypted_mixed", .{ .root_source_file = b.path("tests/fixtures/rar4_encrypted_mixed.rar") });
+	unit_tests.root_module.addAnonymousImport("rar4_encrypted_all", .{ .root_source_file = b.path("tests/fixtures/rar4_encrypted_all.rar") });
+	unit_tests.root_module.addAnonymousImport("rar5_encrypted_none", .{ .root_source_file = b.path("tests/fixtures/rar5_encrypted_none.rar") });
+	unit_tests.root_module.addAnonymousImport("rar5_encrypted_all", .{ .root_source_file = b.path("tests/fixtures/rar5_encrypted_all.rar") });
 	unit_tests.root_module.addAnonymousImport("rar5_store", .{ .root_source_file = b.path("tests/fixtures/rar5_store.rar") });
 	// Minimal v29-compressed archives — 87 and 162 bytes. Small enough to trace
 	// bit-by-bit against the reference decoder when unpack29 misbehaves.

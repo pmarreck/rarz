@@ -256,6 +256,83 @@ else
 	ok "verify with no argument exits non-zero"
 fi
 
+
+echo "=== Gate F: encryption classifier — none / mixed / wholly encrypted ==="
+
+# The claim under test is a CLASSIFIER over archives, so it is exercised over
+# the whole corpus. Passing one mixed fixture proves nothing: code that answers
+# "mixed" unconditionally would pass it, and code that never says "mixed" would
+# pass the none/all cases. Only the set separates them.
+#
+# Fields: name family class expected_exit
+ENCRYPTION_CORPUS="
+rar4_encrypted_none:none:0
+rar4_encrypted_mixed:mixed:69
+rar4_encrypted_all:all:69
+rar5_encrypted_none:none:0
+rar5_encrypted_mixed:mixed:69
+rar5_encrypted_all:all:69
+"
+
+for row in $ENCRYPTION_CORPUS; do
+	name=${row%%:*}; rest=${row#*:}
+	class=${rest%%:*}; want_rc=${rest#*:}
+	f="$FIXTURES/$name.rar"
+	[ -f "$f" ] || { fail "$name: fixture missing"; continue; }
+
+	out=$("$RARZ" verify "$f" 2>&1)
+	rc=$?
+	# Match against the REPORT, not the echoed path. These fixtures are named
+	# ..._encrypted_mixed.rar, so grepping raw output for "mixed"/"encrypted"
+	# passes on the banner line alone — vacuously true whatever rarz concluded.
+	# (Filtering here, after rc is captured, keeps $? off the far side of a pipe.)
+	report=$(echo "$out" | grep -v "$f")
+
+	# An encrypted archive that unrar tests clean must NEVER be called damaged.
+	# Condemning good data is worse than admitting we could not read it.
+	if echo "$report" | grep -q "FAILED"; then
+		fail "$name: intact encrypted archive reported as FAILED"
+	else
+		ok "$name: not reported as damaged"
+	fi
+
+	if [ "$rc" -eq "$want_rc" ]; then
+		ok "$name: exit $rc"
+	else
+		fail "$name: exit $rc, expected $want_rc"
+	fi
+
+	# The reason must be stated, not left for the caller to infer: "unsupported"
+	# alone covers both an encrypted entry and a failed decode.
+	case "$class" in
+		mixed)
+			if echo "$report" | grep -qi "mixed"; then
+				ok "$name: mixed encryption named in the report"
+			else
+				fail "$name: mixed encryption not named (got: $(echo "$out" | tail -1))"
+			fi
+			;;
+		all)
+			if echo "$report" | grep -qi "mixed"; then
+				fail "$name: wholly-encrypted archive wrongly called mixed"
+			else
+				ok "$name: not called mixed"
+			fi
+			if echo "$report" | grep -qiE "encrypted"; then
+				ok "$name: encryption named in the report"
+			else
+				fail "$name: encryption not named"
+			fi
+			;;
+		none)
+			if echo "$report" | grep -qi "encrypt"; then
+				fail "$name: unencrypted archive mentions encryption"
+			else
+				ok "$name: no encryption mentioned"
+			fi
+			;;
+	esac
+done
 echo ""
 echo "Results: $pass passed, $errors failed"
 

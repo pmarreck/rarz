@@ -865,7 +865,11 @@ const RarzVerifyResult = extern struct {
 	/// 1 when a BLAKE2sp was present AND matched. RAR4 never carries one.
 	checked_blake2sp: u8,
 	is_directory: u8,
-	_pad: u8 = 0,
+	/// 1 when this entry's content is encrypted. Reported alongside the status
+	/// rather than folded into it, so a caller can distinguish "unsupported
+	/// because we have no password" from "unsupported because the decode
+	/// failed" — both of which return VERIFY_UNSUPPORTED.
+	is_encrypted: u8 = 0,
 };
 
 /// Lossless archive rollup of the per-entry verify evidence.
@@ -885,6 +889,27 @@ const RarzVerifyArchiveSummary = extern struct {
 	directory_count: u32,
 	format_supported: u8,
 	_pad: [3]u8 = .{ 0, 0, 0 },
+	/// Entries whose CONTENT is encrypted. Deliberately NOT part of the
+	/// accounting invariant: encryption is a property of an entry, not an
+	/// outcome, so an encrypted entry is always also counted in exactly one
+	/// outcome bucket. Today that bucket is `unsupported`; if a password API
+	/// lands, the same entry becomes `verified` and this count stays true.
+	///
+	/// It exists because `unsupported_entry_count` alone cannot say WHY an
+	/// entry went unverified — encryption and a failed decode both land there,
+	/// and a consumer reporting "unsupported due to encrypted content" would
+	/// be guessing. With this field the reason is a fact, not an inference.
+	encrypted_entry_count: u32,
+
+	/// True when the archive holds BOTH encrypted and unencrypted content.
+	/// Such an archive cannot be fully verified without a password, yet its
+	/// readable entries can be and are — so it is neither wholly opaque nor
+	/// fully checked, and a consumer needs to say so precisely.
+	fn hasMixedEncryption(self: RarzVerifyArchiveSummary) bool {
+		const content_entries = self.entry_count - self.directory_count;
+		return self.encrypted_entry_count > 0 and
+			self.encrypted_entry_count < content_entries;
+	}
 
 	fn accountedEntryCount(self: RarzVerifyArchiveSummary) u32 {
 		return self.verified_entry_count +
@@ -1050,6 +1075,7 @@ export fn rarz_verify_file(
 		}
 		if (rar5_headers.extra_has_encryption(f.extra_data)) {
 			setLastError("entry is encrypted; contents cannot be verified without a password");
+			res.is_encrypted = 1;
 			res.status = VERIFY_UNSUPPORTED;
 			return VERIFY_UNSUPPORTED;
 		}
@@ -1128,6 +1154,17 @@ export fn rarz_verify_file(
 			clearLastError();
 			return VERIFY_OK;
 		}
+		// PRECISION: without this the STORE path hashes ciphertext against the
+		// plaintext CRC32 in the header and calls an intact archive damaged —
+		// a false positive on good data. The RAR5 branch above always had this
+		// check; RAR4 did not, so `rarz t` (which consults policy.zig) and
+		// `rarz verify` disagreed on the very same archive.
+		if (rar4_headers.parse_file_flags(f.block.flags).password) {
+			setLastError("entry is encrypted; contents cannot be verified without a password");
+			res.is_encrypted = 1;
+			res.status = VERIFY_UNSUPPORTED;
+			return VERIFY_UNSUPPORTED;
+		}
 
 		var vs = sink.VerifySink.init(false); // RAR4 carries no BLAKE2sp
 
@@ -1202,6 +1239,7 @@ export fn rarz_verify_archive(
 		.error_entry_count = 0,
 		.directory_count = 0,
 		.format_supported = @intFromBool(a.family != .rar14),
+		.encrypted_entry_count = 0,
 	};
 
 	// RAR 1.4 is recognised but has no parser. Zero enumerated entries is an
@@ -1219,6 +1257,8 @@ export fn rarz_verify_archive(
 			summary.directory_count += 1;
 			continue;
 		}
+		// Orthogonal to the outcome buckets below — see the field's comment.
+		if (entry_result.is_encrypted != 0) summary.encrypted_entry_count += 1;
 		switch (entry_status) {
 			VERIFY_OK => summary.verified_entry_count += 1,
 			VERIFY_CHECKSUM_MISMATCH => summary.damaged_entry_count += 1,
@@ -2092,6 +2132,90 @@ test "rarz_verify_archive accounts for every pristine and payload-mutated entry"
 		}
 	}
 	try testing.expect(mutation_count >= 15);
+}
+
+/// One member of the encryption classifier corpus. `encrypted` and `plain` are
+/// the counts unrar itself reported when the fixture was generated, so the
+/// expectations here trace back to an oracle we did not write.
+const EncryptionFixture = struct {
+	name: []const u8,
+	bytes: []const u8,
+	encrypted: u32,
+	plain: u32,
+};
+
+/// The full none/mixed/all cross-product in both families. A classifier must be
+/// judged over a SET: any single fixture can be passed by a stuck answer.
+const encryption_corpus = [_]EncryptionFixture{
+	.{ .name = "rar4 none", .bytes = @embedFile("rar4_encrypted_none"), .encrypted = 0, .plain = 2 },
+	.{ .name = "rar4 mixed", .bytes = @embedFile("rar4_encrypted_mixed"), .encrypted = 2, .plain = 1 },
+	.{ .name = "rar4 all", .bytes = @embedFile("rar4_encrypted_all"), .encrypted = 2, .plain = 0 },
+	.{ .name = "rar5 none", .bytes = @embedFile("rar5_encrypted_none"), .encrypted = 0, .plain = 2 },
+	.{ .name = "rar5 mixed", .bytes = @embedFile("rar5_encrypted_mixed"), .encrypted = 1, .plain = 1 },
+	.{ .name = "rar5 all", .bytes = @embedFile("rar5_encrypted_all"), .encrypted = 2, .plain = 0 },
+};
+
+test "an intact encrypted archive is never reported damaged" {
+	// unrar tests every one of these clean with the fixture password. Claiming
+	// damage on data we simply cannot read condemns good archives — the worst
+	// error an integrity tool can make, and strictly worse than admitting we
+	// could not check. The RAR4 path had no encryption check at all, so its
+	// stored ciphertext was hashed against the plaintext CRC32 in the header.
+	for (encryption_corpus) |fx| {
+		if (fx.encrypted == 0) continue;
+		const archive = rarz_open(fx.bytes.ptr, fx.bytes.len) orelse {
+			std.debug.print("{s}: failed to open\n", .{fx.name});
+			return error.TestUnexpectedResult;
+		};
+		defer rarz_close(archive);
+
+		var summary: RarzVerifyArchiveSummary = undefined;
+		const status = rarz_verify_archive(archive, &summary);
+		if (status == ARCHIVE_VERIFY_DAMAGED or summary.damaged_entry_count != 0) {
+			std.debug.print(
+				"{s}: intact archive reported damaged (status={d}, damaged={d})\n",
+				.{ fx.name, status, summary.damaged_entry_count },
+			);
+			return error.TestUnexpectedResult;
+		}
+		try testing.expectEqual(ARCHIVE_VERIFY_INCOMPLETE, status);
+	}
+}
+
+test "rarz_verify_archive separates no / mixed / wholly encrypted archives" {
+	// The consumer-visible question is "why could this not be fully verified?"
+	// `unsupported_entry_count` cannot answer it — a failed decode lands in the
+	// same bucket as an encrypted entry. These counts make the reason a fact.
+	for (encryption_corpus) |fx| {
+		const archive = rarz_open(fx.bytes.ptr, fx.bytes.len) orelse {
+			std.debug.print("{s}: failed to open\n", .{fx.name});
+			return error.TestUnexpectedResult;
+		};
+		defer rarz_close(archive);
+
+		var summary: RarzVerifyArchiveSummary = undefined;
+		_ = rarz_verify_archive(archive, &summary);
+
+		if (summary.encrypted_entry_count != fx.encrypted) {
+			std.debug.print(
+				"{s}: encrypted_entry_count={d}, unrar counted {d}\n",
+				.{ fx.name, summary.encrypted_entry_count, fx.encrypted },
+			);
+			return error.TestUnexpectedResult;
+		}
+		// The archive-level classification the CLI and validate report on.
+		const expect_mixed = fx.encrypted > 0 and fx.plain > 0;
+		if (summary.hasMixedEncryption() != expect_mixed) {
+			std.debug.print(
+				"{s}: hasMixedEncryption={} expected {}\n",
+				.{ fx.name, summary.hasMixedEncryption(), expect_mixed },
+			);
+			return error.TestUnexpectedResult;
+		}
+		// Encryption is a property, not an outcome: it must never disturb the
+		// accounting invariant that proves no entry was silently skipped.
+		try testing.expectEqual(summary.entry_count, summary.accountedEntryCount());
+	}
 }
 
 test "rarz_verify_archive keeps mixed encryption incomplete rather than valid or damaged" {

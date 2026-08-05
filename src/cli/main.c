@@ -903,6 +903,7 @@ static int cmd_verify(const char *path) {
 
 	uint32_t count = rarz_file_count(archive);
 	uint32_t verified = 0, failed = 0, unverified = 0, no_checksum = 0, dirs = 0;
+	uint32_t encrypted = 0;
 
 	/* Nothing to enumerate means nothing was examined, which must not report as
 	 * success. This is how a RAR 1.4 archive arrived here: the library has no
@@ -938,6 +939,10 @@ static int cmd_verify(const char *path) {
 			dirs++;
 			continue;
 		}
+		/* A property of the entry, not an outcome — it is also counted in one
+		 * of the buckets below. Tracked separately because UNVERIFIED alone
+		 * cannot say whether we lacked a password or the decode failed. */
+		if (vr.is_encrypted) encrypted++;
 
 		const char *label = verify_status_label(status);
 		if (status == RARZ_VERIFY_OK) {
@@ -972,6 +977,25 @@ static int cmd_verify(const char *path) {
 	if (unverified) printf(", %u unverifiable", unverified);
 	if (no_checksum) printf(", %u without a checksum", no_checksum);
 	printf("\n");
+
+	/* Name the REASON entries went unverified. "unverifiable" alone covers both
+	 * an encrypted entry and a decode this build cannot do, and those mean very
+	 * different things to whoever is reading. A mixed archive is called out
+	 * specifically: it is the case where a partial verdict is easiest to
+	 * misread, since some entries genuinely were checked and some never can be
+	 * without a password. */
+	if (encrypted > 0) {
+		uint32_t content = count - dirs;
+		if (encrypted < content) {
+			uint32_t readable = content - encrypted;
+			printf("Note: MIXED ENCRYPTION — %u of %u entries are encrypted and "
+			       "cannot be verified without a password; the other %u %s verified\n",
+			       encrypted, content, readable, readable == 1 ? "was" : "were");
+		} else {
+			printf("Note: every entry is encrypted; supply a password to another "
+			       "tool to verify contents (structure was checked)\n");
+		}
+	}
 
 	rarz_close(archive);
 	for (int i = 0; i < vs.count; i++) free(vol_bufs[i]);

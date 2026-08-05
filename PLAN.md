@@ -1,5 +1,128 @@
 # PLAN
 
+## Coverage push: three false-positive classes closed (2026-08-05 10:50 EDT)
+
+A differential sweep against unrar over content the committed corpus never
+contained (executables, files past the RAR4 dictionary, RAR4 volume sets) found
+three classes where rarz reported DAMAGE on archives unrar tests clean. All are
+fixed; each was isolated causally before being touched, not guessed at.
+
+- [x] **RAR4 encrypted entries reported as damaged.** `rarz_verify_file` checked
+  for encryption on the RAR5 path only, so an encrypted RAR4 *store* entry had
+  its ciphertext hashed against the plaintext CRC32 in its header. `rarz t` was
+  already correct, so the two commands contradicted each other on one archive.
+  (2026-08-05 10:10 EDT)
+- [x] **x86 E8/E8E9 filter decoded to the wrong bytes.** The reference relocates
+  against a fixed `0x1000000` wrap constant with offset
+  `(position + cumulative file offset)`. rarz passed the file offset where the
+  constant belonged and dropped it from the offset term. ARM had the same
+  missing term. Proven causally: identical content with `-mc-` validated, with
+  filters on it did not. Affects any archive containing a program.
+  (2026-08-05 10:41 EDT)
+- [x] **Any RAR4 file larger than the 4 MB dictionary failed to decode.** The
+  decoder held the whole entry in the circular window and emitted once at the
+  end, so a large entry overwrote its own opening bytes. Boundary measured
+  exactly: 4096 KB validated, 4608 KB did not. unpack29 now streams as it
+  decodes, as the reference does. (2026-08-05 10:41 EDT)
+- [x] **RAR4 multi-volume sets reported INVALID.** `validate_volumes` handled
+  RAR5 only. Both the `rarz t` verdict and the per-entry `rarz verify` path now
+  support RAR4, including split-file reassembly across volumes.
+  (2026-08-05 10:50 EDT)
+
+Measured after the fixes, over a 6-content-type × method × solid × recovery ×
+quick-open × volume matrix in both families:
+
+| Sweep | Result |
+|---|---|
+| Agreement with unrar on intact archives | 21/21, 0 mismatches (was 2/18 before) |
+| Sniper mutation (5 positions/archive) | 93/93 damaged refused, **0 missed** |
+| Size sweep, 512 KB–8 MB, exe + text, both families | 20/20 |
+| Extraction byte-identical to unrar | 4/4 new fixtures, incl. a 5.3 MB streamed entry |
+
+Both directions matter: the agreement sweep alone would be passed by a
+blanket-VALID implementation, and the mutation sweep alone by a
+blanket-INVALID one.
+
+### Remaining gaps, honestly stated
+
+- **RAR 1.4** — signature recognised, no parser. `format_supported = 0`,
+  reported INCOMPLETE. Out of scope per Peter ("except for the very earliest
+  formats").
+- **RAR 1.5 / UnpVer 15** — decoder code exists but no producer corpus does;
+  rar 6.21 is the oldest obtainable writer and it emits v20+. Support must not
+  be inferred from the code's presence.
+- **RAR 2.x / UnpVer 26 multimedia** — `-mm` on rar 6.21 emits v20, so no v26
+  stream has ever been tested.
+- **RAR5 / UnpVer 70** — every rar 7.20 option probed (including `-md512m` and
+  `-md1g`) validates, but a stream positively identified as v70 was not isolated,
+  so v70 stays *unconfirmed* rather than claimed.
+- **Header encryption (`-hp`)** — headers cannot be enumerated without a
+  password. Blocked on the password API below.
+- **Extraction does not restore the POSIX exec bit** on RAR4 entries (content is
+  byte-identical; mode is not). Extraction fidelity, not a validation defect.
+- **RAR5 SERVICE block data areas** are not all consumed and hashed, so
+  "every archive byte was checked" must not be claimed.
+
+## Password support and the mixed-encryption contract (design, deferred)
+
+Peter, 2026-08-05: detect mixed-encrypted archives and report them truthfully
+now; defer actually reading them. Detection **shipped** — see
+`rarz_verify_archive_summary.encrypted_entry_count`. This section is the agreed
+shape for the eventual support, so the API does not get invented under pressure.
+
+### What shipped
+
+`encrypted_entry_count` is a **property** count, deliberately outside the
+accounting invariant. An encrypted entry is always ALSO counted in exactly one
+outcome bucket (today `unsupported`). The archive's class is derived, not
+stored:
+
+```
+content = entry_count - directory_count
+encrypted == 0        -> no encryption
+encrypted == content  -> wholly encrypted
+otherwise             -> MIXED
+```
+
+This exists because `unsupported_entry_count` alone cannot say WHY an entry went
+unverified — a failed decode and an encrypted entry land in the same bucket, so
+a consumer reporting "unsupported due to encrypted content" was guessing.
+
+### The success/error structure for eventual password support
+
+The decision Peter asked for, so it is settled before code exists:
+
+1. **A password is an input to `open`, not to `verify`.** RAR5 `-hp` encrypts
+   the headers themselves, so the entry list does not exist until a password is
+   supplied. A per-entry password argument cannot express that.
+   `rarz_open_with_password(data, len, password, pw_len)`.
+
+2. **A wrong password is NOT damage.** It must produce its own outcome, never
+   `DAMAGED`. RAR5 stores a password check value, so "wrong password" is
+   directly detectable rather than inferred from a failed CRC; RAR4 has no such
+   value, so a RAR4 wrong password is indistinguishable from corruption and must
+   report `RARZ_VERIFY_WRONG_PASSWORD` on the *evidence available*, never a
+   damage claim. This asymmetry is the whole reason the code is separate.
+
+3. **`encrypted_entry_count` does not change meaning.** With a correct password
+   an encrypted entry moves from `unsupported` to `verified`; the property count
+   stays put. That is exactly why it was kept out of the accounting invariant —
+   the shipped field survives the feature without a semantic break.
+
+4. **Mixed archives need no new status.** The counts already express
+   "3 encrypted, 2 verified, 1 damaged". A dedicated MIXED status would have to
+   lose to DAMAGED in the precedence ladder and would then say nothing the
+   counts do not.
+
+5. **Partial passwords are in scope.** One password may open some entries and
+   not others (each `rar a -p` invocation is independent). The per-entry result
+   already carries this; do not collapse it to an archive-level boolean.
+
+Blockers before any of this is worth building: AES-256-CBC + the RAR5 KDF
+(PBKDF2-HMAC-SHA256) and RAR4's older scheme, plus a decision on whether
+passwords belong in a file-integrity tool at all given they must be supplied on
+a command line or through an env var.
+
 ## Mecha Validate v1 RAR gate (2026-08-04 23:45 EDT)
 
 - [x] Publish a consumer-facing result contract that distinguishes verified-good, verified-damaged, unverified, and unsupported evidence without breaking the existing C ABI. `rarz_verify_archive` keeps a lossless count rollup and accounting invariant. (2026-08-05 00:01 EDT)

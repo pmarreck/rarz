@@ -1,9 +1,25 @@
 # Mecha Validate v1 RAR gate
 
-Measured 2026-08-04 EDT at commit `2e400a5` plus the pending archive-summary
-change. The corpus contains 31 independently produced archive sets that UnRAR
-tests clean with the fixture password. `rarz verify` fully verified 121 files,
-reported one encrypted file as unverifiable, and accounted for 27 directories.
+Measured 2026-08-05 EDT at commit `cd74e18`. The committed corpus holds 40+
+independently produced archive sets that UnRAR tests clean with the fixture
+password.
+
+A differential sweep on 2026-08-05 over content the corpus never contained
+(executables, files past the RAR4 dictionary, RAR4 volume sets, encrypted RAR4
+entries) found FOUR classes where rarz claimed damage on archives UnRAR tests
+clean — the worst error an integrity tool can make. All are fixed;
+see PLAN.md for the isolation evidence. Post-fix measurements over a
+6-content-type x method x solid x recovery x quick-open x volume matrix in both
+families:
+
+- agreement with UnRAR on intact archives: 21/21, 0 mismatches (was 2/18);
+- sniper mutation, 5 positions per archive: 93/93 damaged refused, 0 missed;
+- size sweep 512 KB-8 MB, executable and text, both families: 20/20;
+- extraction byte-identical to UnRAR for all four new fixtures.
+
+Both directions are reported because either alone is trivially passable: the
+agreement sweep by a blanket-VALID implementation, the mutation sweep by a
+blanket-INVALID one.
 
 ## Consumer contract
 
@@ -29,6 +45,21 @@ verified + damaged + unsupported + no_checksum + error + directories
     == entry_count
 ```
 
+`encrypted_entry_count` (added 2026-08-05) sits DELIBERATELY OUTSIDE that
+invariant. Encryption is a property of an entry, not an outcome, so an encrypted
+entry is also counted in exactly one outcome bucket — today `unsupported`, and
+`verified` if a password API ever lands, with no semantic break. It exists
+because `unsupported_entry_count` alone cannot say WHY an entry went unverified:
+a failed decode and an encrypted entry land in the same bucket. Derive the
+archive's encryption class from it:
+
+```text
+content = entry_count - directory_count
+encrypted == 0        -> no encryption
+encrypted == content  -> wholly encrypted
+otherwise             -> MIXED: some entries verified, some unverifiable
+```
+
 The original `rarz_validate()` ABI remains available. Its Boolean cannot express
 incomplete evidence and must not be used for a new Mecha Validate integration.
 
@@ -47,20 +78,20 @@ evidence.
 | Generation or feature | v1 gate | Evidence and limitation |
 |---|---|---|
 | RAR 1.4 | Unsupported | Signature is recognised. No parser or producer-made fixture exists; `format_supported=0`. |
-| RAR 1.5 / UnpVer 15 | Unsupported | Decoder code exists, but no independent corpus exists. Do not infer support from implementation presence. |
+| RAR 1.5 / UnpVer 15 | Unsupported | Decoder code exists, but no independent corpus does; rar 6.21 is the oldest obtainable writer and emits v20+. Do not infer support from implementation presence. |
 | RAR 2.x / UnpVer 20, store and methods 1/3/5 | Strict | Seven archive sets, including solid and the fixture named `mm`; extracted bytes match UnRAR. |
 | RAR 2.x / UnpVer 26 multimedia | Unsupported | The attempted `-mm` producer emitted v20, so no v26 stream has been tested. |
 | RAR 3/4 / UnpVer 29, store and compressed | Strict | Six archive sets; ordinary and solid payloads verify against CRC32 and extract byte-identically. |
-| RAR 3/4 standard VM filters | Partial | Delta/audio/E8 have prior differential evidence. E8E9/RGB/Itanium code has unit coverage but lacks producer-made fixtures in the committed corpus. Unknown VM programs report unsupported. |
+| RAR 3/4 standard VM filters | Strict for x86; partial elsewhere | The x86 E8/E8E9 path was WRONG until 2026-08-05 (missing file-offset term, file size used where a fixed 0x1000000 constant belongs) and reported damage on clean archives. Now covered by producer-made `rar4_x86_filter`/`rar5_x86_filter` fixtures compiled from self-owned C. RGB/Itanium still lack producer fixtures. Unknown VM programs report unsupported. |
 | RAR5 / UnpVer 50, store and methods 1-5 | Strict | Ten single-archive sets cover store, all five levels, large payloads, regression payloads, and solid streams. CRC32 and BLAKE2sp are checked when present. |
-| RAR5 / UnpVer 70 | Partial | Dispatch support exists, but the committed corpus does not identify a distinct v70 stream. |
+| RAR5 / UnpVer 70 | Unconfirmed | Every rar 7.20 option probed validates, including -md512m and -md1g, but no stream positively identified as v70 was isolated. Not claimed. |
 | RAR5 split and multi-volume | Strict for committed cases | Three complete volume sets cover stored, compressed, and a large split payload. Missing/truncated volume mutations are rejected. |
 | Solid archives | Strict for v20/v29/v50 corpus | Three generations extract byte-identically and retain decoder state across entries. |
-| Per-file encryption (`-p`) | Partial/incomplete | Mixed fixture proves readable entries still verify. Encrypted entries report unsupported without a password; one clean mixed archive is `INCOMPLETE`, not damaged or verified. |
+| Per-file encryption (`-p`) | Partial/incomplete | RAR4 encrypted STORE entries were reported DAMAGED until 2026-08-05 (ciphertext hashed against the plaintext CRC32). Now a none/mixed/all classifier corpus covers both families. Encrypted entries report unsupported without a password and are counted in `encrypted_entry_count`; a clean mixed archive is `INCOMPLETE`, never damaged or verified. |
 | Header encryption (`-hp`) | Unsupported | Headers cannot be enumerated without a password. No password-provider API or committed gate exists. |
 | Recovery/service/quick-open payloads | Structural-only | Their headers are checked. Service data areas are not all consumed and hashed, so full-byte coverage must not be claimed. |
 | SFX prefixes | Strict for recognition | Signature scanning is covered. Embedded executable bytes are outside RAR payload integrity claims. |
-| RAR4 split volumes | Unsupported | No committed producer corpus or end-to-end reconstruction gate exists. |
+| RAR4 split volumes | Strict for committed cases | Was reported INVALID (false damage) until 2026-08-05. `rar4_vol_store` (5 volumes) and `rar4_vol_m3` (4 volumes) reconstruct split files across volumes for both `t` and `verify`; per-volume mutation gate refuses 9/9 damaged sets. |
 
 ## Deterministic classifier evidence
 
@@ -88,8 +119,9 @@ survivors without classifying them and is not release evidence by itself.
   model. Do not map `INCOMPLETE` to either OK or FAIL.
 - Add independent producer fixtures for RAR3 E8E9, RGB, and Itanium filters, or
   leave those variants incomplete in launch claims.
-- Decide whether RAR4 split volumes and header encryption are launch scope. If
-  they are, both need corpora and red-to-green gates.
+- Header encryption (`-hp`) remains out of scope; it is blocked on the password
+  API whose contract is settled in PLAN.md. RAR4 split volumes are now IN and
+  gated.
 - Hash or explicitly exclude RAR5 service payload areas before claiming every
   archive byte was checked.
 - Replace the weak integration mutation loop with named sniper/boltgun/shotgun

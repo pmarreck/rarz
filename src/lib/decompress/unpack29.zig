@@ -211,6 +211,25 @@ pub const Unpack29State = struct {
     old_filter_lengths: [MAX_FILTERS]u32,
     pending: [MAX_PENDING_FILTERS]PendingFilter,
     pending_count: usize,
+    /// Streaming-output state, used ONLY for entries larger than the window.
+    ///
+    /// The reference flushes decoded bytes continuously (`UnpWriteBuf`). This
+    /// decoder emitted the whole entry once at the end, which silently capped
+    /// every entry at the dictionary size: a RAR4 file over 4 MB decoded fine
+    /// and was then reported DAMAGED, because its opening bytes had already
+    /// been overwritten by its own tail. Measured boundary: 4096 KB validated,
+    /// 4608 KB did not.
+    ///
+    /// Left null for entries that fit the window, so the overwhelmingly common
+    /// case keeps the single-emit path unchanged.
+    stream_out: ?Sink,
+    /// Window write_pos when the current entry began.
+    entry_start: usize,
+    /// Bytes of the current entry already emitted to `stream_out`.
+    flushed: usize,
+    /// Unflushed byte count that triggers a flush. Kept below the window size
+    /// by MAX_FILTER_BLOCK so a late-recorded filter can still reach its data.
+    flush_threshold: usize,
     // PPM state
     ppm_model: ?PpmModel,
     allocator: std.mem.Allocator,
@@ -251,6 +270,10 @@ pub const Unpack29State = struct {
             .old_filter_lengths = [_]u32{0} ** MAX_FILTERS,
             .pending = undefined,
             .pending_count = 0,
+            .stream_out = null,
+            .entry_start = 0,
+            .flushed = 0,
+            .flush_threshold = 0,
             .ppm_model = null,
             .allocator = allocator,
             .mc_allocated = false,
@@ -896,6 +919,75 @@ pub const Unpack29State = struct {
     ///
     /// Symptom before the fix: the first four entries of a six-entry solid v29
     /// archive decoded with correct CRCs and the fifth died with EndOfData.
+    /// Emit decoded bytes before the circular window overwrites them.
+    ///
+    /// `keep` bytes are deliberately held back so a filter recorded slightly
+    /// after its data was decoded can still reach the region it covers. A
+    /// filter that reaches further back than that is refused rather than
+    /// applied to the wrong bytes — unverifiable, not damaged.
+    fn flushDecoded(self: *Self, keep: usize, limit: u64) !void {
+        const out = self.stream_out orelse return;
+        const produced = self.window.write_pos - self.entry_start;
+        // Never emit past the size the header declared; the tail of a final
+        // match may overshoot it.
+        const emit_upto = @min(produced -| keep, limit);
+        if (emit_upto <= self.flushed) return;
+
+        const count = emit_upto - self.flushed;
+        const back = produced - self.flushed;
+        // Unflushed data older than the window is data we no longer have.
+        if (back > self.window.buffer.len) return Unpack29Error.CorruptData;
+
+        // Does any un-applied filter touch the span about to leave?
+        var first_touch: ?usize = null;
+        for (self.pending[0..self.pending_count], 0..) |pf, idx| {
+            if (pf.length == 0) continue;
+            const s: usize = @intCast(pf.start);
+            if (s < self.flushed + count and s + pf.length > self.flushed) {
+                first_touch = idx;
+                break;
+            }
+        }
+
+        if (first_touch == null) {
+            if (!self.window.emitTo(out, back, count)) return Unpack29Error.CorruptData;
+            self.flushed += count;
+            return;
+        }
+
+        // Materialise the span so the transform can rewrite it in place.
+        const staged = try self.allocator.alloc(u8, count);
+        defer self.allocator.free(staged);
+        var staged_sink = sink.BufferSink.init(staged);
+        if (!self.window.emitTo(staged_sink.sink(), back, count)) {
+            return Unpack29Error.CorruptData;
+        }
+
+        const scratch = try self.allocator.alloc(u8, MAX_FILTER_BLOCK);
+        defer self.allocator.free(scratch);
+        for (self.pending[0..self.pending_count]) |*pf| {
+            if (pf.length == 0) continue;
+            const s: usize = @intCast(pf.start);
+            if (s + pf.length <= self.flushed or s >= self.flushed + count) continue;
+            // A filter straddling the flush boundary would need bytes already
+            // gone. Refuse; do not transform a partial range.
+            if (s < self.flushed or s + pf.length > self.flushed + count) {
+                return Unpack29Error.UnsupportedFilter;
+            }
+            if (pf.length > scratch.len) return Unpack29Error.UnsupportedFilter;
+            var init_r = pf.init_r;
+            init_r[6] = @truncate(pf.start); // see applyPendingFilters
+            const rel = s - self.flushed;
+            if (!rarvm.applyFilter(pf.filter, staged[rel .. rel + pf.length], scratch, init_r)) {
+                return Unpack29Error.UnsupportedFilter;
+            }
+            pf.length = 0; // consumed
+        }
+
+        out.write(staged);
+        self.flushed += count;
+    }
+
     pub fn decompressLoop(self: *Self, unpacked_size: u64) !void {
         // Read initial tables
         if (!self.tables_loaded) {
@@ -921,6 +1013,15 @@ pub const Unpack29State = struct {
 
             if (!should_continue) {
                 break; // marker consumed: end of this entry
+            }
+
+            // Only ever true for entries larger than the window (stream_out is
+            // null otherwise), so the common path pays one null check.
+            if (self.stream_out != null) {
+                const produced = self.window.write_pos - self.entry_start;
+                if (produced - self.flushed > self.flush_threshold) {
+                    try self.flushDecoded(MAX_FILTER_BLOCK, unpacked_size);
+                }
             }
 
             if (self.written_size > overshoot_limit) return Unpack29Error.CorruptData;
@@ -1015,6 +1116,20 @@ pub const Session = struct {
 
         const start_pos = st.window.write_pos;
 
+        // Entries larger than the window MUST be streamed out as they decode;
+        // holding them entirely in the window loses their opening bytes. Below
+        // that size the single-emit path at the end is used unchanged.
+        st.entry_start = start_pos;
+        st.flushed = 0;
+        const window_len = st.window.buffer.len;
+        if (unpacked_size > window_len and window_len > MAX_FILTER_BLOCK * 2) {
+            st.stream_out = out;
+            st.flush_threshold = window_len - MAX_FILTER_BLOCK;
+        } else {
+            st.stream_out = null;
+        }
+        defer st.stream_out = null;
+
         try st.decompressLoop(unpacked_size);
 
         // A filter program we could not identify — or one of the six whose
@@ -1022,6 +1137,12 @@ pub const Session = struct {
         // The LZ output is real but incomplete, so returning it would be
         // silently wrong: the worst outcome for an integrity tool.
         if (st.unsupported_filter_seen) return Unpack29Error.UnsupportedFilter;
+
+        // Streaming entry: emit whatever is still held back and we are done.
+        if (st.stream_out != null) {
+            try st.flushDecoded(0, unpacked_size);
+            return;
+        }
 
         const out_size: usize = @intCast(@min(st.written_size, unpacked_size));
         const consumed = st.window.write_pos - start_pos;

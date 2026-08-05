@@ -2134,6 +2134,41 @@ test "rarz_verify_archive accounts for every pristine and payload-mutated entry"
 	try testing.expect(mutation_count >= 15);
 }
 
+/// Archives that unrar 7.20 tests CLEAN. Every one of these was a false
+/// positive — rarz reported damage on good data — found by differential sweep
+/// on 2026-08-05. See tests/generate_filter_fixtures.sh for how each was
+/// isolated and why the content is shaped the way it is.
+const unrar_clean_corpus = [_]struct { name: []const u8, bytes: []const u8 }{
+	// x86 E8/E8E9 filter. Proven causally: the same content archived with
+	// `-mc-` (filters off) validated, with filters on it did not.
+	.{ .name = "rar5_x86_filter", .bytes = @embedFile("rar5_x86_filter") },
+	.{ .name = "rar4_x86_filter", .bytes = @embedFile("rar4_x86_filter") },
+	// A file larger than RAR4's 4 MB dictionary. Boundary measured exactly:
+	// 4096 KB validated, 4608 KB did not.
+	.{ .name = "rar4_large_window", .bytes = @embedFile("rar4_large_window") },
+	.{ .name = "rar5_large_window", .bytes = @embedFile("rar5_large_window") },
+};
+
+test "archives unrar tests clean are not reported damaged" {
+	for (unrar_clean_corpus) |fx| {
+		const archive = rarz_open(fx.bytes.ptr, fx.bytes.len) orelse {
+			std.debug.print("{s}: failed to open\n", .{fx.name});
+			return error.TestUnexpectedResult;
+		};
+		defer rarz_close(archive);
+
+		var summary: RarzVerifyArchiveSummary = undefined;
+		const status = rarz_verify_archive(archive, &summary);
+		if (status != ARCHIVE_VERIFY_VERIFIED) {
+			std.debug.print(
+				"{s}: status={d} (damaged={d} unsupported={d} error={d}) — unrar says this archive is intact\n",
+				.{ fx.name, status, summary.damaged_entry_count, summary.unsupported_entry_count, summary.error_entry_count },
+			);
+			return error.TestUnexpectedResult;
+		}
+	}
+}
+
 /// One member of the encryption classifier corpus. `encrypted` and `plain` are
 /// the counts unrar itself reported when the fixture was generated, so the
 /// expectations here trace back to an oracle we did not write.

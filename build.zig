@@ -135,6 +135,13 @@ pub fn build(b: *std.Build) void {
 	unit_tests.root_module.addAnonymousImport("rar4_encrypted_all", .{ .root_source_file = b.path("tests/fixtures/rar4_encrypted_all.rar") });
 	unit_tests.root_module.addAnonymousImport("rar5_encrypted_none", .{ .root_source_file = b.path("tests/fixtures/rar5_encrypted_none.rar") });
 	unit_tests.root_module.addAnonymousImport("rar5_encrypted_all", .{ .root_source_file = b.path("tests/fixtures/rar5_encrypted_all.rar") });
+	// Two false-positive classes found by differential sweep against unrar
+	// (tests/generate_filter_fixtures.sh): the x86 E8/E8E9 filter, and RAR4
+	// files larger than the 4 MB dictionary. unrar tests all four clean.
+	unit_tests.root_module.addAnonymousImport("rar5_x86_filter", .{ .root_source_file = b.path("tests/fixtures/rar5_x86_filter.rar") });
+	unit_tests.root_module.addAnonymousImport("rar4_x86_filter", .{ .root_source_file = b.path("tests/fixtures/rar4_x86_filter.rar") });
+	unit_tests.root_module.addAnonymousImport("rar4_large_window", .{ .root_source_file = b.path("tests/fixtures/rar4_large_window.rar") });
+	unit_tests.root_module.addAnonymousImport("rar5_large_window", .{ .root_source_file = b.path("tests/fixtures/rar5_large_window.rar") });
 	unit_tests.root_module.addAnonymousImport("rar5_store", .{ .root_source_file = b.path("tests/fixtures/rar5_store.rar") });
 	// Minimal v29-compressed archives — 87 and 162 bytes. Small enough to trace
 	// bit-by-bit against the reference decoder when unpack29 misbehaves.

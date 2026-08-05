@@ -28,11 +28,21 @@ pub const Filter = struct {
 pub fn applyFilter(data: []u8, filter: Filter, file_offset: u64, allocator: std.mem.Allocator) error{OutOfMemory}!void {
     switch (filter.filter_type) {
         .delta => try applyDelta(data, filter.channels, allocator),
-        .e8 => applyE8E9(data, @intCast(@min(file_offset, std.math.maxInt(u32))), false),
-        .e8e9 => applyE8E9(data, @intCast(@min(file_offset, std.math.maxInt(u32))), true),
-        .arm => applyArm(data),
+        .e8 => applyE8E9(data, file_offset, false),
+        .e8e9 => applyE8E9(data, file_offset, true),
+        .arm => applyArm(data, file_offset),
     }
 }
+
+/// The wrap constant the E8/E8E9 filter relocates against — a FIXED 16 MB, not
+/// the size of the file being decoded (unrar 7.20 unpack50.cpp:432,
+/// `const uint FileSize=0x1000000`).
+///
+/// Naming it matters: this value was previously conflated with the cumulative
+/// file offset, which is a different quantity that appears two lines later in
+/// the reference. Every filtered region then decoded to the wrong bytes, and
+/// rarz reported a CRC32 mismatch on archives unrar tests clean.
+const E8_WRAP: u32 = 0x1000000;
 
 /// RAR5 delta filter: per-channel cumulative-subtract over de-interleaved input.
 ///
@@ -74,34 +84,43 @@ pub fn applyDelta(data: []u8, channels: u8, allocator: std.mem.Allocator) error{
 ///
 /// During decompression we reverse this: absolute -> relative.
 ///
-/// Algorithm for each byte position i:
+/// `file_offset` is where this region begins WITHIN THE FILE. It is part of the
+/// relocation offset, because the compressor computed absolute addresses from
+/// each instruction's true file position — not its position inside whatever
+/// region the filter happens to cover.
+///
+/// Algorithm for each byte position i (unrar 7.20 unpack50.cpp:427):
 ///   if data[i] == 0xE8 or (e9_mode and data[i] == 0xE9):
-///     addr = signed LE32 from data[i+1..i+5]
-///     offset = i + 1
-///     if addr < 0:
-///       if addr + offset >= 0: write addr + file_size
-///     else:
-///       if addr < file_size: write addr - offset
-///     advance i by 5 (skip opcode + 4 address bytes)
+///     offset = (i + 1 + file_offset) % E8_WRAP
+///     addr   = unsigned LE32 from data[i+1..i+5]
+///     if addr has its high bit set:            // "addr < 0"
+///       if (addr + offset) high bit is clear:  // "addr + offset >= 0"
+///         write addr + E8_WRAP
+///     else if addr < E8_WRAP:
+///       write addr - offset
+///     advance i by 5 (opcode + 4 address bytes)
 ///   else:
 ///     advance i by 1
-pub fn applyE8E9(data: []u8, file_size: u32, e9: bool) void {
+///
+/// All arithmetic is unsigned and wrapping, matching the reference, which
+/// deliberately tests the 0x80000000 bit rather than comparing signed values.
+pub fn applyE8E9(data: []u8, file_offset: u64, e9: bool) void {
     if (data.len < 5) return;
     var i: usize = 0;
-    const limit = data.len - 4;
-    while (i < limit) {
+    while (i + 4 < data.len) {
         if (data[i] == 0xE8 or (e9 and data[i] == 0xE9)) {
-            const offset: i64 = @intCast(i + 1);
-            const addr = readSignedLE32(data[i + 1 ..][0..4]);
+            // Truncating to u32 before the modulo is safe and matches the
+            // reference's `(uint)WrittenFileSize`: E8_WRAP is a power of two
+            // that divides 2^32, so (x mod 2^32) mod E8_WRAP == x mod E8_WRAP.
+            const offset: u32 = @truncate((@as(u64, i) + 1 +% file_offset) % E8_WRAP);
+            const addr = std.mem.readInt(u32, data[i + 1 ..][0..4], .little);
 
-            if (addr < 0) {
-                if (addr + offset >= 0) {
-                    writeSignedLE32(data[i + 1 ..][0..4], addr +% @as(i32, @intCast(file_size)));
+            if (addr & 0x80000000 != 0) {
+                if ((addr +% offset) & 0x80000000 == 0) {
+                    std.mem.writeInt(u32, data[i + 1 ..][0..4], addr +% E8_WRAP, .little);
                 }
-            } else {
-                if (addr < @as(i32, @intCast(file_size))) {
-                    writeSignedLE32(data[i + 1 ..][0..4], addr -% @as(i32, @truncate(offset)));
-                }
+            } else if (addr < E8_WRAP) {
+                std.mem.writeInt(u32, data[i + 1 ..][0..4], addr -% offset, .little);
             }
             i += 5;
         } else {
@@ -115,31 +134,29 @@ pub fn applyE8E9(data: []u8, file_size: u32, e9: bool) void {
 /// ARM BL instructions have 0xEB as byte 3 (the opcode byte in little-endian).
 /// The lower 3 bytes encode a 24-bit signed offset (in instruction units, i.e., *4).
 /// The compressor converts relative branch targets to absolute; we reverse this.
-pub fn applyArm(data: []u8) void {
+/// `file_offset` is where this region begins within the file, and is part of
+/// the subtracted term for the same reason as E8/E8E9: the compressor worked
+/// from true file positions. Reference: unrar 7.20 unpack50.cpp:462,
+/// `Offset -= (FileOffset+CurPos)/4`.
+pub fn applyArm(data: []u8, file_offset: u64) void {
     if (data.len < 4) return;
     var i: usize = 0;
-    const limit = data.len - 3;
-    while (i < limit) : (i += 4) {
-        if (data[i + 3] == 0xEB) {
-            // Read 24-bit little-endian offset from bytes [i..i+3]
+    while (i + 3 < data.len) : (i += 4) {
+        if (data[i + 3] == 0xEB) { // BL with the 'always' condition
+            // Plain unsigned 24-bit arithmetic; only the low 24 bits are
+            // written back, so no sign extension is needed (or performed by
+            // the reference).
             const b0: u32 = data[i];
             const b1: u32 = data[i + 1];
             const b2: u32 = data[i + 2];
-            var offset: i32 = @bitCast((b2 << 16) | (b1 << 8) | b0);
+            var offset: u32 = (b2 << 16) | (b1 << 8) | b0;
 
-            // Sign-extend from 24 bits to 32 bits
-            if (offset & 0x800000 != 0) {
-                offset |= @as(i32, @bitCast(@as(u32, 0xFF000000)));
-            }
+            // Instruction units, hence the /4.
+            offset -%= @truncate((file_offset +% @as(u64, i)) / 4);
 
-            // Subtract current instruction position (in instruction units)
-            offset -%= @as(i32, @intCast(i / 4));
-
-            // Write back the low 24 bits
-            const u_offset: u32 = @bitCast(offset);
-            data[i] = @truncate(u_offset & 0xFF);
-            data[i + 1] = @truncate((u_offset >> 8) & 0xFF);
-            data[i + 2] = @truncate((u_offset >> 16) & 0xFF);
+            data[i] = @truncate(offset);
+            data[i + 1] = @truncate(offset >> 8);
+            data[i + 2] = @truncate(offset >> 16);
             // data[i+3] stays 0xEB
         }
     }
@@ -208,13 +225,13 @@ test "delta filter empty data: no-op" {
 }
 
 test "E8 filter: forward absolute address becomes relative" {
-    // Simulate: at position 0, we have E8 followed by absolute address 0x00001000
-    // file_size = 0x10000
-    // offset = 0 + 1 = 1
-    // addr = 0x00001000 (positive, < file_size)
+    // At position 0, E8 followed by absolute address 0x00001000, region at
+    // file offset 0.
+    // offset = (0 + 1 + 0) % E8_WRAP = 1
+    // addr = 0x00001000 (high bit clear, < E8_WRAP)
     // new addr = 0x00001000 - 1 = 0x00000FFF
     var data = [_]u8{ 0xE8, 0x00, 0x10, 0x00, 0x00, 0x90 };
-    applyE8E9(&data, 0x10000, false);
+    applyE8E9(&data, 0, false);
     // Read back the modified address
     const addr = readSignedLE32(data[1..5]);
     try testing.expectEqual(@as(i32, 0x00000FFF), addr);
@@ -223,24 +240,58 @@ test "E8 filter: forward absolute address becomes relative" {
     try testing.expectEqual(@as(u8, 0x90), data[5]);
 }
 
-test "E8 filter: negative address that crosses zero gets file_size added" {
-    // At position 10, we have E8 followed by address -5
-    // offset = 10 + 1 = 11
-    // addr = -5, addr + offset = -5 + 11 = 6 >= 0 -> modify
-    // new addr = -5 + file_size
+test "E8 filter: negative address that crosses zero gets the wrap constant added" {
+    // At position 10, E8 followed by address -5.
+    // offset = (10 + 1 + 0) % E8_WRAP = 11
+    // addr = 0xFFFFFFFB, high bit set; (addr + 11) wraps to 6, high bit clear
+    //   -> modify: addr + E8_WRAP = 0xFFFFFFFB + 0x1000000 = 0x00FFFFFB
+    // The added constant is E8_WRAP, NOT the file size — that conflation is
+    // precisely what made rarz decode filtered regions to the wrong bytes.
     var data = [_]u8{ 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0xE8, 0xFB, 0xFF, 0xFF, 0xFF, 0x90 };
-    applyE8E9(&data, 0x10000, false);
-    const addr = readSignedLE32(data[11..15]);
-    // -5 + 0x10000 = 0xFFFB
-    try testing.expectEqual(@as(i32, 0x0000FFFB), addr);
+    applyE8E9(&data, 0, false);
+    const addr = std.mem.readInt(u32, data[11..15], .little);
+    try testing.expectEqual(@as(u32, 0x00FFFFFB), addr);
 }
 
-test "E8 filter: address >= file_size is not modified" {
-    // addr = 0x20000, file_size = 0x10000 -> addr >= file_size, skip
-    var data = [_]u8{ 0xE8, 0x00, 0x00, 0x02, 0x00, 0x90 };
-    const original = [_]u8{ 0xE8, 0x00, 0x00, 0x02, 0x00, 0x90 };
-    applyE8E9(&data, 0x10000, false);
+test "E8 filter: address at or beyond the wrap constant is not modified" {
+    // addr = 0x02000000 >= E8_WRAP (0x01000000) -> skip.
+    var data = [_]u8{ 0xE8, 0x00, 0x00, 0x00, 0x02, 0x90 };
+    const original = [_]u8{ 0xE8, 0x00, 0x00, 0x00, 0x02, 0x90 };
+    applyE8E9(&data, 0, false);
     try testing.expectEqualSlices(u8, &original, &data);
+}
+
+test "E8 filter: the region's file offset shifts the relocation" {
+    // THE REGRESSION. The relocation offset is (position + file_offset), so the
+    // same bytes at the same position in the region must decode differently
+    // depending on where that region sits in the file. rarz dropped the
+    // file_offset term entirely and passed it where the wrap constant belonged,
+    // so every filtered region past the first decoded wrongly — reported as a
+    // CRC32 mismatch on archives unrar tests clean.
+    const at_zero = blk: {
+        var d = [_]u8{ 0xE8, 0x00, 0x10, 0x00, 0x00, 0x90 };
+        applyE8E9(&d, 0, false);
+        break :blk std.mem.readInt(u32, d[1..5], .little);
+    };
+    const at_offset = blk: {
+        var d = [_]u8{ 0xE8, 0x00, 0x10, 0x00, 0x00, 0x90 };
+        applyE8E9(&d, 0x400, false);
+        break :blk std.mem.readInt(u32, d[1..5], .little);
+    };
+    // offset = (0+1+0)     = 1      -> 0x1000 - 1     = 0x0FFF
+    // offset = (0+1+0x400) = 0x401  -> 0x1000 - 0x401 = 0x0BFF
+    try testing.expectEqual(@as(u32, 0x0FFF), at_zero);
+    try testing.expectEqual(@as(u32, 0x0BFF), at_offset);
+}
+
+test "E8 filter: file offset wraps modulo the wrap constant" {
+    // (i + 1 + file_offset) % E8_WRAP — a file offset of exactly E8_WRAP is
+    // congruent to 0, so it must relocate identically to offset 0.
+    var a = [_]u8{ 0xE8, 0x00, 0x10, 0x00, 0x00, 0x90 };
+    var b = [_]u8{ 0xE8, 0x00, 0x10, 0x00, 0x00, 0x90 };
+    applyE8E9(&a, 0, false);
+    applyE8E9(&b, E8_WRAP, false);
+    try testing.expectEqualSlices(u8, &a, &b);
 }
 
 test "E8 filter: negative address not crossing zero is not modified" {
@@ -248,7 +299,7 @@ test "E8 filter: negative address not crossing zero is not modified" {
     // addr + offset = -100 + 1 = -99 < 0 -> do not modify
     var data = [_]u8{ 0xE8, 0x9C, 0xFF, 0xFF, 0xFF, 0x90 };
     const original = [_]u8{ 0xE8, 0x9C, 0xFF, 0xFF, 0xFF, 0x90 };
-    applyE8E9(&data, 0x10000, false);
+    applyE8E9(&data, 0, false);
     try testing.expectEqualSlices(u8, &original, &data);
 }
 
@@ -259,7 +310,7 @@ test "E8E9 filter: handles both E8 and E9" {
         0xE9, 0x00, 0x20, 0x00, 0x00, // JMP +0x2000
         0x90,
     };
-    applyE8E9(&data, 0x10000, true);
+    applyE8E9(&data, 0, true);
 
     // E8 at offset 0: addr=0x1000, offset=1, new=0x1000-1=0xFFF
     const addr1 = readSignedLE32(data[1..5]);
@@ -273,14 +324,14 @@ test "E8E9 filter: handles both E8 and E9" {
 test "E8E9 filter: E9 ignored when e9=false" {
     var data = [_]u8{ 0xE9, 0x00, 0x10, 0x00, 0x00, 0x90 };
     const original = [_]u8{ 0xE9, 0x00, 0x10, 0x00, 0x00, 0x90 };
-    applyE8E9(&data, 0x10000, false);
+    applyE8E9(&data, 0, false);
     try testing.expectEqualSlices(u8, &original, &data);
 }
 
 test "E8 filter: data too short (< 5 bytes) is no-op" {
     var data = [_]u8{ 0xE8, 0x00, 0x10 };
     const original = [_]u8{ 0xE8, 0x00, 0x10 };
-    applyE8E9(&data, 0x10000, false);
+    applyE8E9(&data, 0, false);
     try testing.expectEqualSlices(u8, &original, &data);
 }
 
@@ -290,7 +341,7 @@ test "ARM filter: BL instruction address reversal" {
     // At position 0, instruction position = 0/4 = 0
     // Reverse: 0x100 - 0 = 0x100 (no change at position 0)
     var data = [_]u8{ 0x00, 0x01, 0x00, 0xEB };
-    applyArm(&data);
+    applyArm(&data, 0);
     // offset = 0x000100, sign-extended = 0x000100 (positive, bit 23=0)
     // offset -= 0/4 = 0 -> stays 0x000100
     try testing.expectEqual(@as(u8, 0x00), data[0]);
@@ -308,7 +359,7 @@ test "ARM filter: BL at non-zero position subtracts instruction offset" {
         0x00, 0x00, 0x00, 0x00, // non-BL at pos 4
         0x10, 0x00, 0x00, 0xEB, // BL at pos 8
     };
-    applyArm(&data);
+    applyArm(&data, 0);
     // Only the instruction at offset 8 should be modified
     // New offset = 0x10 - 2 = 0x0E
     try testing.expectEqual(@as(u8, 0x0E), data[8]);
@@ -320,14 +371,14 @@ test "ARM filter: BL at non-zero position subtracts instruction offset" {
 test "ARM filter: non-BL instructions are not modified" {
     var data = [_]u8{ 0x10, 0x20, 0x30, 0xEA }; // not 0xEB -> no modification
     const original = [_]u8{ 0x10, 0x20, 0x30, 0xEA };
-    applyArm(&data);
+    applyArm(&data, 0);
     try testing.expectEqualSlices(u8, &original, &data);
 }
 
 test "ARM filter: data shorter than 4 bytes is no-op" {
     var data = [_]u8{ 0xEB, 0x00, 0x00 };
     const original = [_]u8{ 0xEB, 0x00, 0x00 };
-    applyArm(&data);
+    applyArm(&data, 0);
     try testing.expectEqualSlices(u8, &original, &data);
 }
 
@@ -338,7 +389,7 @@ test "ARM filter: negative offset wrapping" {
     // Value: 0xFFFFFE as 24-bit = -(0x1000000 - 0xFFFFFE) = -2
     // After reversal at pos 0: -2 - 0 = -2 (unchanged)
     var data = [_]u8{ 0xFE, 0xFF, 0xFF, 0xEB };
-    applyArm(&data);
+    applyArm(&data, 0);
     // offset in = 0xFFFFFE, sign-extended = 0xFFFFFFFE = -2
     // offset out = -2 - 0 = -2 = 0xFFFFFFFE, low 24 bits = 0xFFFFFE
     try testing.expectEqual(@as(u8, 0xFE), data[0]);
@@ -367,7 +418,12 @@ test "applyFilter dispatches to correct filter type" {
         .block_length = 6,
         .channels = 0,
     };
+    // Dispatched with the region sitting at file offset 0x10000, so the
+    // relocation offset is (0 + 1 + 0x10000) and the result wraps:
+    //   0x00001000 - 0x00010001 = 0xFFFF0FFF
+    // The old expectation of 0xFFF here was the bug in miniature — it only
+    // holds if applyFilter ignores the file offset it was handed.
     try applyFilter(&data2, f2, 0x10000, testing.allocator);
-    const addr = readSignedLE32(data2[1..5]);
-    try testing.expectEqual(@as(i32, 0xFFF), addr);
+    const addr = std.mem.readInt(u32, data2[1..5], .little);
+    try testing.expectEqual(@as(u32, 0xFFFF0FFF), addr);
 }

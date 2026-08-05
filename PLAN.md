@@ -62,6 +62,14 @@ blanket-INVALID one.
   byte-identical; mode is not). Extraction fidelity, not a validation defect.
 - **RAR5 SERVICE block data areas** are not all consumed and hashed, so
   "every archive byte was checked" must not be claimed.
+- **`./build` output does not run on the NixOS host.** `nix build` produces a
+  musl-DYNAMIC binary (`interpreter /lib/ld-musl-x86_64.so.1`), and that loader
+  is absent outside the nix store, so `./zig-out/bin/rarz` is unexecutable after
+  `./build` even though the build exits 0. `nix develop -c zig build` gives a
+  working binary, and `./test` is unaffected (it runs the nix `checks` inside
+  the sandbox). Confirmed PRE-EXISTING, not caused by the 2026-08-05 work:
+  building the parent commit `1ce99ef` in a clean worktree produces the same
+  unrunnable binary. Either link musl statically or target the host libc.
 
 ## Password support and the mixed-encryption contract (design, deferred)
 

@@ -28,6 +28,17 @@ fixed; each was isolated causally before being touched, not guessed at.
   RAR5 only. Both the `rarz t` verdict and the per-entry `rarz verify` path now
   support RAR4, including split-file reassembly across volumes.
   (2026-08-05 10:50 EDT)
+- [x] **Three v20 defects behind entries larger than the dictionary.** The
+  corpus was all small files, so nothing had decoded a v20 entry past its own
+  window. (a) `readTables` opened with a byte alignment copied from v29 —
+  `ReadTables30` aligns, `ReadTables20` does not, so up to 7 bits were discarded
+  on every mid-stream table refresh. Invisible for single-block entries because
+  the stream starts aligned. (b) The v20 dictionary was capped at 256 KB; the
+  reference applies one uncapped formula to every RAR4 version, and RAR 2.90
+  writes codes 3-4 for `-md512`/`-md1024`. (c) The same emit-once-at-the-end
+  window overflow fixed in unpack29, but biting at 64 KB rather than 4 MB.
+  36/36 agreement with unrar over 32 KB-900 KB afterwards.
+  (2026-08-06 10:58 EDT)
 
 Measured after the fixes, over a 6-content-type × method × solid × recovery ×
 quick-open × volume matrix in both families:
@@ -51,11 +62,28 @@ blanket-INVALID one.
 - **RAR 1.5 / UnpVer 15** — decoder code exists but no producer corpus does;
   rar 6.21 is the oldest obtainable writer and it emits v20+. Support must not
   be inferred from the code's presence.
-- **RAR 2.x / UnpVer 26 multimedia** — `-mm` on rar 6.21 emits v20, so no v26
-  stream has ever been tested.
-- **RAR5 / UnpVer 70** — every rar 7.20 option probed (including `-md512m` and
-  `-md1g`) validates, but a stream positively identified as v70 was not isolated,
-  so v70 stays *unconfirmed* rather than claimed.
+- **RAR 2.x / UnpVer 26** — RESOLVED as a non-gap 2026-08-06. v26 is not
+  multimedia: the reference comments it "Files larger than 2GB" and dispatches
+  it to the same `Unpack20` routine (unpack.cpp:173), which rarz already
+  mirrors. Multimedia is an inline mode *within* v20, covered since 2026-07-30
+  by `rar2_v20_mm.rar`. Producing a distinct v26 stream needs a >2 GB member and
+  would exercise no new decoder path.
+- **RAR5 / UnpVer 70** — the flag that distinguishes it from v50 (`ExtraDist`,
+  unpack.cpp:184) IS implemented as `is_rar7`. Every rar 7.20 option probed
+  validates, but no stream positively identified as v70 was isolated, so
+  end-to-end coverage stays unproven rather than claimed.
+
+### Where old encoders can and cannot come from (measured 2026-08-06)
+
+nixpkgs is a dead end for old formats: its oldest usable `rar` is the 6.x era,
+and anything from RAR 2.9 onward emits v29. The encoder picks the unpack
+version, so only a period-correct binary emits an older one.
+
+rarlab still hosts two: `wrar290.exe` (RAR 2.90, already used for the v20
+corpus, run under wine) and `rar250.exe` (RAR 2.50, unused so far). Probed and
+absent: 2.80, 2.60, 2.00, and every 1.5x name. v15 therefore has no obtainable
+producer — RAR 1.5 is a 16-bit DOS binary that wine cannot run anyway, so it
+would need dosbox even if a copy surfaced.
 - **Header encryption (`-hp`)** — headers cannot be enumerated without a
   password. Blocked on the password API below.
 - **Extraction does not restore the POSIX exec bit** on RAR4 entries (content is

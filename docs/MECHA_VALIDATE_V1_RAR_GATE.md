@@ -1,8 +1,16 @@
 # Mecha Validate v1 RAR gate
 
-Measured 2026-08-05 EDT at commit `cd74e18`. The committed corpus holds 40+
+Measured 2026-08-06 EDT at commit `71ff42d`. The committed corpus holds 40+
 independently produced archive sets that UnRAR tests clean with the fixture
 password.
+
+A second sweep on 2026-08-06, prompted by asking whether an older `rar` could
+produce a v26 stream, found THREE more defects in v20 — all behind entries
+larger than the sliding window, which the all-small-files corpus had never
+reached. 36/36 agreement with UnRAR over 32 KB-900 KB at -md64 and -md1024
+after the fixes. Two rows of this matrix were also factually wrong and are
+corrected below: v26 is not multimedia, and v70's distinguishing flag is
+already implemented.
 
 A differential sweep on 2026-08-05 over content the corpus never contained
 (executables, files past the RAR4 dictionary, RAR4 volume sets, encrypted RAR4
@@ -79,12 +87,12 @@ evidence.
 |---|---|---|
 | RAR 1.4 | Unsupported | Signature is recognised. No parser or producer-made fixture exists; `format_supported=0`. |
 | RAR 1.5 / UnpVer 15 | Unsupported | Decoder code exists, but no independent corpus does; rar 6.21 is the oldest obtainable writer and emits v20+. Do not infer support from implementation presence. |
-| RAR 2.x / UnpVer 20, store and methods 1/3/5 | Strict | Seven archive sets, including solid and the fixture named `mm`; extracted bytes match UnRAR. |
-| RAR 2.x / UnpVer 26 multimedia | Unsupported | The attempted `-mm` producer emitted v20, so no v26 stream has been tested. |
+| RAR 2.x / UnpVer 20, store and methods 1/3/5 | Strict | Nine archive sets, including solid, `mm`, and two entries LARGER than the dictionary. The large-entry pair found three defects on 2026-08-06 (spurious byte-align on mid-stream table refresh, a 256 KB dictionary cap the reference does not apply, and emit-once-at-the-end window overflow). 36/36 agreement with UnRAR over 32 KB-900 KB at -md64 and -md1024. |
+| RAR 2.x / UnpVer 26 | Covered by v20 | NOT multimedia — the reference comments it "Files larger than 2GB" and dispatches it to the SAME `Unpack20` routine (unpack.cpp:173), which rarz mirrors. Multimedia is an inline mode WITHIN v20 and is covered by `rar2_v20_mm.rar`. A distinct v26 stream would need a >2GB member; the decoder path is identical either way. |
 | RAR 3/4 / UnpVer 29, store and compressed | Strict | Six archive sets; ordinary and solid payloads verify against CRC32 and extract byte-identically. |
 | RAR 3/4 standard VM filters | Strict for x86; partial elsewhere | The x86 E8/E8E9 path was WRONG until 2026-08-05 (missing file-offset term, file size used where a fixed 0x1000000 constant belongs) and reported damage on clean archives. Now covered by producer-made `rar4_x86_filter`/`rar5_x86_filter` fixtures compiled from self-owned C. RGB/Itanium still lack producer fixtures. Unknown VM programs report unsupported. |
 | RAR5 / UnpVer 50, store and methods 1-5 | Strict | Ten single-archive sets cover store, all five levels, large payloads, regression payloads, and solid streams. CRC32 and BLAKE2sp are checked when present. |
-| RAR5 / UnpVer 70 | Unconfirmed | Every rar 7.20 option probed validates, including -md512m and -md1g, but no stream positively identified as v70 was isolated. Not claimed. |
+| RAR5 / UnpVer 70 | Implemented, stream unconfirmed | v70 differs from v50 by one behavioural flag (`ExtraDist`, unpack.cpp:184), which unpack50 implements as `is_rar7`. Every rar 7.20 option probed validates, including -md512m and -md1g, but no stream positively identified as v70 was isolated, so end-to-end coverage is unproven. |
 | RAR5 split and multi-volume | Strict for committed cases | Three complete volume sets cover stored, compressed, and a large split payload. Missing/truncated volume mutations are rejected. |
 | Solid archives | Strict for v20/v29/v50 corpus | Three generations extract byte-identically and retain decoder state across entries. |
 | Per-file encryption (`-p`) | Partial/incomplete | RAR4 encrypted STORE entries were reported DAMAGED until 2026-08-05 (ciphertext hashed against the plaintext CRC32). Now a none/mixed/all classifier corpus covers both families. Encrypted entries report unsupported without a password and are counted in `encrypted_entry_count`; a clean mixed archive is `INCOMPLETE`, never damaged or verified. |

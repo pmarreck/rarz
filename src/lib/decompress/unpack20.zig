@@ -263,6 +263,19 @@ const Unpack20State = struct {
     last_length: u32,
     written_size: u64,
     unpacked_size: u64,
+    /// Streaming-output state, used ONLY for entries larger than the window.
+    ///
+    /// v20 dictionaries are 64 KB-1 MB, so an ORDINARY file exceeds them — the
+    /// RAR4 equivalent of this bug needed a 4 MB entry before it showed, while
+    /// here a 90 KB text file against the default 64 KB dictionary was enough.
+    /// Emitting once at the end therefore reported DAMAGE on a large fraction
+    /// of real RAR 2.x archives. Null for entries that fit, so the small-entry
+    /// path is untouched.
+    stream_out: ?Sink,
+    /// Window write_pos when the current entry began.
+    entry_start: usize,
+    /// Bytes of the current entry already emitted to `stream_out`.
+    flushed: usize,
     audio_block: bool,
     audio_channels: u8,
     cur_channel: u8,
@@ -288,6 +301,9 @@ const Unpack20State = struct {
             .last_length = 0,
             .written_size = 0,
             .unpacked_size = unpacked_size,
+            .stream_out = null,
+            .entry_start = 0,
+            .flushed = 0,
             .audio_block = false,
             .audio_channels = 0,
             .cur_channel = 0,
@@ -322,8 +338,18 @@ const Unpack20State = struct {
 fn readTables(state: *Unpack20State) !void {
     const br = &state.br;
 
-    // Step 1: align to a byte boundary.
-    br.alignByte();
+    // NO byte alignment here. v29's ReadTables30 opens with
+    // `Inp.faddbits((8-Inp.InBit)&7)`, but v20's ReadTables20 does NOT — it
+    // goes straight to `Inp.getbits()` (unpack20.cpp:174-182). The two
+    // decoders genuinely differ, and copying v29's alignment into v20 discards
+    // up to 7 bits.
+    //
+    // It was invisible for one-block entries, because the stream starts byte
+    // aligned and the align is then a no-op. Only a MID-STREAM table refresh
+    // (symbol 269) exposes it, and that needs an entry big enough to span two
+    // blocks: measured, a 356 KB entry decoded correctly with a single table
+    // read while a 416 KB entry desynchronised at its second, ~4 KB after the
+    // refresh at offset 372422.
 
     // Step 2: TWO flag bits, read by peeking 16 and consuming 2 — plus two MORE
     // for the channel count when this is an audio block. Reference
@@ -453,6 +479,31 @@ fn decodeLength(br: *BitReader, rd: *const DecodeTable) !u32 {
 // Main Decompression Loop
 // ============================================================================
 
+/// Emit decoded bytes before the circular window overwrites them.
+///
+/// v20 has no VM filters — its multimedia mode is an inline decode path, not a
+/// post-transform over a finished region — so unlike unpack29 there is nothing
+/// that needs to reach backwards, and no reserve is held back.
+fn flushDecoded(state: *Unpack20State, keep: usize) !void {
+    const out = state.stream_out orelse return;
+    const produced = state.window.write_pos - state.entry_start;
+    const emit_upto = @min(produced -| keep, state.unpacked_size);
+    if (emit_upto <= state.flushed) return;
+
+    const count = emit_upto - state.flushed;
+    const back = produced - state.flushed;
+    // Unflushed data older than the window is data we no longer have.
+    if (back > state.window.buffer.len) return error.InvalidData;
+    if (!state.window.emitTo(out, back, count)) return error.InvalidData;
+    state.flushed += count;
+}
+
+/// How much may accumulate unflushed before the window wraps over it. Half the
+/// window keeps the emit cheap while leaving ample slack for a long match.
+fn flushThreshold(state: *const Unpack20State) usize {
+    return state.window.buffer.len / 2;
+}
+
 fn unpackLoop(state: *Unpack20State) !void {
     while (state.written_size < state.unpacked_size) {
         // Load tables if not yet loaded
@@ -474,6 +525,11 @@ fn unpackAudioBlock(state: *Unpack20State) !void {
     const br = &state.br;
 
     while (state.written_size < state.unpacked_size) {
+        if (state.stream_out != null and
+            state.window.write_pos - state.entry_start - state.flushed > flushThreshold(state))
+        {
+            try flushDecoded(state, 0);
+        }
         if (br.remainingBits() < 1) return error.EndOfData;
 
         const ch = state.cur_channel;
@@ -501,6 +557,13 @@ fn unpackLzBlock(state: *Unpack20State) !void {
     const br = &state.br;
 
     while (state.written_size < state.unpacked_size) {
+        // Only ever true for entries larger than the window (stream_out is null
+        // otherwise), so the common path pays one null check per symbol.
+        if (state.stream_out != null and
+            state.window.write_pos - state.entry_start - state.flushed > flushThreshold(state))
+        {
+            try flushDecoded(state, 0);
+        }
         if (br.remainingBits() < 1) return error.EndOfData;
 
         const sym = huffman.decodeNumber(br, &state.ld) catch |err| {
@@ -721,7 +784,15 @@ pub const Session = struct {
         // Where this entry's output begins within the continuing window.
         const start_pos = st.window.write_pos;
 
+        // Entries larger than the window MUST stream out as they decode; held
+        // entirely in the window they lose their opening bytes.
+        st.entry_start = start_pos;
+        st.flushed = 0;
+        st.stream_out = if (unpacked_size > st.window.buffer.len) out else null;
+        defer st.stream_out = null;
+
         unpackLoop(st) catch |err| {
+            std.debug.print("DBG err={any} written={d} declared={d} win={d}\n", .{err, st.written_size, st.unpacked_size, st.window.buffer.len});
             // Producing the declared number of bytes and then running out of
             // input is success, not truncation.
             if (st.written_size < st.unpacked_size) {
@@ -733,6 +804,12 @@ pub const Session = struct {
                 };
             }
         };
+
+        // Streaming entry: emit whatever is still held back and we are done.
+        if (st.stream_out != null) {
+            try flushDecoded(st, 0);
+            return;
+        }
 
         const out_size: usize = @intCast(@min(st.written_size, st.unpacked_size));
         // A trailing match may overshoot the declared size, so measure how far

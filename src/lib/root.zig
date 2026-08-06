@@ -2285,6 +2285,14 @@ const unrar_clean_corpus = [_]struct { name: []const u8, bytes: []const u8 }{
 	// 4096 KB validated, 4608 KB did not.
 	.{ .name = "rar4_large_window", .bytes = @embedFile("rar4_large_window") },
 	.{ .name = "rar5_large_window", .bytes = @embedFile("rar5_large_window") },
+	// RAR 2.90, entry ~750 KB against a 64 KB and a 1 MB dictionary. v20 windows
+	// are 64 KB-1 MB, so an ORDINARY file exceeds them — the RAR4 equivalent
+	// needed 4 MB before it showed. Two defects sit behind these:
+	// the same emit-once-at-the-end window overflow fixed in unpack29, and a
+	// 256 KB cap rarz applied to the v20 dictionary that the reference does not
+	// (arcread.cpp:268 uses one uncapped formula for every RAR4 version).
+	.{ .name = "rar2_v20_md64_large", .bytes = @embedFile("rar2_v20_md64_large") },
+	.{ .name = "rar2_v20_md1024_large", .bytes = @embedFile("rar2_v20_md1024_large") },
 };
 
 test "archives unrar tests clean are not reported damaged" {

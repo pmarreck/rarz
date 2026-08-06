@@ -142,6 +142,10 @@ pub fn build(b: *std.Build) void {
 	unit_tests.root_module.addAnonymousImport("rar4_x86_filter", .{ .root_source_file = b.path("tests/fixtures/rar4_x86_filter.rar") });
 	unit_tests.root_module.addAnonymousImport("rar4_large_window", .{ .root_source_file = b.path("tests/fixtures/rar4_large_window.rar") });
 	unit_tests.root_module.addAnonymousImport("rar5_large_window", .{ .root_source_file = b.path("tests/fixtures/rar5_large_window.rar") });
+	// RAR 2.90-produced entries LARGER than the sliding window. v20 windows are
+	// 64 KB-1 MB, so ordinary files exceed them — unlike RAR4's 4 MB.
+	unit_tests.root_module.addAnonymousImport("rar2_v20_md64_large", .{ .root_source_file = b.path("tests/fixtures/rar2_v20_md64_large.rar") });
+	unit_tests.root_module.addAnonymousImport("rar2_v20_md1024_large", .{ .root_source_file = b.path("tests/fixtures/rar2_v20_md1024_large.rar") });
 	unit_tests.root_module.addAnonymousImport("rar5_store", .{ .root_source_file = b.path("tests/fixtures/rar5_store.rar") });
 	// Minimal v29-compressed archives — 87 and 162 bytes. Small enough to trace
 	// bit-by-bit against the reference decoder when unpack29 misbehaves.

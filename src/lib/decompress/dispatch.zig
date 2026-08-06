@@ -233,22 +233,26 @@ pub fn decompressRar4(
 /// In RAR4, the dictionary size is encoded in bits 5-7 of the file flags:
 ///   dict_size_code = (file_flags >> 5) & 7
 ///
-/// The mapping depends on the unpack version:
-///   v15: always 64KB (dict_bits = 16)
-///   v20: 64KB-256KB (dict_bits = 16 + min(code, 2))
-///   v26/v29: 64KB-4MB (dict_bits = 16 + min(code, 6))
+/// ONE formula for every RAR4-family version, matching unrar 7.20
+/// arcread.cpp:268:
+///
+///     hd->WinSize = hd->Dir ? 0 : 0x10000 << ((hd->Flags & LHD_WINDOWMASK) >> 5)
+///
+/// The reference applies no version-dependent cap, and neither does this. rarz
+/// previously capped v20 at 256 KB and pinned v15 to 64 KB, which handed the
+/// decoder a window smaller than the encoder had used and produced DAMAGE
+/// verdicts on intact archives — RAR 2.90 accepts -md512 and -md1024 and writes
+/// dict codes 3 and 4.
+///
+/// Code 7 is LHD_DIRECTORY, which the reference resolves to WinSize 0 rather
+/// than a window; a directory has no payload to decode, so clamping to 6 (4 MB)
+/// here is equivalent and keeps the allocation bounded.
+///
+/// v15 follows the same formula because the reference does. That path has no
+/// producer corpus, so it is reference-derived rather than measured.
 fn getDictBitsRar4(unpack_version: u8, file_flags_raw: u16) u5 {
-    if (unpack_version <= 15) return 16; // v15: always 64KB
-
+    _ = unpack_version;
     const dict_code: u3 = @intCast((file_flags_raw >> 5) & 7);
-
-    if (unpack_version <= 20) {
-        // v20: max 256KB
-        const capped: u5 = if (dict_code > 2) 2 else dict_code;
-        return 16 + capped;
-    }
-
-    // v26/v29: max 4MB (code 6 = 2^22 = 4MB)
     const capped: u5 = if (dict_code > 6) 6 else dict_code;
     return 16 + capped;
 }
@@ -259,23 +263,36 @@ fn getDictBitsRar4(unpack_version: u8, file_flags_raw: u16) u5 {
 
 const testing = std.testing;
 
-test "getDictBitsRar4 v15 always returns 16" {
-    try testing.expectEqual(@as(u5, 16), getDictBitsRar4(15, 0x0000));
-    try testing.expectEqual(@as(u5, 16), getDictBitsRar4(15, 0xFFFF));
-    try testing.expectEqual(@as(u5, 16), getDictBitsRar4(10, 0x00E0)); // even older
+test "getDictBitsRar4 reads the window from the flags for v15 too" {
+    // This test previously asserted a fixed 16 for v15, which is what rarz did
+    // and not what the reference does — arcread.cpp:268 applies one formula to
+    // every RAR4-family version. UNVERIFIED against a real v15 archive: no
+    // obtainable producer writes v15 (rarlab's oldest is RAR 2.50), so this is
+    // reference-derived, not measured.
+    try testing.expectEqual(@as(u5, 16), getDictBitsRar4(15, 0x0000)); // code 0
+    try testing.expectEqual(@as(u5, 17), getDictBitsRar4(15, 0x0020)); // code 1
+    try testing.expectEqual(@as(u5, 22), getDictBitsRar4(15, 0x00E0)); // code 7 -> clamped
 }
 
-test "getDictBitsRar4 v20 caps at 18 (256KB)" {
-    // code 0: 16
-    try testing.expectEqual(@as(u5, 16), getDictBitsRar4(20, 0x0000));
-    // code 1: 17
-    try testing.expectEqual(@as(u5, 17), getDictBitsRar4(20, 0x0020));
-    // code 2: 18
-    try testing.expectEqual(@as(u5, 18), getDictBitsRar4(20, 0x0040));
-    // code 3: capped to 18
-    try testing.expectEqual(@as(u5, 18), getDictBitsRar4(20, 0x0060));
-    // code 7: capped to 18
-    try testing.expectEqual(@as(u5, 18), getDictBitsRar4(20, 0x00E0));
+test "getDictBitsRar4 v20 honours the full dictionary range, like the reference" {
+    // The reference applies ONE uncapped formula to every RAR4-family version
+    // (arcread.cpp:268): WinSize = 0x10000 << ((Flags & LHD_WINDOWMASK) >> 5).
+    //
+    // rarz capped v20 at 18 (256 KB) on the belief that RAR 2.x could not go
+    // higher. It can: RAR 2.90 accepts -md512 and -md1024 and writes dict codes
+    // 3 and 4. The cap handed the decoder a window smaller than the encoder
+    // used, so any v20 entry over 256 KB decoded wrongly and was reported as
+    // DAMAGED on archives unrar tests clean. Measured: a 356 KB entry written
+    // with -md1024 failed, a 177 KB one passed.
+    try testing.expectEqual(@as(u5, 16), getDictBitsRar4(20, 0x0000)); // 64KB
+    try testing.expectEqual(@as(u5, 17), getDictBitsRar4(20, 0x0020)); // 128KB
+    try testing.expectEqual(@as(u5, 18), getDictBitsRar4(20, 0x0040)); // 256KB
+    try testing.expectEqual(@as(u5, 19), getDictBitsRar4(20, 0x0060)); // 512KB  (-md512)
+    try testing.expectEqual(@as(u5, 20), getDictBitsRar4(20, 0x0080)); // 1MB    (-md1024)
+    try testing.expectEqual(@as(u5, 21), getDictBitsRar4(20, 0x00A0)); // 2MB
+    // Code 7 is LHD_DIRECTORY, never a file window, so 6 is the real ceiling.
+    try testing.expectEqual(@as(u5, 22), getDictBitsRar4(20, 0x00C0)); // 4MB
+    try testing.expectEqual(@as(u5, 22), getDictBitsRar4(20, 0x00E0));
 }
 
 test "getDictBitsRar4 v29 full range" {

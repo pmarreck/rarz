@@ -1,5 +1,84 @@
 # PLAN
 
+## Triage: 37 GitHub issues from `unxed` (opened 2026-06-05/06, triaged 2026-08-27)
+
+NOT spam. `unxed` is a 2011-vintage account building file managers and archive
+tooling (`f4` 184★, Go `archives`/`zipper`/`sevenzip`) — a domain expert with an
+obvious stake in a clean-room RAR library. The dump reads as an LLM-assisted
+deep review, and its content held up under verification: three of its reports
+describe defects we later found and FIXED INDEPENDENTLY (#7 split-file
+last-part CRC, #9 ARM file_offset, #18 RAR4 field desync — the current code's
+comment describes exactly the bug the issue reports, past tense). Every verdict
+below was checked against HEAD, not taken on faith.
+
+### Live bugs, ours, worth fixing (descending priority)
+
+- [ ] **#15 RAR5 filters wrapping the circular window are silently SKIPPED**
+  (non-streaming path, unpack50 "Only apply if the region doesn't wrap").
+  Skipped filter -> wrong bytes -> CRC mismatch -> false DAMAGE on a clean
+  archive. The 2026-08-27 streaming path already stages wrapped spans; the
+  fit-in-window path must do the same. Needs a solid-archive fixture whose
+  filter region straddles the wrap.
+- [ ] **#31 mtime epoch conflation** — CONFIRMED in main.c: we write DOS-encoded
+  time into the RAR5 mtime field (which the format defines as Unix) and decode
+  foreign archives' Unix mtimes as DOS bitmasks in `rarz l`. rarz-created
+  archives carry garbage timestamps to other tools. Interop gates never
+  compared mtimes, which is how it survived.
+- [ ] **#6 (+#14) unpack20 audio adaptation is fabricated** — the reference uses
+  a delta-of-delta chain and an 11-bucket `Dif[]` accumulator every 32 samples;
+  ours adapts per-sample by sign correlation with wrong (+/-32) clamps. Real
+  RAR2 -mm AUDIO blocks would decode to garbage -> false DAMAGE. Our mm fixture
+  never triggered audio mode (text/noise input), so 18 unit tests colluded.
+  Needs a real-PCM fixture via RAR 2.90 first (rar only enters audio mode for
+  PCM-like data).
+- [ ] **#20 writer stack overflow** — `write_file_block` packs header fields +
+  name into `[4096]u8` but admits names up to 4096; names >= ~4050 overflow:
+  ReleaseSafe panic, ReleaseFast UB.
+- [ ] **#17 (+#2/#19/#10/#16, the RAR7 large-dictionary cluster)** — we CLAMP
+  dictionaries above 2 GiB and decode with a too-small window (silently wrong)
+  instead of refusing as unverifiable. Near-term fix: refuse > our cap.
+  Full fix (5-bit dict mask **v70-only** per arcread.cpp:871 — #2's "always
+  5 bits" overreaches; frac bits at shift 15 not 14; frac applied to window
+  size; u64 distances) is gated on the v70 story: no producer stream
+  positively identified as v70 exists yet.
+- [ ] **#29 `skip_if_unknown` not enforced** — an unknown block WITHOUT the
+  skippable flag must fail validation (spec); we silently pass it. RAR5 parses
+  the flag already; RAR4 (0x4000) needs parsing. Precision-ethos fit.
+- [ ] **#36 recognise `.rev` recovery-volume signature** (Rar!\x1aRev) instead
+  of "no recognized RAR signature" — honest classification for validate.
+- [ ] **#3 readTables sym16/17 at i==0** soft-skips (desync-tolerant); harden
+  to fail-closed like unpack29 already does. (Refuted as infinite-loop DoS:
+  bits are consumed each iteration.)
+- [ ] **#8 read_vint 10th-byte overflow** — REFUTED as panic/DoS (measured:
+  Zig `<<` discards silently), but a malformed VINT yields a wrong value
+  instead of an error; harden.
+- [ ] **#21 RAR2 comment-in-header CRC** — plausible, unverified; needs a
+  RAR 2.90 fixture with an embedded comment.
+- [ ] **#26 per-part packed-CRC checks** in multi-volume validation (damage
+  localisation; final CRC already catches corruption — gates proved it).
+- [ ] **#33 k/K suffix semantics** vs official rar (lowercase binary,
+  uppercase decimal per report) — verify against rar's own parsing first.
+- [ ] Low/fidelity: **#30** UTF-8 name validation (RAR5 only), **#32**
+  FHEXTRA_VERSION `;N` names, **#35** directory mtimes never restored (we set
+  none at all — same fidelity bucket as the exec bit), **#11** encrypted RAR4
+  subblocks not counted as unverified, **#5** RAR4 SALT/EXT_TIME parse gap
+  (prereq for password work), **#4** extra-area slicing robustness.
+- [ ] Doc fixes: **#12/#13** (duplicate reports; 263..271 -> 263..270 in
+  RAR_COMPRESSION_ALGORITHMS_EXHAUSTIVE.md), **#23** PATH_SANITIZATION warning.
+
+### Not actionable now
+
+- **#7, #9, #18**: fixed independently since June (close with commit refs).
+- **#27** ANSI-filter comments: we never print archive comments; guard belongs
+  wherever comment display is ever added.
+- **#28** unpack15 window guards: our window zero-fills at init and the
+  reference's own memset is commented out; semantics match. Keep as a note.
+- **#34** NTFS reparse buffers: Windows junction extraction, future work.
+- **#22/#25/#37** (AES no-padding, volume-boundary trimming, per-volume salt):
+  folded into the password-support design section below. **#24** (flat RS
+  matrices): recovery-record future work. **#1**: pointer to
+  bitplane/rar-research — useful cross-reference, no action.
+
 ## Work order: streaming verification, no size caps (2026-08-27, Peter ruling via validate)
 
 Peter: "NOTHING is too large for deep validation, period. We figure out how to

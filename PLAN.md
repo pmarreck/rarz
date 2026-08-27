@@ -24,7 +24,9 @@ a 1115.6 MB RAR made validate refuse deep validation at its 1 GiB cap.
   1115.6 MB file that hit validate's cap) verifies in 2.04 s at 65.5 MB peak
   RSS = 33 MB archive buffer + 32 MB window + fixed state; 3/3 witness
   mutations refused. (2026-08-27 12:43 EDT)
-- [ ] Reply to validate with the SHA + API notes.
+- [x] Replied to validate: pin 9bf3cfa, cap deletion green-lit, API notes and
+  the one stated exception (packed reassembly for volume-spanning entries).
+  (2026-08-27 12:47 EDT)
 
 ## Coverage push: three false-positive classes closed (2026-08-05 10:50 EDT)
 

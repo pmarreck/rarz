@@ -85,6 +85,21 @@ below was checked against HEAD, not taken on faith.
   matrices): recovery-record future work. **#1**: pointer to
   bitplane/rar-research — useful cross-reference, no action.
 
+## PPMd rewrite (2026-08-27, validate launch blocker)
+
+- [x] Clean-room PPMd variant H replacing the simplified stand-in whose model
+  never learned and whose tests validated the stand-in against itself (the
+  same collusion class as GH #6). Both of validate's blockers — the instant
+  false positive on `bohemian rhapsody.aup` and the minutes-per-entry
+  RangeCoder cliff — were this one root cause. Bisected: predates all August
+  work. Witness: all 1539 entries of the 1115.6 MB archive verify in 23.9 s
+  wall (unrar: 39.1 s); fixtures byte-identical; 12/12 mutations refused.
+  (2026-08-27 14:50 EDT)
+- [ ] PPM heap is NOT in the pre-decode memory budget: a PPM block declares
+  its own sub-allocator size (up to 256 MiB) inside the compressed stream.
+  Documented in the gate doc; decide with validate whether to expose a
+  post-open "max possible PPM heap" constant or a mid-decode admission hook.
+
 ## Work order: streaming verification, no size caps (2026-08-27, Peter ruling via validate)
 
 Peter: "NOTHING is too large for deep validation, period. We figure out how to

@@ -151,6 +151,10 @@ pub fn build(b: *std.Build) void {
 	// blocker behind validate's 1 GiB deep-validation cap.
 	unit_tests.root_module.addAnonymousImport("rar5_stream_text", .{ .root_source_file = b.path("tests/fixtures/rar5_stream_text.rar") });
 	unit_tests.root_module.addAnonymousImport("rar5_stream_filter", .{ .root_source_file = b.path("tests/fixtures/rar5_stream_filter.rar") });
+	// RAR3 PPMd streams (generate_ppm_fixtures.sh). The corpus contained none,
+	// which is how a non-functional stand-in PPMd survived every gate.
+	unit_tests.root_module.addAnonymousImport("rar4_ppm_xml", .{ .root_source_file = b.path("tests/fixtures/rar4_ppm_xml.rar") });
+	unit_tests.root_module.addAnonymousImport("rar4_ppm_prose", .{ .root_source_file = b.path("tests/fixtures/rar4_ppm_prose.rar") });
 	unit_tests.root_module.addAnonymousImport("rar5_store", .{ .root_source_file = b.path("tests/fixtures/rar5_store.rar") });
 	// Minimal v29-compressed archives — 87 and 162 bytes. Small enough to trace
 	// bit-by-bit against the reference decoder when unpack29 misbehaves.

@@ -230,8 +230,10 @@ pub const Unpack29State = struct {
     /// Unflushed byte count that triggers a flush. Kept below the window size
     /// by MAX_FILTER_BLOCK so a late-recorded filter can still reach its data.
     flush_threshold: usize,
-    // PPM state
+    // PPM state. The model persists across blocks and files (see readTables);
+    // esc_char is the in-band escape byte, reset to 2 per UnpInitData30.
     ppm_model: ?PpmModel,
+    ppm_esc_char: u8,
     allocator: std.mem.Allocator,
     // Tables allocated flag for cleanup
     mc_allocated: bool,
@@ -275,6 +277,7 @@ pub const Unpack29State = struct {
             .flushed = 0,
             .flush_threshold = 0,
             .ppm_model = null,
+            .ppm_esc_char = 2,
             .allocator = allocator,
             .mc_allocated = false,
             .dc_allocated = false,
@@ -336,14 +339,21 @@ pub const Unpack29State = struct {
         // decoded as garbage, so any genuinely compressed v29 payload failed.
         const bit_field = try self.br.peekBits(16);
         if (bit_field & 0x8000 != 0) {
-            // PPM mode. The PPM decoder re-reads its own header, so consume
-            // only the single mode bit here, matching the reference's
-            // DecodeInit path.
-            self.br.skipBits(1);
+            // PPM mode. Consume NOTHING: the reference peeks this flag and
+            // then DecodeInit's first GetChar reads the SAME byte — its bits
+            // 0-4 are the order, bit 5 the reset flag, bit 6 "escape char
+            // follows". The previous code skipped one bit here AND read the
+            // header as three plain bytes, so the entire PPM stream was
+            // desynchronised from its first byte.
             self.block_mode = .ppm_mode;
-            self.ppm_model = PpmModel.init(self.allocator, &self.br) catch {
-                return Unpack29Error.UnsupportedPpmMode;
-            };
+            if (self.ppm_model == null) {
+                // The MODEL persists across blocks and (solid) files; only
+                // DecodeInit's reset bit rebuilds it. Created lazily here,
+                // destroyed only in deinit.
+                self.ppm_model = PpmModel.init(self.allocator);
+            }
+            const ok = self.ppm_model.?.decodeInit(&self.br, &self.ppm_esc_char) catch false;
+            if (!ok) return Unpack29Error.CorruptPpmData;
             return false;
         }
 
@@ -859,44 +869,93 @@ pub const Unpack29State = struct {
         return Unpack29Error.CorruptData;
     }
 
-    /// Process one PPM symbol.
-    /// Returns true if decoding should continue, false if end of block/file.
+    /// One byte of PPM decode, plus the reference's in-band escape protocol
+    /// (unpack30.cpp:72-140). PPMEscChar introduces a sub-code:
+    ///   0 = end of PPM encoding — read tables and CONTINUE the same entry
+    ///       (an LZ block may follow within one file; treating this as end of
+    ///       ENTRY truncated every multi-block PPM file),
+    ///   1 = the literal escape byte itself,
+    ///   2 = end of file,
+    ///   3 = VM filter code carried inside the PPM stream,
+    ///   4 = LZ match: 3 distance bytes + length byte, CopyString(len+32, dist+2),
+    ///   5 = one-byte-distance RLE: CopyString(len+4, 1).
+    /// Returns true to continue, false at end of entry.
     fn processPpmSymbol(self: *Self) !bool {
         var model = &(self.ppm_model orelse return Unpack29Error.UnsupportedPpmMode);
-        const result = model.decodeSymbol() catch {
-            return Unpack29Error.CorruptPpmData;
-        };
+        const ch = model.decodeChar(&self.br) catch return Unpack29Error.CorruptPpmData;
 
-        switch (result) {
-            .literal => |byte| {
-                self.window.putByte(byte);
-                self.written_size += 1;
-                return true;
-            },
-            .end_of_block => {
-                // Switch back to table reading
-                _ = try self.readTables();
-                return false;
-            },
-            .end_of_file => {
-                return false;
-            },
-            .vm_code => {
-                return Unpack29Error.UnsupportedFilter;
-            },
-            .lz_match => |match_info| {
-                self.window.copyMatch(match_info.distance, match_info.length);
-                self.written_size += match_info.length;
-                return true;
-            },
-            .rle_byte => |rle_info| {
-                for (0..rle_info.count) |_| {
-                    self.window.putByte(rle_info.byte);
-                }
-                self.written_size += rle_info.count;
-                return true;
-            },
+        if (ch == self.ppm_esc_char) {
+            const next = model.decodeChar(&self.br) catch return Unpack29Error.CorruptPpmData;
+            switch (next) {
+                0 => {
+                    // End of PPM encoding, NOT of the entry.
+                    _ = try self.readTables();
+                    return true;
+                },
+                2 => return false, // end of file
+                3 => {
+                    // ReadVMCodePPM: a filter program transported as PPM bytes.
+                    const first_byte = model.decodeChar(&self.br) catch
+                        return Unpack29Error.CorruptPpmData;
+                    var length: u32 = (first_byte & 7) + 1;
+                    if (length == 7) {
+                        const b1 = model.decodeChar(&self.br) catch
+                            return Unpack29Error.CorruptPpmData;
+                        length = b1 + 7;
+                    } else if (length == 8) {
+                        const b1 = model.decodeChar(&self.br) catch
+                            return Unpack29Error.CorruptPpmData;
+                        const b2 = model.decodeChar(&self.br) catch
+                            return Unpack29Error.CorruptPpmData;
+                        length = b1 * 256 + b2;
+                    }
+                    if (length == 0 or length > MAX_VM_CODE_SIZE)
+                        return Unpack29Error.CorruptPpmData;
+                    var code_buf: [MAX_VM_CODE_SIZE]u8 = undefined;
+                    for (0..length) |i| {
+                        const b = model.decodeChar(&self.br) catch
+                            return Unpack29Error.CorruptPpmData;
+                        code_buf[i] = @intCast(b & 0xFF);
+                    }
+                    try self.addVMCode(first_byte, code_buf[0..length]);
+                    return true;
+                },
+                4 => {
+                    // LZ inside PPM.
+                    var distance: u32 = 0;
+                    for (0..3) |_| {
+                        const b = model.decodeChar(&self.br) catch
+                            return Unpack29Error.CorruptPpmData;
+                        distance = (distance << 8) + (b & 0xFF);
+                    }
+                    const len_b = model.decodeChar(&self.br) catch
+                        return Unpack29Error.CorruptPpmData;
+                    const length = (len_b & 0xFF) + 32;
+                    self.window.copyMatch(distance + 2, length);
+                    self.written_size += length;
+                    return true;
+                },
+                5 => {
+                    const len_b = model.decodeChar(&self.br) catch
+                        return Unpack29Error.CorruptPpmData;
+                    const length = (len_b & 0xFF) + 4;
+                    self.window.copyMatch(1, length);
+                    self.written_size += length;
+                    return true;
+                },
+                else => {
+                    // NextCh == 1 (or anything else, per the reference's
+                    // fall-through): the byte IS the escape character.
+                    self.window.putByte(@intCast(ch & 0xFF));
+                    self.written_size += 1;
+                    return true;
+                },
+            }
         }
+
+        self.window.putByte(@intCast(ch & 0xFF));
+        self.written_size += 1;
+        return true;
     }
 
     /// Main decompression loop.
@@ -1070,10 +1129,12 @@ pub const Session = struct {
         st.tables_loaded = false;
         st.old_table = [_]u8{0} ** TOTAL_CODE_LENGTHS;
         st.block_mode = .lz;
-        if (st.ppm_model) |*m| {
-            m.deinit();
-            st.ppm_model = null;
-        }
+        // Reference UnpInitData30(!Solid) resets PPMEscChar and the block type
+        // but does NOT destroy the PPM model — it persists for the whole
+        // unpack session, and only DecodeInit's reset bit rebuilds it. A
+        // non-solid file whose first PPM block has reset clear would otherwise
+        // find no allocator and fail on an archive unrar accepts.
+        st.ppm_esc_char = 2;
         // InitFilters30(!Solid): the filter PROGRAM table.
         st.filter_types = [_]rarvm.StandardFilter{.none} ** MAX_FILTERS;
         st.filter_count = 0;

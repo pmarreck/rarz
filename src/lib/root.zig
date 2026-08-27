@@ -2351,6 +2351,11 @@ const unrar_clean_corpus = [_]struct { name: []const u8, bytes: []const u8 }{
 	// was the last decoder still holding whole entries in the window.
 	.{ .name = "rar5_stream_text", .bytes = @embedFile("rar5_stream_text") },
 	.{ .name = "rar5_stream_filter", .bytes = @embedFile("rar5_stream_filter") },
+	// RAR3 PPMd text-compression streams. The stand-in PPMd this corpus
+	// exposed produced an instant false positive on one shape of stream and
+	// minutes of escape churn on the other — both in one root cause.
+	.{ .name = "rar4_ppm_xml", .bytes = @embedFile("rar4_ppm_xml") },
+	.{ .name = "rar4_ppm_prose", .bytes = @embedFile("rar4_ppm_prose") },
 };
 
 test "rarz_max_dictionary_size reports the window the decoder will allocate" {

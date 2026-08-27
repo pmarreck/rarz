@@ -2,6 +2,12 @@
 
 ## Triage: 37 GitHub issues from `unxed` (opened 2026-06-05/06, triaged 2026-08-27)
 
+ALL 37 RESPONDED TO on GitHub (2026-08-27 13:05 EDT): 16 closed (fixed-with-
+commit-refs b913a66/ed3722b/06b6e86/9c4cd21, duplicates, recorded design
+guidance, measured rebuttals), 21 open with acknowledgements stating they are
+slated. STANDING RULE (Peter): each remaining fix closes its issue citing the
+fixing commit.
+
 NOT spam. `unxed` is a 2011-vintage account building file managers and archive
 tooling (`f4` 184★, Go `archives`/`zipper`/`sevenzip`) — a domain expert with an
 obvious stake in a clean-room RAR library. The dump reads as an LLM-assisted

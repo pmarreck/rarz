@@ -146,6 +146,11 @@ pub fn build(b: *std.Build) void {
 	// 64 KB-1 MB, so ordinary files exceed them — unlike RAR4's 4 MB.
 	unit_tests.root_module.addAnonymousImport("rar2_v20_md64_large", .{ .root_source_file = b.path("tests/fixtures/rar2_v20_md64_large.rar") });
 	unit_tests.root_module.addAnonymousImport("rar2_v20_md1024_large", .{ .root_source_file = b.path("tests/fixtures/rar2_v20_md1024_large.rar") });
+	// RAR5 entries ~28x/16x their 128 KB dictionary (generate_streaming_fixtures.sh).
+	// unpack50 emitted once at entry end, so these were FALSE POSITIVES and the
+	// blocker behind validate's 1 GiB deep-validation cap.
+	unit_tests.root_module.addAnonymousImport("rar5_stream_text", .{ .root_source_file = b.path("tests/fixtures/rar5_stream_text.rar") });
+	unit_tests.root_module.addAnonymousImport("rar5_stream_filter", .{ .root_source_file = b.path("tests/fixtures/rar5_stream_filter.rar") });
 	unit_tests.root_module.addAnonymousImport("rar5_store", .{ .root_source_file = b.path("tests/fixtures/rar5_store.rar") });
 	// Minimal v29-compressed archives — 87 and 162 bytes. Small enough to trace
 	// bit-by-bit against the reference decoder when unpack29 misbehaves.

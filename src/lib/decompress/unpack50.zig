@@ -74,6 +74,23 @@ pub const Unpack50State = struct {
     prev_distances: [4]u32,
     last_length: u32,
     written_size: u64,
+    /// Streaming-output state, used ONLY for entries larger than the window.
+    ///
+    /// unpack50 was the last decoder still holding whole entries in the
+    /// circular window and emitting once at the end — the defect fixed in
+    /// unpack29 (2026-08-05) and unpack20 (2026-08-06). RAR5 hid it because
+    /// rar sizes the dictionary to the file by default, but an explicit -md
+    /// (or a file bigger than the 1 GB spec maximum) breaks that: an 18 MB
+    /// entry with a 128 KB dictionary was reported DAMAGED on an archive
+    /// unrar tests clean. It is also why a consumer had to cap deep
+    /// validation by size: with this null, memory is the window plus the
+    /// sink, whatever the entry's size (Peter, 2026-08-27: "NOTHING is too
+    /// large for deep validation").
+    stream_out: ?Sink,
+    /// Window write_pos when the current entry began.
+    entry_start: usize,
+    /// Bytes of the current entry already emitted to `stream_out`.
+    flushed: usize,
     is_rar7: bool,
     tables_loaded: bool,
     allocator: std.mem.Allocator,
@@ -94,6 +111,9 @@ pub const Unpack50State = struct {
             .tables_loaded = false,
             .allocator = allocator,
             .pending_filters = .empty,
+            .stream_out = null,
+            .entry_start = 0,
+            .flushed = 0,
         };
     }
 
@@ -353,6 +373,112 @@ fn readFilterSize(br: *BitReader) !usize {
 ///   3. Read 8-bit checksum
 ///   4. Read ByteCount bytes for BlockSize (little-endian)
 ///   5. Verify: checksum == 0x5a ^ flags ^ BlockSize_byte0 ^ BlockSize_byte1 ^ BlockSize_byte2
+/// Largest region one RAR5 filter may cover (reference unpack.hpp:24,
+/// `#define MAX_FILTER_BLOCK_SIZE 0x400000`). Bounds the streaming reserve.
+const MAX_FILTER_BLOCK_SIZE: usize = 0x400000;
+
+/// Longest single LZ match (reference compress.hpp:17, MAX_INC_LZ_MATCH =
+/// 0x1001 + 3). One symbol can grow the unflushed span by at most this, which
+/// sets how close to a full window the streaming path may run.
+const MAX_LZ_MATCH: usize = 0x1001 + 3;
+
+/// Emit decoded bytes before the circular window overwrites them.
+///
+/// No look-back reserve is needed: a RAR5 filter's start is a FORWARD delta
+/// from the position at which its descriptor appears (reference
+/// unpack50.cpp:235, `BlockStart = (delta + UnpPtr) % MaxWinSize`, mirrored in
+/// parseFilterDescriptor), so every filter is known before any byte of its
+/// region is decoded. The cap below therefore covers all of them; a filter
+/// whose region cannot fit the window at all is refused rather than skipped —
+/// its bytes would emit untransformed, and the CRC would then blame the
+/// ARCHIVE for our gap.
+///
+/// Filter coordinates: `block_start` is a monotonic window-stream position
+/// (compared against `write_pos` everywhere), so a filter's offset within the
+/// ENTRY is `block_start - entry_start`.
+fn flushDecoded(state: *Unpack50State, limit: u64) !void {
+    const out = state.stream_out orelse return;
+    const produced = state.window.write_pos - state.entry_start;
+    var emit_upto: usize = @intCast(@min(@as(u64, produced), limit));
+
+    // Never emit INTO an unapplied filter's region: cap the span at the first
+    // filter that would be split by it. The filter is applied whole on a later
+    // flush, once its region has fully decoded.
+    for (state.pending_filters.items) |f| {
+        if (f.block_length == 0) continue;
+        const fstart = f.block_start - state.entry_start;
+        if (fstart >= state.flushed and fstart < emit_upto and
+            fstart + f.block_length > emit_upto)
+        {
+            emit_upto = fstart;
+        }
+    }
+
+    if (emit_upto <= state.flushed) {
+        // Nothing emittable while a filter's region is still decoding. Only
+        // fatal when the window is about to wrap over unemitted data — a
+        // filter genuinely larger than the window. Unverifiable, not damaged.
+        if (produced - state.flushed + MAX_LZ_MATCH >= state.window.buffer.len) {
+            return error.FilterExceedsWindow;
+        }
+        return;
+    }
+
+    const count = emit_upto - state.flushed;
+    const back = produced - state.flushed;
+    // Unflushed data older than the window is data we no longer have.
+    if (back > state.window.buffer.len) return error.CorruptData;
+
+    // A filter starting BEFORE the flushed mark lost part of its region to an
+    // earlier emit. (Unreachable while the cap above holds; kept because the
+    // failure direction of a stale assumption here is silent wrong output.)
+    var needs_staging = false;
+    for (state.pending_filters.items) |f| {
+        if (f.block_length == 0) continue;
+        const fstart = f.block_start - state.entry_start;
+        if (fstart < state.flushed and fstart + f.block_length > state.flushed) {
+            return error.FilterExceedsWindow;
+        }
+        if (fstart >= state.flushed and fstart + f.block_length <= emit_upto) {
+            needs_staging = true;
+        }
+    }
+
+    if (!needs_staging) {
+        if (!state.window.emitTo(out, back, count)) return error.CorruptData;
+        state.flushed += count;
+        return;
+    }
+
+    // Filters rewrite their region in place, so the span must be materialised
+    // contiguously before it can be transformed and emitted.
+    const staged = try state.allocator.alloc(u8, count);
+    defer state.allocator.free(staged);
+    var staged_sink = sink.BufferSink.init(staged);
+    if (!state.window.emitTo(staged_sink.sink(), back, count)) {
+        return error.CorruptData;
+    }
+
+    for (state.pending_filters.items) |*f| {
+        if (f.block_length == 0) continue;
+        const fstart = f.block_start - state.entry_start;
+        if (fstart < state.flushed or fstart + f.block_length > emit_upto) continue;
+        const rel = fstart - state.flushed;
+        // Same offset the non-streaming path passes: the region's position
+        // within the FILE (see the E8 relocation note there).
+        try filters.applyFilter(
+            staged[rel .. rel + f.block_length],
+            f.*,
+            @intCast(fstart),
+            state.allocator,
+        );
+        f.block_length = 0; // consumed
+    }
+
+    out.write(staged);
+    state.flushed += count;
+}
+
 fn decodeBlock(state: *Unpack50State, unpacked_size: u64) !bool {
     const br = &state.br;
 
@@ -399,6 +525,14 @@ fn decodeBlock(state: *Unpack50State, unpacked_size: u64) !bool {
 
     // Decode symbols until we exhaust the block or reach the target size
     while (state.written_size < unpacked_size) {
+        // Only ever true for entries larger than the window (stream_out is
+        // null otherwise), so the common path pays one null check per symbol.
+        if (state.stream_out != null) {
+            const produced = state.window.write_pos - state.entry_start;
+            if (produced - state.flushed > state.window.buffer.len / 2) {
+                try flushDecoded(state, unpacked_size);
+            }
+        }
         // Check if we've consumed the block
         const cur_byte = br.bit_pos / 8;
         const cur_bit: u4 = @intCast(br.bit_pos % 8);
@@ -542,9 +676,22 @@ pub const Session = struct {
         // Where this entry's output begins within the continuing window.
         const start_pos = st.window.write_pos;
 
+        // Entries larger than the window MUST stream out as they decode; held
+        // entirely in the window they lose their opening bytes.
+        st.entry_start = start_pos;
+        st.flushed = 0;
+        st.stream_out = if (unpacked_size > st.window.buffer.len) out else null;
+        defer st.stream_out = null;
+
         var more_blocks = true;
         while (more_blocks and st.written_size < unpacked_size) {
             more_blocks = try decodeBlock(st, unpacked_size);
+        }
+
+        // Streaming entry: apply what filters remain and emit the tail.
+        if (st.stream_out != null) {
+            try flushDecoded(st, unpacked_size);
+            return;
         }
 
         // Apply pending filters to the window data in place.

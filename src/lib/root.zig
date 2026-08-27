@@ -2293,6 +2293,11 @@ const unrar_clean_corpus = [_]struct { name: []const u8, bytes: []const u8 }{
 	// (arcread.cpp:268 uses one uncapped formula for every RAR4 version).
 	.{ .name = "rar2_v20_md64_large", .bytes = @embedFile("rar2_v20_md64_large") },
 	.{ .name = "rar2_v20_md1024_large", .bytes = @embedFile("rar2_v20_md1024_large") },
+	// RAR5 with -md128k: entries ~28x (text) and ~16x (x86, exercising the
+	// filter-during-streaming interaction) their dictionary window. unpack50
+	// was the last decoder still holding whole entries in the window.
+	.{ .name = "rar5_stream_text", .bytes = @embedFile("rar5_stream_text") },
+	.{ .name = "rar5_stream_filter", .bytes = @embedFile("rar5_stream_filter") },
 };
 
 test "archives unrar tests clean are not reported damaged" {

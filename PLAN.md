@@ -1,5 +1,24 @@
 # PLAN
 
+## Work order: streaming verification, no size caps (2026-08-27, Peter ruling via validate)
+
+Peter: "NOTHING is too large for deep validation, period. We figure out how to
+do it efficiently and correctly with the minimum memory used." Witnessed gap:
+a 1115.6 MB RAR made validate refuse deep validation at its 1 GiB cap.
+
+- [ ] unpack50: stream entries larger than the dictionary window (same
+  emit-once-at-the-end defect fixed in unpack29/unpack20; today an 18 MB entry
+  with a 128 KB dict is a FALSE POSITIVE — unrar OK, rarz INVALID).
+- [ ] Multi-volume verify: decode into the hashing sink instead of
+  materialising the whole decoded entry (`decompressRar5`/`decompressRar4`
+  return a full buffer today). Packed-side reassembly copy stays (bounded by
+  the entry's packed size); the unbounded DECODED side goes.
+- [ ] Expose the archive's max declared dictionary size pre-decode (new C
+  export; validate's admission estimator budgets against it).
+- [ ] Gates: differential vs unrar on the new large-entry fixture, corruption
+  sweep, and a ~1.2 GB local witness with measured peak RSS.
+- [ ] Reply to validate with the SHA + API notes.
+
 ## Coverage push: three false-positive classes closed (2026-08-05 10:50 EDT)
 
 A differential sweep against unrar over content the committed corpus never

@@ -8,6 +8,7 @@ annotate=[
 	tests/cli/test_precision_volumes.sh = Multi-volume precision: unrar-damaged => rarz must never report VALID (differential truncation sweep)
 	tests/cli/test_rar4_volumes.sh = RAR4 multi-volume validation gates: agreement with unrar, plus per-volume damage detection
 	tests/cli/test_solid.sh = Solid-archive acceptance: extraction byte-identical to unrar, VALID verdict, and corruption still detected (differential vs unrar)
+	tests/cli/test_v70_corpus.sh = v70 gate: corpus validates, mutations refused; skips without local cache
 	tests/cli/test_verify.sh = rarz verify: per-entry verify-only via FFI; agreement, entry coverage, and per-entry damage localisation
 	tests/fixtures/invalid = intentionally-invalid fixtures (kept out of all-valid Interop Gate A scans)
 	tests/fixtures/rar2_v20_md1024_large.rar = RAR 2.90 entry with a 1MB dictionary; exposed the 256KB v20 dictionary cap
@@ -22,5 +23,6 @@ annotate=[
 	tests/generate_rar4_volume_fixtures.sh = Generates RAR4 multi-volume corpus (store + compressed) via pinned rar 6.21; unrar-verified
 	tests/generate_rar5_solid_fixture.sh = One-time generator: RAR5 solid fixture with cross-file matches; asserts output really is solid
 	tests/generate_streaming_fixtures.sh = Generates RAR5 entries far larger than their -md128k dictionary (text + x86-filter) for streaming verification
+	tests/generate_v70_corpus.sh = Deterministic drandomz-seeded RAR7 v70 corpus generator (local cache, 8GiB-window class)
 	tests/generate_wrap_filter_fixture.sh = Solid RAR5 x86 fixture whose filter region straddles the window wrap (GH #15)
 ]

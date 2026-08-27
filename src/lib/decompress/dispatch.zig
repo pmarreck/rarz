@@ -34,7 +34,7 @@ pub const SolidSession = struct {
     inner: Inner,
     /// Window exponent this session was built with. A later entry needing a
     /// larger dictionary cannot reuse the session's window.
-    dict_bits: u5,
+    dict_bits: u6,
 
     const Inner = union(enum) {
         v20: unpack20.Session,
@@ -65,7 +65,7 @@ pub const SolidSession = struct {
         allocator: std.mem.Allocator,
         compression: rar5_headers.CompressionInfo,
     ) DecompressError!SolidSession {
-        const dict_bits = getDictBitsRar5(compression);
+        const dict_bits = try getDictBitsRar5(compression);
         return .{
             .inner = .{
                 .v50 = unpack50.Session.init(
@@ -97,7 +97,7 @@ pub const SolidSession = struct {
     }
 
     pub fn acceptsRar5(self: *const SolidSession, compression: rar5_headers.CompressionInfo) bool {
-        return self.inner == .v50 and getDictBitsRar5(compression) == self.dict_bits;
+        return self.inner == .v50 and (getDictBitsRar5(compression) catch return false) == self.dict_bits;
     }
 
     /// Decode one entry, emitting its bytes to `out`.
@@ -142,17 +142,35 @@ pub const SolidSession = struct {
     }
 };
 
-/// RAR5 encodes the window exponent as an offset from 17.
-fn getDictBitsRar5(compression: rar5_headers.CompressionInfo) u5 {
-    const raw_bits: u8 = @as(u8, compression.dict_bits) + 17;
-    return if (raw_bits > 31) 31 else @intCast(raw_bits);
+/// Largest window this build will allocate: 8 GiB (2^33). Above it we REFUSE
+/// as unsupported rather than clamp — decoding with a smaller window than the
+/// encoder used produces wrong bytes presented as a verdict, which is how
+/// this used to behave (silent clamp at 2 GiB; unxed GH #17).
+pub const MAX_WINDOW_BITS: u6 = 33;
+
+/// The DECLARED RAR5/7 window in bytes (arcread.cpp:871-878): base
+/// 0x20000 << dict_bits, plus win/32 per fraction unit for v70-format headers
+/// (including FCI_RAR5_COMPAT ones, whose STREAM is v50 but whose window math
+/// stays v70-shaped — the reference reassigns the version only after).
+pub fn windowSizeRar5(compression: rar5_headers.CompressionInfo) u64 {
+    var win: u64 = @as(u64, 0x20000) << compression.dict_bits;
+    if (compression.algo_version == 70 or compression.rar5_compat)
+        win += win / 32 * compression.dict_frac_bits;
+    return win;
 }
 
-/// The window this library will ALLOCATE to decode the entry — the number an
-/// admission estimator can budget against before any decode runs. Derived from
-/// the same functions the decoders use, so it cannot drift from reality.
-pub fn windowSizeRar5(compression: rar5_headers.CompressionInfo) u64 {
-    return @as(u64, 1) << getDictBitsRar5(compression);
+/// The window exponent this build will ALLOCATE for the entry: the declared
+/// size rounded UP to a power of two. Rounding up is strictly safe with our
+/// monotonic window positions — a larger buffer only retains MORE history —
+/// and it is what lets fractional (non-power-of-two) RAR7 dictionaries decode
+/// without a modulo on the hot path.
+fn getDictBitsRar5(compression: rar5_headers.CompressionInfo) DecompressError!u6 {
+    if (compression.algo_version != 50 and compression.algo_version != 70)
+        return error.UnsupportedVersion; // unknown future algorithm
+    const win = windowSizeRar5(compression);
+    const bits: u6 = @intCast(64 - @clz(win - 1));
+    if (bits > MAX_WINDOW_BITS) return error.UnsupportedVersion;
+    return @max(bits, 17);
 }
 
 /// RAR4 sibling of `windowSizeRar5`.
@@ -176,7 +194,7 @@ pub fn decompressRar5(
 ) DecompressError![]u8 {
     if (compression.method == 0) return error.UnsupportedMethod; // store is handled directly
 
-    const dict_bits = getDictBitsRar5(compression);
+    const dict_bits = try getDictBitsRar5(compression);
 
     return unpack50.decompress(allocator, packed_data, unpacked_size, compression.algo_version, dict_bits) catch |err| {
         return switch (err) {
@@ -202,7 +220,7 @@ pub fn decompressRar5ToSink(
 ) DecompressError!void {
     if (compression.method == 0) return error.UnsupportedMethod; // store is handled directly
 
-    const dict_bits = getDictBitsRar5(compression);
+    const dict_bits = try getDictBitsRar5(compression);
     const is_rar7 = compression.algo_version == 70;
 
     var session = unpack50.Session.init(allocator, is_rar7, dict_bits) catch return error.OutOfMemory;
@@ -420,6 +438,7 @@ test "decompressRar5 rejects store method" {
         .method = 0,
         .dict_bits = 0,
         .dict_frac_bits = 0,
+        .rar5_compat = false,
     };
     try testing.expectError(error.UnsupportedMethod, decompressRar5(testing.allocator, &[_]u8{}, 0, comp));
 }

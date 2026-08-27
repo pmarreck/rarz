@@ -202,10 +202,12 @@ blanket-INVALID one.
   mirrors. Multimedia is an inline mode *within* v20, covered since 2026-07-30
   by `rar2_v20_mm.rar`. Producing a distinct v26 stream needs a >2 GB member and
   would exercise no new decoder path.
-- **RAR5 / UnpVer 70** — the flag that distinguishes it from v50 (`ExtraDist`,
-  unpack.cpp:184) IS implemented as `is_rar7`. Every rar 7.20 option probed
-  validates, but no stream positively identified as v70 was isolated, so
-  end-to-end coverage stays unproven rather than claimed.
+- **RAR5/7 / UnpVer 70** — RESOLVED 2026-08-27: deterministic local corpus
+  (drandomz-seeded A-B-A, 7.07 GB, -md=6784m) is the first positively
+  identified v70 stream; validates + refuses mutations via
+  tests/cli/test_v70_corpus.sh. En route: is_rar7 was DEAD CODE (raw 0/1 vs
+  70 comparison), version-blind dict parse fixed, u64 distances, fractional
+  dictionaries via next-pow2 window rounding, refuse-not-clamp above 8 GiB.
 
 ### Where old encoders can and cannot come from (measured 2026-08-06)
 

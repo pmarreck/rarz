@@ -1560,9 +1560,9 @@ test "encode_compression_info: method 3 with dict_bits=3 (1MB)" {
 	const info = encode_compression_info(3, 3);
 	// Round-trip through the parser
 	const parsed = rar5_headers.parse_compression_info(info);
-	try testing.expectEqual(@as(u6, 0), parsed.algo_version);
+	try testing.expectEqual(@as(u8, 50), parsed.algo_version);
 	try testing.expectEqual(@as(u3, 3), parsed.method);
-	try testing.expectEqual(@as(u4, 3), parsed.dict_bits);
+	try testing.expectEqual(@as(u5, 3), parsed.dict_bits);
 	try testing.expect(!parsed.solid);
 }
 

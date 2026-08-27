@@ -53,11 +53,22 @@ pub const MainBlock = struct {
 };
 
 pub const CompressionInfo = struct {
-	algo_version: u6,
+	/// NORMALISED unpack version: 50 or 70 (raw field values 0 and 1), or the
+	/// raw value verbatim for unknown future algorithms (2..63) so callers can
+	/// refuse rather than guess. FCI_RAR5_COMPAT normalises to 50: a RAR7
+	/// header carrying a RAR5 stream decodes as v50 (the reference reassigns
+	/// UnpVer AFTER the v70-shaped window computation).
+	algo_version: u8,
 	solid: bool,
 	method: u3, // 0=store, 1-5=compression
-	dict_bits: u4,
-	dict_frac_bits: u4,
+	/// Window exponent code. 4 bits for v50, 5 for v70 — the mask depends on
+	/// the version in the same field (arcread.cpp:871).
+	dict_bits: u5,
+	/// v70 only: 5-bit window fraction at shift 15 (arcread.cpp:874). Always 0
+	/// for v50 — bit 14 is FCI_DICT_BIT4 territory, not fraction.
+	dict_frac_bits: u5,
+	/// FCI_RAR5_COMPAT (0x100000) was present.
+	rar5_compat: bool,
 };
 
 pub const FileBlock = struct {
@@ -128,12 +139,18 @@ pub fn parse_header_flags(raw: u64) HeaderFlags {
 
 /// Extract compression info bit fields from a raw vint value.
 pub fn parse_compression_info(raw: u64) CompressionInfo {
+	const raw_algo: u8 = @intCast(raw & 0x3F); // bits 0-5
+	const compat = (raw & 0x100000) != 0; // FCI_RAR5_COMPAT
+	const is_v70 = raw_algo == 1;
 	return .{
-		.algo_version = @intCast(raw & 0x3F), // bits 0-5
+		.algo_version = if (raw_algo == 0) 50 else if (is_v70) (if (compat) @as(u8, 50) else 70) else raw_algo,
 		.solid = ((raw >> 6) & 1) != 0, // bit 6
 		.method = @intCast((raw >> 7) & 0x7), // bits 7-9
-		.dict_bits = @intCast((raw >> 10) & 0xF), // bits 10-13
-		.dict_frac_bits = @intCast((raw >> 14) & 0xF), // bits 14-17
+		// arcread.cpp:871: `(CompInfo>>10) & (UnpVer==0 ? 0x0f : 0x1f)`
+		.dict_bits = @intCast((raw >> 10) & @as(u64, if (is_v70) 0x1F else 0x0F)),
+		// arcread.cpp:874: v70-only 5-bit fraction at shift 15.
+		.dict_frac_bits = if (is_v70) @intCast((raw >> 15) & 0x1F) else 0,
+		.rar5_compat = compat,
 	};
 }
 
@@ -553,11 +570,12 @@ test "parse_header_flags extracts all bits" {
 test "parse_compression_info extracts bit fields" {
 	// Test store: method=0, algo_version=0, no solid, dict_bits=0
 	const store = parse_compression_info(0);
-	try testing.expectEqual(@as(u6, 0), store.algo_version);
+	// Raw algo 0 normalises to 50; see the version-aware test below.
+	try testing.expectEqual(@as(u8, 50), store.algo_version);
 	try testing.expect(!store.solid);
 	try testing.expectEqual(@as(u3, 0), store.method);
-	try testing.expectEqual(@as(u4, 0), store.dict_bits);
-	try testing.expectEqual(@as(u4, 0), store.dict_frac_bits);
+	try testing.expectEqual(@as(u5, 0), store.dict_bits);
+	try testing.expectEqual(@as(u5, 0), store.dict_frac_bits);
 
 	// Test compressed: algo_version=0, solid=true, method=3, dict_bits=10, dict_frac_bits=2
 	// bits: 000000 = algo(0), 1 = solid, 011 = method(3), 1010 = dict(10), 0010 = frac(2)
@@ -570,11 +588,14 @@ test "parse_compression_info extracts bit fields" {
 	// bits 14-17: 0b0010 = 2
 	const raw: u64 = (0 << 0) | (1 << 6) | (3 << 7) | (10 << 10) | (2 << 14);
 	const comp = parse_compression_info(raw);
-	try testing.expectEqual(@as(u6, 0), comp.algo_version);
+	try testing.expectEqual(@as(u8, 50), comp.algo_version);
 	try testing.expect(comp.solid);
 	try testing.expectEqual(@as(u3, 3), comp.method);
-	try testing.expectEqual(@as(u4, 10), comp.dict_bits);
-	try testing.expectEqual(@as(u4, 2), comp.dict_frac_bits);
+	// v50 masks FOUR dict bits (arcread.cpp:871) — bit 14 is not dict, and
+	// v50 has no fraction field at all. The old expectations here encoded the
+	// version-blind parse.
+	try testing.expectEqual(@as(u5, 10), comp.dict_bits);
+	try testing.expectEqual(@as(u5, 0), comp.dict_frac_bits);
 }
 
 test "parse_block_header reads CRC + vint fields" {
@@ -1022,4 +1043,42 @@ test "walk_blocks iterates through blocks" {
 	// No more blocks
 	const block3 = try iter.next();
 	try testing.expectEqual(@as(?ArchiveBlock, null), block3);
+}
+
+test "compression info is VERSION-AWARE: v50 masks 4 dict bits, v70 masks 5 plus fraction" {
+	// Reference arcread.cpp:871-878. The exponent mask depends on the
+	// algorithm version in the SAME field: `(CompInfo>>10) & (UnpVer==0 ?
+	// 0x0f : 0x1f)`, and the 5-bit fraction at shift 15 exists for v70 only.
+	// A version-blind parse cannot be correct for both.
+
+	// v50, dict code 13: bits 0-5 algo=0, dict bits 10-13 = 13.
+	const v50 = parse_compression_info(0 | (13 << 10));
+	try testing.expectEqual(@as(u8, 50), v50.algo_version);
+	try testing.expectEqual(@as(u5, 13), v50.dict_bits);
+	try testing.expectEqual(@as(u5, 0), v50.dict_frac_bits);
+
+	// v50 with bit 14 set: NOT a dict bit for v50; must not leak in.
+	const v50b = parse_compression_info(0 | (13 << 10) | (1 << 14));
+	try testing.expectEqual(@as(u5, 13), v50b.dict_bits);
+
+	// v70 (raw algo 1), dict code 21 (needs bit 4 = FCI_DICT_BIT4), frac 9.
+	const v70 = parse_compression_info(1 | (21 << 10) | (9 << 15));
+	try testing.expectEqual(@as(u8, 70), v70.algo_version);
+	try testing.expectEqual(@as(u5, 21), v70.dict_bits);
+	try testing.expectEqual(@as(u5, 9), v70.dict_frac_bits);
+	try testing.expect(!v70.rar5_compat);
+
+	// FCI_RAR5_COMPAT (bit 20): RAR7 header carrying a RAR5 STREAM. The
+	// reference computes the window with v70 rules and THEN reassigns the
+	// version to v50 — so the stream decodes as v50 while the window math
+	// stays v70-shaped.
+	const compat = parse_compression_info(1 | (18 << 10) | (1 << 20));
+	try testing.expectEqual(@as(u8, 50), compat.algo_version);
+	try testing.expect(compat.rar5_compat);
+	try testing.expectEqual(@as(u5, 18), compat.dict_bits);
+
+	// Unknown future algorithm (raw 2+): reported as-is so callers refuse
+	// rather than guess (the reference sets WinSize=0 for UnpVer>1).
+	const unk = parse_compression_info(2);
+	try testing.expectEqual(@as(u8, 2), unk.algo_version);
 }

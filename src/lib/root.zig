@@ -1792,6 +1792,7 @@ fn collectRar4FilesUnified(alloc: std.mem.Allocator, volumes: []const VolumeData
 				.solid = first_flags.solid,
 				.method = if (first.fh.method == RAR4_METHOD_STORE) 0 else 1,
 				.dict_bits = 0,
+				.rar5_compat = false,
 				.dict_frac_bits = 0,
 			},
 			.data_crc32 = last_fh.file_crc,

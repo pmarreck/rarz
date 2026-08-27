@@ -71,7 +71,7 @@ pub const Unpack50State = struct {
     dd: DecodeTable, // distances
     ldd: DecodeTable, // low distance bits
     rd: DecodeTable, // repeat lengths
-    prev_distances: [4]u32,
+    prev_distances: [4]u64,
     last_length: u32,
     written_size: u64,
     /// Streaming-output state, used ONLY for entries larger than the window.
@@ -96,7 +96,7 @@ pub const Unpack50State = struct {
     allocator: std.mem.Allocator,
     pending_filters: std.ArrayList(filters.Filter),
 
-    pub fn init(allocator: std.mem.Allocator, packed_data: []const u8, is_rar7: bool, dict_bits: u5) !Unpack50State {
+    pub fn init(allocator: std.mem.Allocator, packed_data: []const u8, is_rar7: bool, dict_bits: u6) !Unpack50State {
         return .{
             .br = BitReader.init(packed_data),
             .window = try Window.initFromBits(allocator, dict_bits),
@@ -140,25 +140,42 @@ pub fn decodeLengthSlot(br: *BitReader, slot: u32) !u32 {
     return entry.base + extra;
 }
 
+/// Wide bit read for RAR7 extended distances: DBits reaches 38, so the high
+/// part (DBits-4) can exceed the bit reader's 31-bit single-read ceiling.
+/// Sequential composition keeps the reference's bit order: earlier-read bits
+/// are the more significant ones.
+fn readWideBits(br: *BitReader, n: u6) !u64 {
+    if (n == 0) return 0;
+    if (n <= 31) return try br.readBits(@intCast(n));
+    const hi: u64 = try br.readBits(@intCast(n - 20));
+    const lo: u64 = try br.readBits(20);
+    return (hi << 20) | lo;
+}
+
 /// Decode a distance value from the DD and LDD Huffman tables.
-pub fn decodeDistance(br: *BitReader, dd: *const DecodeTable, ldd: *const DecodeTable) !u32 {
+///
+/// u64 throughout (reference unpack50.cpp:76-118): RAR7's DCX=80 slots
+/// declare distances up to 1 TB, and slot codes above 62 overflow 32 bits —
+/// the u32 version of this function could not represent the >4 GiB match
+/// distances the v70 corpus actually contains.
+pub fn decodeDistance(br: *BitReader, dd: *const DecodeTable, ldd: *const DecodeTable) !u64 {
     const dist_slot: u32 = try huffman.decodeNumber(br, dd);
     if (dist_slot < 4) {
-        return dist_slot + 1;
+        return @as(u64, dist_slot) + 1;
     }
 
-    const extra_bits: u5 = @intCast(dist_slot / 2 - 1);
-    var distance: u32 = (2 | (dist_slot & 1)) << extra_bits;
+    const extra_bits: u6 = @intCast(dist_slot / 2 - 1);
+    var distance: u64 = @as(u64, 2 | (dist_slot & 1)) << extra_bits;
 
     if (extra_bits < 4) {
-        distance += try br.readBits(extra_bits);
+        distance += try br.readBits(@intCast(extra_bits));
     } else {
-        // For long distances, read most bits normally, last 4 from LDD table
-        const high_extra: u5 = extra_bits - 4;
+        // High part first, then the low 4 bits from the LDD table.
+        const high_extra: u6 = extra_bits - 4;
         if (high_extra > 0) {
-            distance += try br.readBits(high_extra) << 4;
+            distance += (try readWideBits(br, high_extra)) << 4;
         }
-        const low_bits: u32 = try huffman.decodeNumber(br, ldd);
+        const low_bits: u64 = try huffman.decodeNumber(br, ldd);
         distance += low_bits;
     }
 
@@ -620,7 +637,7 @@ fn decodeBlock(state: *Unpack50State, unpacked_size: u64) !bool {
 pub const Session = struct {
     state: Unpack50State,
 
-    pub fn init(allocator: std.mem.Allocator, is_rar7: bool, dict_bits: u5) !Session {
+    pub fn init(allocator: std.mem.Allocator, is_rar7: bool, dict_bits: u6) !Session {
         return .{ .state = try Unpack50State.init(allocator, &.{}, is_rar7, dict_bits) };
     }
 
@@ -761,8 +778,8 @@ pub fn decompress(
     allocator: std.mem.Allocator,
     packed_data: []const u8,
     unpacked_size: u64,
-    algo_version: u6,
-    dict_bits: u5,
+    algo_version: u8,
+    dict_bits: u6,
 ) ![]u8 {
     const is_rar7 = (algo_version == 70);
 

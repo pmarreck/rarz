@@ -23,7 +23,7 @@ pub const Window = struct {
     }
 
     /// Initialize from dict_bits (e.g., 20 means 1MB dictionary).
-    pub fn initFromBits(allocator: std.mem.Allocator, dict_bits: u5) !Window {
+    pub fn initFromBits(allocator: std.mem.Allocator, dict_bits: u6) !Window {
         const dict_size: usize = @as(usize, 1) << dict_bits;
         return init(allocator, dict_size);
     }

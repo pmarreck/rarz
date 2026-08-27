@@ -694,38 +694,61 @@ pub const Session = struct {
             return;
         }
 
-        // Apply pending filters to the window data in place.
-        // (unrar applies filters during streaming output via UnpWriteBuf; we
-        // apply them once the entry is complete, which is equivalent for entries
-        // that fit the window — the same bound `emitTo` enforces below.)
-        for (st.pending_filters.items) |filter| {
-            if (filter.block_length > 0 and filter.block_start + filter.block_length <= st.window.write_pos) {
-                const start = filter.block_start & st.window.mask;
-                // Only apply if the region doesn't wrap around the circular buffer
-                if (start + filter.block_length <= st.window.buffer.len) {
-                    const region = st.window.buffer[start .. start + filter.block_length];
-                    // E8/E8E9 relocate branch targets using the block's offset
-                    // WITHIN THE FILE. block_start is a window position, and in a
-                    // solid stream the window does not restart per entry, so the
-                    // two differ by everything decoded before this entry. Passing
-                    // the raw window position would mis-relocate every branch —
-                    // the same defect as v29's R[6], which cost 97% -> 100%.
-                    const file_offset = filter.block_start - start_pos;
-                    try filters.applyFilter(region, filter, @intCast(file_offset), st.allocator);
-                }
-            }
-        }
-
         const out_size: usize = @intCast(@min(unpacked_size, st.written_size));
         // A trailing match may overshoot the declared size, so measure how far
         // the cursor actually moved rather than assuming it moved out_size.
         const consumed = st.window.write_pos - start_pos;
-        if (!st.window.emitTo(out, consumed, out_size)) {
-            // The entry is larger than the window, so its opening bytes have
-            // already been overwritten. Refusing beats handing back the bytes
-            // that occupy those slots now.
+
+        var has_filters = false;
+        for (st.pending_filters.items) |f| {
+            if (f.block_length > 0) has_filters = true;
+        }
+
+        if (!has_filters) {
+            // No filters: stream straight out of the window, no staging.
+            if (!st.window.emitTo(out, consumed, out_size)) {
+                // The entry is larger than the window, so its opening bytes
+                // have already been overwritten. Refusing beats handing back
+                // the bytes that occupy those slots now.
+                return error.CorruptData;
+            }
+            return;
+        }
+
+        // Filters MUST be applied on a staged copy, never in the window. The
+        // reference filters into a separate output pass (UnpWriteBuf) and the
+        // window keeps the RAW LZ bytes — in a solid stream, later entries'
+        // matches reach back into earlier entries' window regions, so
+        // filtering in place (as this code once did) corrupts every entry
+        // that follows a filtered one: unrar OK, rarz "payload CRC32
+        // mismatch" on 3 of 4 entries of the solid x86 fixture. Staging also
+        // makes wrapped regions (unxed's GH #15) a non-case, since the copy
+        // is linear in FILE coordinates. unpack29 has used this exact pattern
+        // all along.
+        const staged = try st.allocator.alloc(u8, out_size);
+        defer st.allocator.free(staged);
+        var staged_sink = sink.BufferSink.init(staged);
+        if (!st.window.emitTo(staged_sink.sink(), consumed, out_size)) {
             return error.CorruptData;
         }
+        for (st.pending_filters.items) |filter| {
+            if (filter.block_length == 0) continue;
+            // E8/E8E9 relocate branch targets using the block's offset WITHIN
+            // THE FILE. block_start is a window-stream position; in a solid
+            // stream the two differ by everything decoded before this entry.
+            const file_offset = filter.block_start - start_pos;
+            // A filter region outside the entry's decoded range means our
+            // block geometry disagrees with the stream. Refuse rather than
+            // transform the wrong bytes.
+            if (file_offset + filter.block_length > out_size) return error.CorruptData;
+            try filters.applyFilter(
+                staged[file_offset .. file_offset + filter.block_length],
+                filter,
+                @intCast(file_offset),
+                st.allocator,
+            );
+        }
+        out.write(staged);
     }
 };
 

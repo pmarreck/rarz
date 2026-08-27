@@ -186,7 +186,7 @@ LZ branch in RAR3 extends RAR2 style with:
 - token `257` VM filter command (`ReadVMCode`).
 - token `258` full repeat of last match.
 - token `259..262` old-distance repeats with new length.
-- token `263..271` short-distance 2-byte matches.
+- token `263..270` short-distance 2-byte matches.
 - token `>=271` full length/distance matches.
 
 Citations:

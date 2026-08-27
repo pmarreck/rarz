@@ -19,3 +19,4 @@ inbox/
 
 # session handoff docs (skill: handoff)
 HANDOFF*
+tests/fixtures_large/

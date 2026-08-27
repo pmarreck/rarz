@@ -95,6 +95,12 @@ below was checked against HEAD, not taken on faith.
   work. Witness: all 1539 entries of the 1115.6 MB archive verify in 23.9 s
   wall (unrar: 39.1 s); fixtures byte-identical; 12/12 mutations refused.
   (2026-08-27 14:50 EDT)
+- [x] Header encryption (-hp) now reported truthfully (Peter, 2026-08-27):
+  detected pre-walk in both families; was FALSE DAMAGE ("header CRC mismatch"
+  on ciphertext) and the C summary even said VERIFIED over zero entries. Now
+  UNVERIFIABLE + Info line, exit 69, summary INCOMPLETE,
+  `rarz_header_encrypted()` exported. Gate G over committed fixtures.
+  (2026-08-27 15:40 EDT)
 - [ ] PPM heap is NOT in the pre-decode memory budget: a PPM block declares
   its own sub-allocator size (up to 256 MiB) inside the compressed stream.
   Documented in the gate doc; decide with validate whether to expose a

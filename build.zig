@@ -162,6 +162,10 @@ pub fn build(b: *std.Build) void {
 	// fixture is text and never reached audio mode, so these are the first.
 	unit_tests.root_module.addAnonymousImport("rar2_v20_audio_mono", .{ .root_source_file = b.path("tests/fixtures/rar2_v20_audio_mono.rar") });
 	unit_tests.root_module.addAnonymousImport("rar2_v20_audio_stereo", .{ .root_source_file = b.path("tests/fixtures/rar2_v20_audio_stereo.rar") });
+	// Header-encrypted (-hp) archives (generate_hp_fixtures.sh): must be
+	// reported as not-covered, never as damage.
+	unit_tests.root_module.addAnonymousImport("rar5_hp", .{ .root_source_file = b.path("tests/fixtures/rar5_hp.rar") });
+	unit_tests.root_module.addAnonymousImport("rar4_hp", .{ .root_source_file = b.path("tests/fixtures/rar4_hp.rar") });
 	unit_tests.root_module.addAnonymousImport("rar5_store", .{ .root_source_file = b.path("tests/fixtures/rar5_store.rar") });
 	// Minimal v29-compressed archives — 87 and 162 bytes. Small enough to trace
 	// bit-by-bit against the reference decoder when unpack29 misbehaves.

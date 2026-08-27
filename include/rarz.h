@@ -342,6 +342,13 @@ int32_t rarz_verify_archive(const rarz_archive *archive,
  */
 uint64_t rarz_max_dictionary_size(const rarz_archive *archive);
 
+/**
+ * 1 when the archive uses -hp header encryption: the headers themselves are
+ * ciphertext, so entries cannot be enumerated without a password. Treat as
+ * NOT COVERED (INFO/WARN in a consumer's vocabulary), never as damage.
+ */
+uint8_t rarz_header_encrypted(const rarz_archive *archive);
+
 #ifdef __cplusplus
 }
 #endif

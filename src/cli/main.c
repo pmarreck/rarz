@@ -779,8 +779,18 @@ static int cmd_test(const char *path) {
 					printf("  Error: %s\n", result.error_msg);
 			}
 
-			printf("Validation: %s\n", result.is_valid ? "VALID" : "INVALID");
-			ret = result.is_valid ? 0 : 1;
+			/* -hp is a property, not damage: INVALID here would repeat the
+			 * false-damage claim this path used to make ("header CRC mismatch"
+			 * on ciphertext). UNVERIFIABLE + INFO states what is known. */
+			if (!result.is_valid && result.error_msg &&
+			    strstr(result.error_msg, "headers are encrypted")) {
+				printf("Validation: UNVERIFIABLE\n");
+				printf("Info: header encryption (-hp) is not covered without a password\n");
+				ret = EX_UNAVAILABLE;
+			} else {
+				printf("Validation: %s\n", result.is_valid ? "VALID" : "INVALID");
+				ret = result.is_valid ? 0 : 1;
+			}
 		}
 
 		for (int i = 0; i < vs.count; i++) free(vol_bufs[i]);
@@ -814,8 +824,17 @@ static int cmd_test(const char *path) {
 			printf("  Error: %s\n", result.error_msg);
 	}
 
-	printf("Validation: %s\n", result.is_valid ? "VALID" : "INVALID");
-	int ret = result.is_valid ? 0 : 1;
+	int ret;
+	/* See the volume path above: -hp is a property, not damage. */
+	if (!result.is_valid && result.error_msg &&
+	    strstr(result.error_msg, "headers are encrypted")) {
+		printf("Validation: UNVERIFIABLE\n");
+		printf("Info: header encryption (-hp) is not covered without a password\n");
+		ret = EX_UNAVAILABLE;
+	} else {
+		printf("Validation: %s\n", result.is_valid ? "VALID" : "INVALID");
+		ret = result.is_valid ? 0 : 1;
+	}
 
 	free(data);
 	free_volume_set(&vs);
@@ -910,6 +929,16 @@ static int cmd_verify(const char *path) {
 	 * parser for it, so it yielded zero entries and `verify` printed
 	 * "Verified 0 files" and exited 0 on a file it had not looked at. */
 	if (count == 0) {
+		if (rarz_header_encrypted(archive)) {
+			printf("  %-10s headers are encrypted (-hp); nothing can be enumerated\n", "UNVERIFIED");
+			printf("Info: header encryption is not covered without a password\n");
+			rarz_close(archive);
+			for (int i = 0; i < vs.count; i++) free(vol_bufs[i]);
+			free(vol_bufs);
+			free(vol_lens);
+			free_volume_set(&vs);
+			return EX_UNAVAILABLE;
+		}
 		printf("  %-10s no entries could be enumerated in this archive\n", "UNVERIFIED");
 		printf("Verified 0 files, 1 unverifiable\n");
 		rarz_close(archive);

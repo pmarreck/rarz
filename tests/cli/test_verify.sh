@@ -334,6 +334,38 @@ for row in $ENCRYPTION_CORPUS; do
 	esac
 done
 echo ""
+echo "=== Gate G: header encryption (-hp) is INFO/not-covered, never damage ==="
+# The prior behavior CRC-checked ciphertext as headers: "header CRC mismatch",
+# INVALID — false damage on archives unrar opens fine with the password.
+for name in rar5_hp rar4_hp; do
+	f="$FIXTURES/$name.rar"
+	[ -f "$f" ] || { fail "$name: fixture missing"; continue; }
+
+	t_out=$("$RARZ" t "$f" 2>&1)
+	t_rc=$?
+	if echo "$t_out" | grep -q "Validation: UNVERIFIABLE"; then
+		ok "$name: t reports UNVERIFIABLE"
+	else
+		fail "$name: t did not report UNVERIFIABLE ($(echo "$t_out" | tail -1))"
+	fi
+	if echo "$t_out" | grep -qi "Info:.*not covered"; then
+		ok "$name: t prints the not-covered info line"
+	else
+		fail "$name: t missing info line"
+	fi
+	if echo "$t_out" | grep -qE "INVALID|CRC mismatch"; then
+		fail "$name: t still claims damage"
+	else
+		ok "$name: no damage claim"
+	fi
+	[ "$t_rc" -eq 69 ] && ok "$name: t exit 69 (EX_UNAVAILABLE)" || fail "$name: t exit $t_rc, want 69"
+
+	"$RARZ" verify "$f" >/dev/null 2>&1
+	v_rc=$?
+	[ "$v_rc" -eq 69 ] && ok "$name: verify exit 69" || fail "$name: verify exit $v_rc, want 69"
+done
+
+echo ""
 echo "Results: $pass passed, $errors failed"
 
 if [ "$errors" -gt 0 ]; then

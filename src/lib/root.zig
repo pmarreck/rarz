@@ -101,6 +101,9 @@ const ArchiveHandle = struct {
 	/// Entry index `solid_session` is ready to decode next. A request for any
 	/// other index means the session must be rewound and replayed.
 	solid_next_index: u32,
+	/// 1 when -hp header encryption was detected at open: nothing is
+	/// enumerable, and that is a property of the archive, not damage.
+	header_encrypted: u8 = 0,
 
 	fn deinit(self: *ArchiveHandle) void {
 		if (self.solid_session) |*s| s.deinit();
@@ -210,6 +213,14 @@ export fn rarz_open(data_ptr: ?[*]const u8, len: usize) ?*ArchiveHandle {
 		.solid_session = null,
 		.solid_next_index = 0,
 	};
+
+	// -hp: the blocks are ciphertext. Parsing them as headers fails noisily
+	// (or worse, quietly wrongly); record the truth and skip collection.
+	handle.header_encrypted = @intFromBool(policy.headers_encrypted(slice, format, family));
+	if (handle.header_encrypted != 0) {
+		clearLastError();
+		return handle;
+	}
 
 	const alloc = handle.arena.allocator();
 
@@ -1287,6 +1298,14 @@ export fn rarz_max_dictionary_size(archive: ?*const ArchiveHandle) u64 {
 	return 0;
 }
 
+/// 1 when the archive uses -hp header encryption: headers are ciphertext, so
+/// entries cannot be enumerated without a password. Callers should treat the
+/// archive as NOT COVERED (INFO/WARN), never as damaged.
+export fn rarz_header_encrypted(archive: ?*const ArchiveHandle) u8 {
+	const a = archive orelse return 0;
+	return a.header_encrypted;
+}
+
 /// Verify every entry and publish a complete, additive archive summary.
 ///
 /// Return value equals `out_summary.status`. A damaged result takes precedence
@@ -1317,6 +1336,14 @@ export fn rarz_verify_archive(
 		.format_supported = @intFromBool(a.family != .rar14),
 		.encrypted_entry_count = 0,
 	};
+
+	// -hp: nothing enumerable. Without this branch, zero entries fell through
+	// to VERIFIED — a false pass over an archive we could not read at all.
+	if (a.header_encrypted != 0) {
+		summary.status = ARCHIVE_VERIFY_INCOMPLETE;
+		setLastError("archive headers are encrypted (-hp); contents cannot be verified without a password");
+		return summary.status;
+	}
 
 	// RAR 1.4 is recognised but has no parser. Zero enumerated entries is an
 	// incomplete result for that family, not a vacuous success.
@@ -2399,6 +2426,39 @@ test "rarz_max_dictionary_size reports the window the decoder will allocate" {
 	const r14_archive = rarz_open(&rar14, rar14.len) orelse return error.TestUnexpectedResult;
 	defer rarz_close(r14_archive);
 	try testing.expectEqual(@as(u64, 0), rarz_max_dictionary_size(r14_archive));
+}
+
+test "header-encrypted archives are not-covered, never damaged and never blessed" {
+	// -hp encrypts the HEADERS: nothing is enumerable without a password. Two
+	// wrong answers existed: policy CRC-checked ciphertext as headers and said
+	// "header CRC mismatch" (false damage), while the summary API said
+	// VERIFIED over zero entries (false pass). The only truthful verdict is
+	// INCOMPLETE with the reason stated.
+	const cases = [_]struct { name: []const u8, bytes: []const u8 }{
+		.{ .name = "rar5_hp", .bytes = @embedFile("rar5_hp") },
+		.{ .name = "rar4_hp", .bytes = @embedFile("rar4_hp") },
+	};
+	for (cases) |fx| {
+		const archive = rarz_open(fx.bytes.ptr, fx.bytes.len) orelse {
+			std.debug.print("{s}: open failed\n", .{fx.name});
+			return error.TestUnexpectedResult;
+		};
+		defer rarz_close(archive);
+		try testing.expectEqual(@as(u8, 1), rarz_header_encrypted(archive));
+		var summary: RarzVerifyArchiveSummary = undefined;
+		const status = rarz_verify_archive(archive, &summary);
+		if (status != ARCHIVE_VERIFY_INCOMPLETE) {
+			std.debug.print("{s}: status={d}, want INCOMPLETE\n", .{ fx.name, status });
+			return error.TestUnexpectedResult;
+		}
+		// policy verdict: must NOT claim damage evidence ("header CRC mismatch")
+		const vr = policy.validate(fx.bytes);
+		try testing.expect(!vr.is_valid);
+		try testing.expect(vr.has_encrypted_content);
+		const msg = vr.error_message orelse return error.TestUnexpectedResult;
+		try testing.expect(std.mem.indexOf(u8, msg, "encrypted") != null);
+		try testing.expect(std.mem.indexOf(u8, msg, "CRC") == null);
+	}
 }
 
 test "archives unrar tests clean are not reported damaged" {

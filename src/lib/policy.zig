@@ -1184,6 +1184,21 @@ pub fn validate(data: []const u8) ValidationResult {
 		return invalid_result(null, "no recognized RAR signature");
 	};
 
+	// Header encryption (-hp) makes the BLOCKS themselves ciphertext. Walking
+	// them as if they were headers produced "header CRC mismatch" — a damage
+	// claim about an intact archive we merely cannot read. Detect it first and
+	// say what it is.
+	if (headers_encrypted(data, fmt, family)) {
+		return .{
+			.is_valid = false,
+			.family = family,
+			.has_encrypted_content = true,
+			.error_message = "archive headers are encrypted (-hp); contents cannot be verified without a password",
+			.block_count = 0,
+			.file_count = 0,
+		};
+	}
+
 	// Step 2+3: Validate based on family
 	return switch (family) {
 		// RAR 1.4 has no parser here, so nothing about the file has been
@@ -1545,9 +1560,16 @@ test "validate detects encrypted content" {
 	pos += build_rar5_block(archive[pos..], 5, 0, end_body[0..end_body_len]);
 
 	const result = validate(archive[0..pos]);
-	try testing.expect(result.is_valid);
-
+	// MHD_PASSWORD on the MAIN header IS -hp for RAR4: every following block
+	// is ciphertext. The old expectation here (is_valid = true) blessed an
+	// archive whose contents cannot even be enumerated. The truthful verdict
+	// is not-valid + encrypted + a message naming the reason — and never a
+	// CRC complaint, which would claim damage we cannot know about.
+	try testing.expect(!result.is_valid);
 	try testing.expect(result.has_encrypted_content);
+	const msg = result.error_message orelse return error.TestUnexpectedResult;
+	try testing.expect(std.mem.indexOf(u8, msg, "encrypted") != null);
+	try testing.expect(std.mem.indexOf(u8, msg, "CRC") == null);
 }
 
 test "validate detects RAR5 per-file encryption record (type 0x01)" {
@@ -1983,9 +2005,14 @@ test "validate detects RAR4 encrypted content via main password flag" {
 	pos += end_len;
 
 	const result = validate(archive[0..pos]);
-	try testing.expect(result.is_valid);
-
+	// MHD_PASSWORD on MAIN is RAR4's -hp: the blocks that follow are
+	// ciphertext. Truthful verdict: not-valid + encrypted + a message naming
+	// the reason, never a CRC damage claim.
+	try testing.expect(!result.is_valid);
 	try testing.expect(result.has_encrypted_content);
+	const msg = result.error_message orelse return error.TestUnexpectedResult;
+	try testing.expect(std.mem.indexOf(u8, msg, "encrypted") != null);
+	try testing.expect(std.mem.indexOf(u8, msg, "CRC") == null);
 }
 
 // --- Test: validate returns full depth for compressed file with valid CRC ---
@@ -2583,4 +2610,32 @@ test "validate: a genuine RAR 2.x archive with no end-of-archive block is VALID"
 	const data: []const u8 = @embedFile("rar2_v20_store");
 	const result = validate(data);
 	try testing.expect(result.is_valid);
+}
+
+/// Detect RAR "-hp" header encryption pre-walk: RAR5 opens with a HEAD_CRYPT
+/// block (type 4); RAR4 sets MHD_PASSWORD (0x0080) on the MAIN header. Both
+/// mean every subsequent block is ciphertext — unreadable, not damaged.
+pub fn headers_encrypted(data: []const u8, fmt: detect_mod.FormatResult, family: detect_mod.RarFamily) bool {
+	switch (family) {
+		.rar50 => {
+			const block_start = fmt.signature_offset + fmt.signature_len;
+			if (block_start >= data.len) return false;
+			// HEAD_CRYPT exists ONLY for header encryption; everything after it
+			// is ciphertext. Real -hp archives place it first, but any position
+			// means the same thing, so scan rather than peek.
+			var iter = rar5_headers.walk_blocks(data[block_start..]);
+			while (iter.next() catch return false) |block| {
+				if (block == .crypt) return true;
+				if (block == .end_archive) break;
+			}
+			return false;
+		},
+		.rar15 => {
+			var r = reader_mod.Reader.init(data[fmt.signature_offset + fmt.signature_len ..]);
+			const block = rar4_headers.parse_block_header(&r) catch return false;
+			if (block.header_type != .main) return false;
+			return rar4_headers.parse_main_flags(block.flags).password;
+		},
+		.rar14 => return false,
+	}
 }

@@ -14,6 +14,7 @@ annotate=[
 	tests/fixtures/rar2_v20_md64_large.rar = RAR 2.90 entry far larger than its 64KB dictionary; exposed the v20 table-refresh desync
 	tests/generate_encryption_fixtures.sh = Generates the none/mixed/all encryption classifier corpus (RAR4 via pinned rar 6.21, RAR5 via flake rar); unrar-verified
 	tests/generate_filter_fixtures.sh = Generates x86-filter and >4MB-window fixtures for the two false-positive classes found by differential sweep
+	tests/generate_hp_fixtures.sh = Header-encrypted (-hp) fixtures for both families; the not-covered-not-damage gate
 	tests/generate_mixed_encryption_fixture.sh = One-time generator: RAR5 archive with one plain + one encrypted entry (mixed-encryption false-pass regression)
 	tests/generate_ppm_fixtures.sh = Generates RAR3 PPMd text-compression fixtures via rar 6.21 -mct+; exposed the stand-in PPMd
 	tests/generate_rar2_audio_fixtures.sh = RAR 2.90 -mm PCM fixtures that genuinely enter audio mode (GH #6)

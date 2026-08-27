@@ -29,6 +29,13 @@ for f in "$FIXTURES"/*.rar; do
 		continue
 	fi
 
+	# Header-encrypted fixtures are UNVERIFIABLE by design: `rarz t` reports
+	# UNVERIFIABLE and exits 69, which is the correct verdict, not a failure.
+	# Their own gate is test_verify.sh Gate G.
+	case "$name" in
+		rar4_hp.rar|rar5_hp.rar) continue ;;
+	esac
+
 	# rarz t should succeed on all official archives
 	if ! "$RARZ" t "$f" >/dev/null 2>&1; then
 		fail "rarz t failed on $name"

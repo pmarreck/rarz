@@ -148,6 +148,18 @@ fn getDictBitsRar5(compression: rar5_headers.CompressionInfo) u5 {
     return if (raw_bits > 31) 31 else @intCast(raw_bits);
 }
 
+/// The window this library will ALLOCATE to decode the entry — the number an
+/// admission estimator can budget against before any decode runs. Derived from
+/// the same functions the decoders use, so it cannot drift from reality.
+pub fn windowSizeRar5(compression: rar5_headers.CompressionInfo) u64 {
+    return @as(u64, 1) << getDictBitsRar5(compression);
+}
+
+/// RAR4 sibling of `windowSizeRar5`.
+pub fn windowSizeRar4(unpack_version: u8, file_flags_raw: u16) u64 {
+    return @as(u64, 1) << getDictBitsRar4(unpack_version, file_flags_raw);
+}
+
 /// Decompress a RAR5/7 compressed file entry.
 ///
 /// `packed_data`: the raw compressed payload bytes from the archive
@@ -167,6 +179,35 @@ pub fn decompressRar5(
     const dict_bits = getDictBitsRar5(compression);
 
     return unpack50.decompress(allocator, packed_data, unpacked_size, compression.algo_version, dict_bits) catch |err| {
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.EndOfData => error.EndOfData,
+            error.InvalidTable => error.InvalidTable,
+            else => error.CorruptData,
+        };
+    };
+}
+
+/// Decode a RAR5/7 entry into a caller-supplied sink without materialising the
+/// decoded bytes. This is what lets verification stay bounded by the
+/// dictionary window whatever the entry's size — the buffer-returning
+/// `decompressRar5` above allocates `unpacked_size`, which is exactly the
+/// allocation a no-size-cap verifier cannot afford.
+pub fn decompressRar5ToSink(
+    allocator: std.mem.Allocator,
+    packed_data: []const u8,
+    unpacked_size: u64,
+    compression: rar5_headers.CompressionInfo,
+    out: Sink,
+) DecompressError!void {
+    if (compression.method == 0) return error.UnsupportedMethod; // store is handled directly
+
+    const dict_bits = getDictBitsRar5(compression);
+    const is_rar7 = compression.algo_version == 70;
+
+    var session = unpack50.Session.init(allocator, is_rar7, dict_bits) catch return error.OutOfMemory;
+    defer session.deinit();
+    session.decodeFile(packed_data, unpacked_size, false, out) catch |err| {
         return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             error.EndOfData => error.EndOfData,
@@ -226,6 +267,55 @@ pub fn decompressRar4(
         },
         else => error.UnsupportedVersion,
     };
+}
+
+/// Decode a RAR4-family entry into a caller-supplied sink without
+/// materialising the decoded bytes. Sibling of `decompressRar5ToSink`; see the
+/// rationale there.
+pub fn decompressRar4ToSink(
+    allocator: std.mem.Allocator,
+    packed_data: []const u8,
+    unpacked_size: u64,
+    unpack_version: u8,
+    method: u8,
+    file_flags_raw: u16,
+    out: Sink,
+) DecompressError!void {
+    if (method == 0) return error.UnsupportedMethod; // store
+
+    const dict_bits = getDictBitsRar4(unpack_version, file_flags_raw);
+
+    switch (unpack_version) {
+        29, 36 => {
+            var session = unpack29.Session.init(allocator, dict_bits) catch return error.OutOfMemory;
+            defer session.deinit();
+            session.decodeFile(packed_data, unpacked_size, false, out) catch |err| {
+                return switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    error.EndOfData => error.EndOfData,
+                    error.InvalidTable => error.InvalidTable,
+                    error.UnsupportedFilter => error.UnsupportedFilter,
+                    error.CorruptPpmData => error.CorruptPpmData,
+                    else => error.CorruptData,
+                };
+            };
+        },
+        20, 26 => {
+            var session = unpack20.Session.init(allocator, dict_bits) catch return error.OutOfMemory;
+            defer session.deinit();
+            session.decodeFile(packed_data, unpacked_size, false, out) catch |err| {
+                return switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    error.EndOfData => error.EndOfData,
+                    error.InvalidTable => error.InvalidTable,
+                    else => error.CorruptData,
+                };
+            };
+        },
+        // v15 has no producer corpus (PLAN.md 2026-08-06); its one-shot path
+        // stays the only one until real archives exist to gate a sink path.
+        else => return error.UnsupportedVersion,
+    }
 }
 
 /// Derive the dictionary size exponent from RAR4 file header fields.

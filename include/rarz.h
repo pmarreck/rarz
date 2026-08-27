@@ -325,6 +325,23 @@ typedef struct {
 int32_t rarz_verify_archive(const rarz_archive *archive,
 							rarz_verify_archive_summary *out_summary);
 
+/**
+ * Largest dictionary window this library will allocate to decode any entry of
+ * this archive, in bytes — computed from the parsed headers alone, no decode.
+ *
+ * Verification's peak anonymous memory is this window plus fixed decoder and
+ * hash state, INDEPENDENT of archive or entry size: entries larger than the
+ * window stream through it (multi-volume verification additionally reassembles
+ * the entry's PACKED bytes contiguously). An admission estimator enforcing a
+ * memory ceiling should budget against this instead of any archive-size cap.
+ *
+ * RAR5 declares up to 1 GiB (spec); RAR4 up to 4 MiB; RAR7 archives may
+ * declare more. Returns 0 when no window is known (an unparsed format such as
+ * RAR 1.4, or an archive with no entries) — treat 0 as "cannot budget", never
+ * as "free".
+ */
+uint64_t rarz_max_dictionary_size(const rarz_archive *archive);
+
 #ifdef __cplusplus
 }
 #endif

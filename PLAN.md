@@ -6,17 +6,24 @@ Peter: "NOTHING is too large for deep validation, period. We figure out how to
 do it efficiently and correctly with the minimum memory used." Witnessed gap:
 a 1115.6 MB RAR made validate refuse deep validation at its 1 GiB cap.
 
-- [ ] unpack50: stream entries larger than the dictionary window (same
-  emit-once-at-the-end defect fixed in unpack29/unpack20; today an 18 MB entry
-  with a 128 KB dict is a FALSE POSITIVE — unrar OK, rarz INVALID).
-- [ ] Multi-volume verify: decode into the hashing sink instead of
-  materialising the whole decoded entry (`decompressRar5`/`decompressRar4`
-  return a full buffer today). Packed-side reassembly copy stays (bounded by
-  the entry's packed size); the unbounded DECODED side goes.
-- [ ] Expose the archive's max declared dictionary size pre-decode (new C
-  export; validate's admission estimator budgets against it).
-- [ ] Gates: differential vs unrar on the new large-entry fixture, corruption
-  sweep, and a ~1.2 GB local witness with measured peak RSS.
+- [x] unpack50: stream entries larger than the dictionary window. No look-back
+  reserve needed: RAR5 filter starts are FORWARD deltas from their descriptor
+  (reference unpack50.cpp:235), so the flush just never emits into an
+  unapplied filter's region. Gates: text + x86-filter fixtures at ~28x/~16x
+  the window verify and extract byte-identically; 15/15 mutations refused.
+  (2026-08-27 12:35 EDT)
+- [x] Multi-volume verify + validate_volumes: decode into the hashing sink
+  (`decompressRar4ToSink`/`decompressRar5ToSink`); the unbounded decoded-side
+  allocation is gone from every verification path. Packed-side reassembly
+  stays (bounded by the entry's packed size). (2026-08-27 12:38 EDT)
+- [x] `rarz_max_dictionary_size()` exported: max window from parsed headers
+  alone, 0 = "cannot budget" (RAR 1.4). Expectations traced to `unrar lt`
+  -md output, which also corrected a wrong guess (rar 6.21 sizes RAR4
+  dictionaries to the file, not to the 4 MB maximum). (2026-08-27 12:40 EDT)
+- [x] Witness: a 1.39 GB entry (43x its 32 MB window — the exact class of the
+  1115.6 MB file that hit validate's cap) verifies in 2.04 s at 65.5 MB peak
+  RSS = 33 MB archive buffer + 32 MB window + fixed state; 3/3 witness
+  mutations refused. (2026-08-27 12:43 EDT)
 - [ ] Reply to validate with the SHA + API notes.
 
 ## Coverage push: three false-positive classes closed (2026-08-05 10:50 EDT)

@@ -1034,25 +1034,31 @@ export fn rarz_verify_file(
 				wpos += chunk.length;
 			}
 
-			const decompressed = (if (uf.rar4) |r4| dispatch.decompressRar4(
+			// Decode INTO the hashing sink. Materialising the decoded entry
+			// here (the old `decompressRar4/5` + write) made multi-volume the
+			// one verify path whose memory grew with the DECODED size — the
+			// exact allocation a no-size-cap verifier cannot afford. Bounded
+			// state is now the reassembled packed stream above plus the
+			// decoder window.
+			(if (uf.rar4) |r4| dispatch.decompressRar4ToSink(
 				alloc,
 				combined,
 				uf.unpacked_size,
 				r4.unpack_version,
 				r4.method,
 				r4.flags_raw,
-			) else dispatch.decompressRar5(
+				vs.sink(),
+			) else dispatch.decompressRar5ToSink(
 				alloc,
 				combined,
 				uf.unpacked_size,
 				uf.compression,
+				vs.sink(),
 			)) catch {
 				setLastError("decompression failed");
 				res.status = VERIFY_UNSUPPORTED;
 				return VERIFY_UNSUPPORTED;
 			};
-			defer alloc.free(decompressed);
-			vs.sink().write(decompressed);
 		}
 
 		res.bytes_verified = vs.len;
@@ -1232,6 +1238,53 @@ export fn rarz_verify_file(
 
 	setLastError("archive has no verifiable entries");
 	return VERIFY_ERROR;
+}
+
+/// The largest dictionary window this library will allocate to decode any
+/// entry of this archive, in bytes — from the parsed headers alone, no decode.
+///
+/// Verification's peak anonymous memory is this window plus fixed decoder and
+/// hash state, independent of archive or entry size (multi-volume adds the
+/// entry's reassembled PACKED stream). A consumer admitting archives against a
+/// memory ceiling budgets on this instead of a blanket size cap.
+///
+/// Returns 0 when no window is known — an unparsed format (RAR 1.4) or an
+/// archive with no entries. Zero means "cannot budget", never "free".
+export fn rarz_max_dictionary_size(archive: ?*const ArchiveHandle) u64 {
+	const a = archive orelse return 0;
+	var max: u64 = 0;
+
+	if (a.unified_files) |files| {
+		for (files) |uf| {
+			if (uf.is_directory) continue;
+			const w = if (uf.rar4) |r4|
+				dispatch.windowSizeRar4(r4.unpack_version, r4.flags_raw)
+			else
+				dispatch.windowSizeRar5(uf.compression);
+			if (w > max) max = w;
+		}
+		return max;
+	}
+	if (a.rar5_files) |files| {
+		for (files) |f| {
+			if (f.is_directory) continue;
+			const w = dispatch.windowSizeRar5(f.compression);
+			if (w > max) max = w;
+		}
+		return max;
+	}
+	if (a.rar4_files) |files| {
+		for (files) |f| {
+			// A directory's window code is the LHD_DIRECTORY marker, not a
+			// dictionary; reading it as one would report a 4 MB window for
+			// archives holding only tiny files and a folder.
+			if (rar4_headers.is_directory_entry(f)) continue;
+			const w = dispatch.windowSizeRar4(f.unpack_version, f.block.flags);
+			if (w > max) max = w;
+		}
+		return max;
+	}
+	return 0;
 }
 
 /// Verify every entry and publish a complete, additive archive summary.
@@ -2299,6 +2352,42 @@ const unrar_clean_corpus = [_]struct { name: []const u8, bytes: []const u8 }{
 	.{ .name = "rar5_stream_text", .bytes = @embedFile("rar5_stream_text") },
 	.{ .name = "rar5_stream_filter", .bytes = @embedFile("rar5_stream_filter") },
 };
+
+test "rarz_max_dictionary_size reports the window the decoder will allocate" {
+	// validate's admission estimator budgets deep validation against this
+	// BEFORE any decode: peak anonymous memory for verification is this window
+	// plus fixed state, whatever the entry sizes. It must come from the parsed
+	// headers alone — paying a decode to learn the decode's cost would defeat
+	// the point.
+	const text: []const u8 = @embedFile("rar5_stream_text");
+	const t_archive = rarz_open(text.ptr, text.len) orelse return error.TestUnexpectedResult;
+	defer rarz_close(t_archive);
+	// Written with -md128k: dict_bits 0 -> 1 << 17.
+	try testing.expectEqual(@as(u64, 0x20000), rarz_max_dictionary_size(t_archive));
+
+	// Expectations traced to the oracle, not assumed: `unrar lt` prints
+	// "-md=128k" for every rar4_m3 entry (rar 6.21 sizes the dictionary to the
+	// file, so small files get small windows — NOT the 4 MB format maximum)
+	// and "-md=4m" for rar4_large_window's 5.5 MB entry. rar4_m3 also holds a
+	// directory, whose window code is the LHD_DIRECTORY marker and must not be
+	// read as a dictionary.
+	const m3: []const u8 = @embedFile("rar4_m3");
+	const m3_archive = rarz_open(m3.ptr, m3.len) orelse return error.TestUnexpectedResult;
+	defer rarz_close(m3_archive);
+	try testing.expectEqual(@as(u64, 0x20000), rarz_max_dictionary_size(m3_archive));
+
+	const lw: []const u8 = @embedFile("rar4_large_window");
+	const lw_archive = rarz_open(lw.ptr, lw.len) orelse return error.TestUnexpectedResult;
+	defer rarz_close(lw_archive);
+	try testing.expectEqual(@as(u64, 0x400000), rarz_max_dictionary_size(lw_archive));
+
+	// A recognised-but-unparsed format has no known window; claiming one
+	// would let an admission estimator budget on fiction.
+	const rar14 = [_]u8{ 0x52, 0x45, 0x7e, 0x5e, 0x00, 0x00, 0x00, 0x00 };
+	const r14_archive = rarz_open(&rar14, rar14.len) orelse return error.TestUnexpectedResult;
+	defer rarz_close(r14_archive);
+	try testing.expectEqual(@as(u64, 0), rarz_max_dictionary_size(r14_archive));
+}
 
 test "archives unrar tests clean are not reported damaged" {
 	for (unrar_clean_corpus) |fx| {

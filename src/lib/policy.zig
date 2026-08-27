@@ -841,19 +841,22 @@ fn validate_volumes_rar4(volumes: []const []const u8) ValidationResult {
 			}
 		} else {
 			// A split file cannot share a solid session with its neighbours here
-			// (its stream is reassembled), so decode it standalone.
-			const decompressed = dispatch.decompressRar4(
+			// (its stream is reassembled), so decode it standalone — into the
+			// hashing sink, so memory stays the window + packed reassembly and
+			// never the decoded size.
+			var vs = sink.VerifySink.init(false);
+			dispatch.decompressRar4ToSink(
 				alloc,
 				concat,
 				first.unpacked_size,
 				first.unpack_version,
 				first.method,
 				first.flags_raw,
+				vs.sink(),
 			) catch {
 				return rar4_volume_failure(total_block_count, file_count, unverified, "decompression failed during validation");
 			};
-			defer alloc.free(decompressed);
-			if (integrity.crc32(decompressed) != last.file_crc) {
+			if (vs.len != first.unpacked_size or vs.crc32() != last.file_crc) {
 				return rar4_volume_failure(total_block_count, file_count, unverified, "payload CRC32 mismatch");
 			}
 		}
@@ -1022,12 +1025,15 @@ pub fn validate_volumes(volumes: []const []const u8) ValidationResult {
 						};
 					}
 				} else {
-					// Compressed — decompress then CRC
-					const decompressed = dispatch.decompressRar5(
+					// Compressed — decode into the hashing sink; see the
+					// split-file branch below for why nothing is materialised.
+					var whole_vs = sink.VerifySink.init(false);
+					dispatch.decompressRar5ToSink(
 						alloc,
 						payload,
 						first.unpacked_size,
 						first.compression,
+						whole_vs.sink(),
 					) catch {
 						return .{
 							.is_valid = false,
@@ -1038,10 +1044,9 @@ pub fn validate_volumes(volumes: []const []const u8) ValidationResult {
 							.file_count = file_count,
 						};
 					};
-					defer alloc.free(decompressed);
 
-					const computed_crc = integrity.crc32(decompressed);
-					if (computed_crc != first.data_crc32.?) {
+					const computed_crc = whole_vs.crc32();
+					if (whole_vs.len != first.unpacked_size or computed_crc != first.data_crc32.?) {
 						return .{
 							.is_valid = false,
 							.family = .rar50,
@@ -1113,12 +1118,16 @@ pub fn validate_volumes(volumes: []const []const u8) ValidationResult {
 					};
 				}
 			} else {
-				// Compressed — decompress concatenated packed data, then CRC
-				const decompressed = dispatch.decompressRar5(
+				// Compressed — decode the concatenated packed data INTO the
+				// hashing sink, so memory stays the window + packed reassembly
+				// and never the decoded size.
+				var split_vs = sink.VerifySink.init(false);
+				dispatch.decompressRar5ToSink(
 					alloc,
 					concat,
 					first.unpacked_size,
 					first.compression,
+					split_vs.sink(),
 				) catch {
 					return .{
 						.is_valid = false,
@@ -1129,10 +1138,9 @@ pub fn validate_volumes(volumes: []const []const u8) ValidationResult {
 						.file_count = file_count,
 					};
 				};
-				defer alloc.free(decompressed);
 
-				const computed_crc = integrity.crc32(decompressed);
-				if (computed_crc != last.data_crc32.?) {
+				const computed_crc = split_vs.crc32();
+				if (split_vs.len != first.unpacked_size or computed_crc != last.data_crc32.?) {
 					return .{
 						.is_valid = false,
 						.family = .rar50,

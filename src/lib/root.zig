@@ -2356,6 +2356,13 @@ const unrar_clean_corpus = [_]struct { name: []const u8, bytes: []const u8 }{
 	// minutes of escape churn on the other — both in one root cause.
 	.{ .name = "rar4_ppm_xml", .bytes = @embedFile("rar4_ppm_xml") },
 	.{ .name = "rar4_ppm_prose", .bytes = @embedFile("rar4_ppm_prose") },
+	// Solid + x86 + 128 KB dict: a filter region straddling the window wrap on
+	// the fit-in-window path was silently SKIPPED -> false damage (GH #15).
+	.{ .name = "rar5_solid_wrap_filter", .bytes = @embedFile("rar5_solid_wrap_filter") },
+	// RAR 2.0 audio mode: fabricated adaptation + a wrong audio alphabet
+	// constant (298 for 257) made every real audio block a false positive.
+	.{ .name = "rar2_v20_audio_mono", .bytes = @embedFile("rar2_v20_audio_mono") },
+	.{ .name = "rar2_v20_audio_stereo", .bytes = @embedFile("rar2_v20_audio_stereo") },
 };
 
 test "rarz_max_dictionary_size reports the window the decoder will allocate" {

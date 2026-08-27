@@ -11,8 +11,16 @@ const Sink = sink.Sink;
 // RAR 2.x Constants
 // ============================================================================
 
-/// Main/control alphabet: 256 literals + 42 control codes = 298
-const MC20: u16 = 298;
+/// LZ main alphabet: 256 literals + 42 control codes = 298 (reference NC20).
+const NC20: u16 = 298;
+/// AUDIO alphabet: 256 delta symbols + the table-refresh code = 257 (reference
+/// MC20). NOT the same as NC20 — conflating the two made every audio table
+/// read consume 894 code lengths instead of 771 and split the per-channel
+/// tables at offsets of 298 instead of 257, desynchronising the bitstream at
+/// the first audio block. Found by differential BD-symbol trace against an
+/// instrumented unrar: identical symbols through event 349, then the
+/// reference stops at TableSize=771 while we kept reading.
+const MC20: u16 = 257;
 /// Distance alphabet: 48 slots
 const DC20: u16 = 48;
 /// Repeat-length alphabet: 28 slots
@@ -26,7 +34,9 @@ const BC20: u16 = 19;
 /// Number of audio channels (max 4, indexed 0-3)
 const MAX_AUDIO_CHANNELS: u8 = 4;
 
-/// Largest symbol-length table a v20 block can declare: MC20 per audio channel.
+/// Largest symbol-length table a v20 block can declare. The LZ layout
+/// (NC20+DC20+RC20 = 374) is smaller than four audio channels (4*257 = 1028),
+/// so the audio shape sizes the buffer — reference: `UnpOldTable20[MC20*4]`.
 const OLD_TABLE_SIZE: usize = @as(usize, MC20) * @as(usize, MAX_AUDIO_CHANNELS);
 
 // ============================================================================
@@ -147,96 +157,103 @@ fn distanceDecode(slot: u32, br: *BitReader) !u32 {
 // Audio Channel State (for audio mode)
 // ============================================================================
 
+/// RAR 2.0 audio-mode channel state — reference-exact (unrar unpack20.cpp
+/// `DecodeAudio`, unpack.hpp `AudioVariables`).
+///
+/// This REPLACES a fabricated model that adapted its coefficients on every
+/// sample by sign correlation with +/-32 clamps. The reference adapts every
+/// 32 SAMPLES by scanning an 11-bucket accumulator of absolute prediction
+/// differences and nudging exactly ONE coefficient toward the winning
+/// hypothesis — with asymmetric clamps ([-17, 16]: the guard is `>= -16`
+/// BEFORE decrementing). Nothing about the two schemes agrees past the
+/// first few samples, so real audio blocks decoded to garbage and clean
+/// archives were reported damaged (unxed, GH #6; corpus never held a true
+/// audio block — the mm fixture was text, which RAR 2.x does not route
+/// into audio mode).
 const AudioChannel = struct {
-    last_delta: i32 = 0,
-    d1: i32 = 0,
-    d2: i32 = 0,
-    d3: i32 = 0,
-    d4: i32 = 0,
     k1: i32 = 0,
     k2: i32 = 0,
     k3: i32 = 0,
     k4: i32 = 0,
     k5: i32 = 0,
-    last_byte: i32 = 0,
-    count: u32 = 0,
+    d1: i32 = 0,
+    d2: i32 = 0,
+    d3: i32 = 0,
+    d4: i32 = 0,
+    last_delta: i32 = 0,
+    dif: [11]u32 = [_]u32{0} ** 11,
+    byte_count: u32 = 0,
+    last_char: i32 = 0,
 
-    fn decode(self: *AudioChannel, encoded_raw: u8) u8 {
-        // Compute the predicted value using the adaptive linear predictor.
-        // The five "delta" inputs for the FIR are: d1, d2, d3, d4, and a
-        // delta-of-delta average computed from recent differences.
-        const d5: i32 = self.d1 - self.d2;
-        _ = d5;
-        const d_avg: i32 = self.d1 + self.d2 + self.d3 + self.d4;
-        _ = d_avg;
-
-        // Predicted value from 5-tap adaptive filter
-        const predicted: i32 = blk: {
-            const v = @as(i64, 8) * @as(i64, self.d1) * @as(i64, self.k1) +
-                @as(i64, 8) * @as(i64, self.d2) * @as(i64, self.k2) +
-                @as(i64, 8) * @as(i64, self.d3) * @as(i64, self.k3) +
-                @as(i64, 8) * @as(i64, self.d4) * @as(i64, self.k4) +
-                @as(i64, 8) * @as(i64, (self.d1 - self.d2)) * @as(i64, self.k5);
-            break :blk @intCast(@as(i64, @divTrunc(v, 8)) >> 8);
-        };
-
-        // Decode the encoded symbol as a signed value.
-        // RAR 2.x encodes the audio residual as:
-        //   0..127 -> positive (0..127)
-        //   128..255 -> negative (remap)
-        const encoded_signed: i32 = blk: {
-            const e: i32 = @intCast(encoded_raw);
-            if (e >= 128) {
-                break :blk e - 256;
-            }
-            break :blk e;
-        };
-
-        const decoded_byte_i32: i32 = (predicted + encoded_signed) & 0xFF;
-        const decoded_byte: u8 = @intCast(@as(u32, @bitCast(decoded_byte_i32)) & 0xFF);
-
-        // Update deltas
-        const dd: i32 = @as(i32, @intCast(decoded_byte)) -% self.last_delta;
-        self.last_delta = @intCast(decoded_byte);
-
-        // Shift deltas
+    /// `delta_raw` is the Huffman-decoded symbol (0..255); `channel_delta`
+    /// is the SHARED cross-channel delta (reference UnpChannelDelta).
+    fn decode(self: *AudioChannel, channel_delta: *i32, delta_raw: u32) u8 {
+        self.byte_count +%= 1;
         self.d4 = self.d3;
         self.d3 = self.d2;
-        self.d2 = self.d1;
-        self.d1 = dd;
+        self.d2 = self.last_delta -% self.d1;
+        self.d1 = self.last_delta;
+        var pch: i32 = 8 *% self.last_char +%
+            self.k1 *% self.d1 +% self.k2 *% self.d2 +%
+            self.k3 *% self.d3 +% self.k4 *% self.d4 +%
+            self.k5 *% channel_delta.*;
+        pch = (pch >> 3) & 0xFF;
 
-        // Adapt coefficients every sample based on sign correlation
-        const sign_dd = signOf(dd);
-        adaptCoefficient(&self.k1, sign_dd, signOf(self.d1));
-        adaptCoefficient(&self.k2, sign_dd, signOf(self.d2));
-        adaptCoefficient(&self.k3, sign_dd, signOf(self.d3));
-        adaptCoefficient(&self.k4, sign_dd, signOf(self.d4));
-        adaptCoefficient(&self.k5, sign_dd, signOf(self.d1 - self.d2));
+        const ch: u32 = @as(u32, @bitCast(pch)) -% delta_raw;
 
-        self.last_byte = decoded_byte;
-        self.count += 1;
+        // D = ((signed char)Delta) << 3, via unsigned per the reference.
+        const d_signed: i32 = @as(i8, @bitCast(@as(u8, @truncate(delta_raw))));
+        const d: i32 = @bitCast(@as(u32, @bitCast(d_signed)) << 3);
 
-        return decoded_byte;
+        self.dif[0] +%= @abs(d);
+        self.dif[1] +%= @abs(d -% self.d1);
+        self.dif[2] +%= @abs(d +% self.d1);
+        self.dif[3] +%= @abs(d -% self.d2);
+        self.dif[4] +%= @abs(d +% self.d2);
+        self.dif[5] +%= @abs(d -% self.d3);
+        self.dif[6] +%= @abs(d +% self.d3);
+        self.dif[7] +%= @abs(d -% self.d4);
+        self.dif[8] +%= @abs(d +% self.d4);
+        self.dif[9] +%= @abs(d -% channel_delta.*);
+        self.dif[10] +%= @abs(d +% channel_delta.*);
+
+        const new_delta: i32 = @as(i8, @bitCast(@as(u8, @truncate(ch -% @as(u32, @bitCast(self.last_char))))));
+        channel_delta.* = new_delta;
+        self.last_delta = new_delta;
+        self.last_char = @bitCast(ch);
+
+        if ((self.byte_count & 0x1F) == 0) {
+            var min_dif: u32 = self.dif[0];
+            var num_min: usize = 0;
+            self.dif[0] = 0;
+            for (1..11) |i| {
+                if (self.dif[i] < min_dif) {
+                    min_dif = self.dif[i];
+                    num_min = i;
+                }
+                self.dif[i] = 0;
+            }
+            switch (num_min) {
+                1 => if (self.k1 >= -16) { self.k1 -= 1; },
+                2 => if (self.k1 < 16) { self.k1 += 1; },
+                3 => if (self.k2 >= -16) { self.k2 -= 1; },
+                4 => if (self.k2 < 16) { self.k2 += 1; },
+                5 => if (self.k3 >= -16) { self.k3 -= 1; },
+                6 => if (self.k3 < 16) { self.k3 += 1; },
+                7 => if (self.k4 >= -16) { self.k4 -= 1; },
+                8 => if (self.k4 < 16) { self.k4 += 1; },
+                9 => if (self.k5 >= -16) { self.k5 -= 1; },
+                10 => if (self.k5 < 16) { self.k5 += 1; },
+                else => {},
+            }
+        }
+        return @truncate(ch);
     }
 
     fn reset(self: *AudioChannel) void {
         self.* = .{};
     }
 };
-
-fn signOf(val: i32) i32 {
-    if (val > 0) return 1;
-    if (val < 0) return -1;
-    return 0;
-}
-
-fn adaptCoefficient(k: *i32, sign_dd: i32, sign_d: i32) void {
-    if (sign_dd == sign_d) {
-        if (k.* < 32) k.* += 1;
-    } else if (sign_dd != 0 and sign_d != 0) {
-        if (k.* > -32) k.* -= 1;
-    }
-}
 
 // ============================================================================
 // Unpack20 State
@@ -282,7 +299,8 @@ const Unpack20State = struct {
     /// Previous block's symbol lengths (reference `UnpOldTable20`). v20 encodes
     /// each block as a 4-bit DELTA against this, so it must persist.
     old_table: [OLD_TABLE_SIZE]u8,
-    channel_delta: u8,
+    // Shared cross-channel prediction delta (reference UnpChannelDelta).
+    channel_delta: i32,
     tables_loaded: bool,
     audio_state: [MAX_AUDIO_CHANNELS]AudioChannel,
     allocator: std.mem.Allocator,
@@ -384,8 +402,8 @@ fn readTables(state: *Unpack20State) !void {
         br.skipBits(2);
         table_size = @intCast(@as(u32, MC20) * @as(u32, state.audio_channels));
     } else {
-        // NC20 == MC20 == 298.
-        table_size = MC20 + DC20 + RC20;
+        // LZ alphabet: NC20+DC20+RC20 = 374.
+        table_size = NC20 + DC20 + RC20;
     }
 
     // Step 3: the 20 code-length-alphabet lengths, 4 bits each. Unlike v29,
@@ -445,9 +463,9 @@ fn readTables(state: *Unpack20State) !void {
         if (state.ld.valid) huffman.freeDecodeTable(&state.ld, state.allocator);
         if (state.dd.valid) huffman.freeDecodeTable(&state.dd, state.allocator);
         if (state.rd.valid) huffman.freeDecodeTable(&state.rd, state.allocator);
-        state.ld = try huffman.makeDecodeTables(table[0..MC20], state.allocator);
-        state.dd = try huffman.makeDecodeTables(table[MC20 .. MC20 + DC20], state.allocator);
-        state.rd = try huffman.makeDecodeTables(table[MC20 + DC20 .. MC20 + DC20 + RC20], state.allocator);
+        state.ld = try huffman.makeDecodeTables(table[0..NC20], state.allocator);
+        state.dd = try huffman.makeDecodeTables(table[NC20 .. NC20 + DC20], state.allocator);
+        state.rd = try huffman.makeDecodeTables(table[NC20 + DC20 .. NC20 + DC20 + RC20], state.allocator);
     }
 
     // These lengths become the delta base for the next block.
@@ -544,7 +562,7 @@ fn unpackAudioBlock(state: *Unpack20State) !void {
             return;
         }
 
-        const decoded_byte = state.audio_state[ch].decode(@intCast(sym & 0xFF));
+        const decoded_byte = state.audio_state[ch].decode(&state.channel_delta, sym & 0xFF);
         state.window.putByte(decoded_byte);
         state.written_size += 1;
 
@@ -792,7 +810,6 @@ pub const Session = struct {
         defer st.stream_out = null;
 
         unpackLoop(st) catch |err| {
-            std.debug.print("DBG err={any} written={d} declared={d} win={d}\n", .{err, st.written_size, st.unpacked_size, st.window.buffer.len});
             // Producing the declared number of bytes and then running out of
             // input is success, not truncation.
             if (st.written_size < st.unpacked_size) {
@@ -997,34 +1014,44 @@ test "old-distance repeat (symbols 257-260) rotates distances" {
 }
 
 
-test "audio channel predictor basic decode" {
+test "audio decode traces the reference for the first samples" {
+    // Hand-traced from unrar DecodeAudio with all-zero initial state and
+    // shared channel_delta:
+    //   sample 1, Delta=42: PCh = 0 -> Ch = (0-42) & ... = 0xFFFFFFD6,
+    //     returned byte = 0xD6 (214); LastChar = -42;
+    //     ChannelDelta = LastDelta = (signed char)(Ch - 0) = -42.
+    //   sample 2, Delta=0: D1=-42, D2=-42-0=-42... wait D2=LastDelta-D1
+    //     computed BEFORE D1 update: D2 = -42 - 0 = -42? No: D2 uses the
+    //     PREVIOUS D1 (0), so D2 = -42; D1 = -42; K coefficients are all
+    //     zero so PCh = 8*LastChar = 8*(-42) = -336; (PCh>>3)&0xFF =
+    //     (-42) & 0xFF = 0xD6; Ch = 0xD6 - 0 = 0xD6 -> byte 214 again.
     var ch = AudioChannel{};
-
-    // First sample: predicted = 0 (all zeros), encoded = 42
-    // decoded = (0 + 42) & 0xFF = 42
-    const b1 = ch.decode(42);
-    try testing.expectEqual(@as(u8, 42), b1);
-
-    // Second sample: predictor should have updated state
-    // The exact value depends on the prediction, but it should not crash
-    const b2 = ch.decode(0);
-    _ = b2; // We just verify it doesn't crash
+    var cd: i32 = 0;
+    try testing.expectEqual(@as(u8, 214), ch.decode(&cd, 42));
+    try testing.expectEqual(@as(i32, -42), cd);
+    try testing.expectEqual(@as(i32, -42), ch.last_delta);
+    try testing.expectEqual(@as(u8, 214), ch.decode(&cd, 0));
+    // Second sample matched the prediction exactly (delta 0), so the
+    // cross-channel delta decays to (signed char)(0xD6 - 0xFFFFFFD6) = 0.
+    try testing.expectEqual(@as(i32, 0), cd);
 }
 
-test "audio channel predictor wrapping" {
+test "audio adaptation fires every 32 samples and clamps at [-17, 16]" {
+    // Feed a constant nonzero delta so Dif[1] (the D-D1 hypothesis) wins
+    // deterministically, then check that exactly one coefficient moved
+    // and in the reference direction, with the asymmetric lower clamp.
     var ch = AudioChannel{};
-
-    // Encode a value that wraps around
-    const b1 = ch.decode(200);
-    try testing.expectEqual(@as(u8, 200), b1);
-
-    // Feed a large encoded value that causes wrapping
-    const b2 = ch.decode(100);
-    // predicted is non-zero now, result = (predicted + 100) & 0xFF
-    // We just verify it produces some byte without crashing
-    _ = b2;
+    var cd: i32 = 0;
+    for (0..32 * 40) |_| _ = ch.decode(&cd, 7);
+    // K1 is only ever nudged by cases 1/2; the clamp allows -17 but not
+    // -18, and 16 but not 17.
+    try testing.expect(ch.k1 >= -17 and ch.k1 <= 16);
+    try testing.expect(ch.k2 >= -17 and ch.k2 <= 16);
+    try testing.expect(ch.k5 >= -17 and ch.k5 <= 16);
+    // Adaptation must actually have moved SOMETHING off zero by now.
+    const moved = ch.k1 != 0 or ch.k2 != 0 or ch.k3 != 0 or ch.k4 != 0 or ch.k5 != 0;
+    try testing.expect(moved);
 }
-
 test "decompress with zero unpacked size returns empty slice" {
     const packed_data = [_]u8{0};
     const result = try decompress(testing.allocator, &packed_data, 0, 15);
@@ -1032,48 +1059,6 @@ test "decompress with zero unpacked size returns empty slice" {
     try testing.expectEqual(@as(usize, 0), result.len);
 }
 
-test "sign function" {
-    try testing.expectEqual(@as(i32, 1), signOf(42));
-    try testing.expectEqual(@as(i32, -1), signOf(-7));
-    try testing.expectEqual(@as(i32, 0), signOf(0));
-}
-
-test "adapt coefficient increases on same sign" {
-    var k: i32 = 0;
-    adaptCoefficient(&k, 1, 1);
-    try testing.expectEqual(@as(i32, 1), k);
-
-    adaptCoefficient(&k, -1, -1);
-    try testing.expectEqual(@as(i32, 2), k);
-}
-
-test "adapt coefficient decreases on opposite sign" {
-    var k: i32 = 0;
-    adaptCoefficient(&k, 1, -1);
-    try testing.expectEqual(@as(i32, -1), k);
-
-    adaptCoefficient(&k, -1, 1);
-    try testing.expectEqual(@as(i32, -2), k);
-}
-
-test "adapt coefficient clamps at bounds" {
-    var k_high: i32 = 32;
-    adaptCoefficient(&k_high, 1, 1);
-    try testing.expectEqual(@as(i32, 32), k_high); // should not exceed 32
-
-    var k_low: i32 = -32;
-    adaptCoefficient(&k_low, 1, -1);
-    try testing.expectEqual(@as(i32, -32), k_low); // should not go below -32
-}
-
-test "adapt coefficient no change when sign is zero" {
-    var k: i32 = 5;
-    adaptCoefficient(&k, 0, 1);
-    try testing.expectEqual(@as(i32, 5), k); // dd sign is 0, no change
-
-    adaptCoefficient(&k, 1, 0);
-    try testing.expectEqual(@as(i32, 5), k); // d sign is 0, no change
-}
 
 
 test "unpack20: real RAR 2.90 store archive decodes byte-identically" {

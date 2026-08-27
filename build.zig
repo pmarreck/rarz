@@ -155,6 +155,13 @@ pub fn build(b: *std.Build) void {
 	// which is how a non-functional stand-in PPMd survived every gate.
 	unit_tests.root_module.addAnonymousImport("rar4_ppm_xml", .{ .root_source_file = b.path("tests/fixtures/rar4_ppm_xml.rar") });
 	unit_tests.root_module.addAnonymousImport("rar4_ppm_prose", .{ .root_source_file = b.path("tests/fixtures/rar4_ppm_prose.rar") });
+	// Solid RAR5 whose x86-filter region straddles the circular-window wrap
+	// while the entry FITS the window (GH #15; generate_wrap_filter_fixture.sh).
+	unit_tests.root_module.addAnonymousImport("rar5_solid_wrap_filter", .{ .root_source_file = b.path("tests/fixtures/rar5_solid_wrap_filter.rar") });
+	// RAR 2.0 AUDIO blocks (generate_rar2_audio_fixtures.sh; GH #6) — the mm
+	// fixture is text and never reached audio mode, so these are the first.
+	unit_tests.root_module.addAnonymousImport("rar2_v20_audio_mono", .{ .root_source_file = b.path("tests/fixtures/rar2_v20_audio_mono.rar") });
+	unit_tests.root_module.addAnonymousImport("rar2_v20_audio_stereo", .{ .root_source_file = b.path("tests/fixtures/rar2_v20_audio_stereo.rar") });
 	unit_tests.root_module.addAnonymousImport("rar5_store", .{ .root_source_file = b.path("tests/fixtures/rar5_store.rar") });
 	// Minimal v29-compressed archives — 87 and 162 bytes. Small enough to trace
 	// bit-by-bit against the reference decoder when unpack29 misbehaves.

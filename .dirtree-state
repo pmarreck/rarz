@@ -16,8 +16,10 @@ annotate=[
 	tests/generate_filter_fixtures.sh = Generates x86-filter and >4MB-window fixtures for the two false-positive classes found by differential sweep
 	tests/generate_mixed_encryption_fixture.sh = One-time generator: RAR5 archive with one plain + one encrypted entry (mixed-encryption false-pass regression)
 	tests/generate_ppm_fixtures.sh = Generates RAR3 PPMd text-compression fixtures via rar 6.21 -mct+; exposed the stand-in PPMd
+	tests/generate_rar2_audio_fixtures.sh = RAR 2.90 -mm PCM fixtures that genuinely enter audio mode (GH #6)
 	tests/generate_rar4_solid_fixture.sh = One-time generator: RAR4/v29 solid fixture via rar 6.21 (nixos-23.11); asserts solid AND v29
 	tests/generate_rar4_volume_fixtures.sh = Generates RAR4 multi-volume corpus (store + compressed) via pinned rar 6.21; unrar-verified
 	tests/generate_rar5_solid_fixture.sh = One-time generator: RAR5 solid fixture with cross-file matches; asserts output really is solid
 	tests/generate_streaming_fixtures.sh = Generates RAR5 entries far larger than their -md128k dictionary (text + x86-filter) for streaming verification
+	tests/generate_wrap_filter_fixture.sh = Solid RAR5 x86 fixture whose filter region straddles the window wrap (GH #15)
 ]

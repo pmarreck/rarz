@@ -26,9 +26,10 @@
 #   C. Coverage — verify must actually examine every entry unrar lists. A
 #      `verify` that silently skipped entries would pass gate A trivially.
 set -u
+source tests/support/validation-outcome.bash || exit 1
 
 RARZ="${RARZ:-zig-out/bin/rarz}"
-FIXTURES="tests/fixtures"
+FIXTURES="${FIXTURES:-tests/fixtures}"
 errors=0
 pass=0
 
@@ -58,20 +59,27 @@ TARGETS="rar5_store rar5_m3 rar5_solid rar4_store rar4_m3 rar4_v29_solid rar2_v2
 # and unrar on an intact archive. The original TARGETS list contained no volume
 # fixture, which is exactly why that shipped.
 VOLUME_TARGETS="rar5_vol_store.part1 rar5_vol_m3.part01 rar5_vol_large.part1"
+required_verify=()
+for name in $TARGETS $VOLUME_TARGETS rar4_encrypted_none rar4_encrypted_mixed rar4_encrypted_all rar5_encrypted_none rar5_encrypted_mixed rar5_encrypted_all rar4_hp rar5_hp; do
+	required_verify+=("$FIXTURES/$name.rar")
+done
+require_fixture_paths "${required_verify[@]}" || exit 1
 
 echo "=== Gate A: clean archives verify, and agree with t and unrar ==="
 
 for name in $TARGETS; do
 	f="$FIXTURES/$name.rar"
-	[ -f "$f" ] || continue
+	[ -f "$f" ] || { fail "$name: INCOMPLETE required fixture"; continue; }
 
 	out=$("$RARZ" verify "$f" 2>&1)
 	rc=$?
 
-	unrar t "$f" >/dev/null 2>&1 && u=ok || u=damaged
-	if "$RARZ" t "$f" 2>&1 | grep -q "Validation: VALID"; then t=valid; else t=invalid; fi
+	observe_unrar_test "$f"
+	observe_rarz_test "$RARZ" "$f"
+	u=$unrar_t_class
+	t=$rarz_t_class
 
-	if [ "$rc" -eq 0 ] && [ "$u" = ok ] && [ "$t" = valid ]; then
+	if [ "$rc" -eq 0 ] && [ "$u" = valid ] && [ "$t" = valid ]; then
 		ok "$name: verify exit 0, agrees with t and unrar"
 	else
 		fail "$name: verify rc=$rc, t=$t, unrar=$u — $(echo "$out" | tail -1)"
@@ -83,14 +91,16 @@ echo "=== Gate A2: multi-volume sets verify, and agree with t and unrar ==="
 
 for name in $VOLUME_TARGETS; do
 	f="$FIXTURES/$name.rar"
-	[ -f "$f" ] || continue
+	[ -f "$f" ] || { fail "$name: INCOMPLETE required fixture"; continue; }
 
 	out=$("$RARZ" verify "$f" 2>&1)
 	rc=$?
-	unrar t "$f" >/dev/null 2>&1 && u=ok || u=damaged
-	if "$RARZ" t "$f" 2>&1 | grep -q "Validation: VALID"; then t=valid; else t=invalid; fi
+	observe_unrar_test "$f"
+	observe_rarz_test "$RARZ" "$f"
+	u=$unrar_t_class
+	t=$rarz_t_class
 
-	if [ "$rc" -eq 0 ] && [ "$u" = ok ] && [ "$t" = valid ]; then
+	if [ "$rc" -eq 0 ] && [ "$u" = valid ] && [ "$t" = valid ]; then
 		ok "$name: multi-volume verify exit 0, agrees with t and unrar"
 	else
 		fail "$name: verify rc=$rc, t=$t, unrar=$u — $(echo "$out" | grep -E 'UNVERIFIED|FAIL' | head -1)"
@@ -185,7 +195,7 @@ echo "=== Gate C: verify examines every entry unrar lists ==="
 
 for name in $TARGETS; do
 	f="$FIXTURES/$name.rar"
-	[ -f "$f" ] || continue
+	[ -f "$f" ] || { fail "$name: INCOMPLETE required fixture"; continue; }
 
 	# unrar's file count (files only, not directories).
 	want=$(unrar lb "$f" 2>/dev/null | while IFS= read -r n; do
@@ -204,13 +214,21 @@ done
 echo ""
 echo "=== Gate B: a corrupted entry is reported BY NAME and exits non-zero ==="
 
+require_fixture_paths "$FIXTURES/rar5_m3.rar" "$FIXTURES/rar4_m3.rar" "$FIXTURES/rar5_solid.rar" || exit 1
 for name in rar5_m3 rar4_m3 rar5_solid; do
 	f="$FIXTURES/$name.rar"
-	[ -f "$f" ] || continue
+	# Existing first-trial positions independently confirmed as checksum damage.
+	case "$name" in
+		rar5_m3) control_offset=3747 ;;
+		rar4_m3) control_offset=4119 ;;
+		rar5_solid) control_offset=7774 ;;
+	esac
 
 	sz=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f")
 	detected=0
 	total=0
+	exercised=0
+	controls_passed=0
 	# Corrupt deep in the payload region, past the headers.
 	for i in 1 2 3 4 5; do
 		off=$(( sz / 3 + (i * 613) % (sz / 2) ))
@@ -219,22 +237,27 @@ for name in rar5_m3 rar4_m3 rar5_solid; do
 		cp "$f" "$c"
 		printf '\xA5' | dd of="$c" bs=1 seek="$off" count=1 conv=notrunc 2>/dev/null
 
-		unrar t "$c" >/dev/null 2>&1 && u=ok || u=damaged
-		[ "$u" = ok ] && continue   # unrar says fine; nothing to require
+		exercised=$((exercised + 1))
+		observe_unrar_test "$c"
+		[[ $unrar_t_class == valid ]] && continue
+		if [[ $unrar_t_class != damaged ]]; then
+			fail "$name mutation $i: reference $unrar_t_class (exit $unrar_t_status)"
+			continue
+		fi
 
 		total=$((total + 1))
 		out=$("$RARZ" verify "$c" 2>&1)
 		rc=$?
-		# Must exit non-zero AND name a failing entry, not just fail globally.
-		if [ "$rc" -ne 0 ] && echo "$out" | grep -qE '^\s+FAIL\b'; then
+		# Damage has exit 1. A partial FAIL line followed by a crash is not a verdict.
+		if [ "$rc" -eq 1 ] && echo "$out" | grep -qE '^\s+FAIL\b'; then
 			detected=$((detected + 1))
+			if [[ $off == "$control_offset" ]]; then controls_passed=$((controls_passed + 1)); fi
 		fi
 	done
 
-	if [ "$total" -eq 0 ]; then
-		continue
-	fi
-	if [ "$detected" -eq "$total" ]; then
+	if [[ $(classify_required_trials 5 "$exercised" 1 "$controls_passed") != complete ]]; then
+		fail "$name: INCOMPLETE ($exercised/5 trials, $controls_passed/1 known damage controls)"
+	elif [ "$detected" -eq "$total" ]; then
 		ok "$name: $detected/$total corruptions localised to a named entry"
 	else
 		fail "$name: only $detected/$total corruptions localised (rest not reported per-entry)"
@@ -341,9 +364,10 @@ for name in rar5_hp rar4_hp; do
 	f="$FIXTURES/$name.rar"
 	[ -f "$f" ] || { fail "$name: fixture missing"; continue; }
 
-	t_out=$("$RARZ" t "$f" 2>&1)
-	t_rc=$?
-	if echo "$t_out" | grep -q "Validation: UNVERIFIABLE"; then
+	observe_rarz_test "$RARZ" "$f"
+	t_out=$rarz_t_stdout
+	t_rc=$rarz_t_status
+	if [[ $rarz_t_class == unverifiable ]]; then
 		ok "$name: t reports UNVERIFIABLE"
 	else
 		fail "$name: t did not report UNVERIFIABLE ($(echo "$t_out" | tail -1))"

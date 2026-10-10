@@ -88,6 +88,16 @@
           echo "installed package execution passed" > $out/result
         '';
 
+        checks-classifiers = pkgs.runCommand "${pname}-validation-outcomes" {
+          nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.unrar ];
+        } ''
+          cd ${self}
+          RARZ=${rarz}/bin/rarz bash tests/cli/test_validation_outcome.sh
+          RARZ=${rarz}/bin/rarz bash tests/cli/test_required_cases.sh
+          mkdir -p $out
+          echo "validation outcome controls passed" > $out/result
+        '';
+
         checks-test = pkgs.stdenv.mkDerivation {
           pname = "${pname}-tests";
           inherit version;
@@ -134,6 +144,7 @@
 
         checks.default = checks-test;
         checks.package-smoke = checks-package;
+        checks.classifiers = checks-classifiers;
 
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [

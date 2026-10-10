@@ -91,6 +91,56 @@ pinned Zig toolchain. Native execution was checked only on Linux x86-64.
 | `x86_64-windows-gnu` | Cross-compiled, PE32+ x86-64 | Not run |
 | `aarch64-windows-gnu` | Cross-compiled, PE32+ AArch64 | Not run |
 
+## Bounded CLI outcome controls
+
+`tests/support/validation-outcome.bash` classifies recorded process outcomes
+before the bounded CLI suites count a mutation. `rarz t` requires exactly one
+stdout verdict and its matching exit status: 0/VALID, 1/INVALID, or
+69/UNVERIFIABLE. Missing, conflicting, malformed, or mismatched verdicts are
+tool errors. A verdict printed before a crash or timeout cannot count as
+damage detection. The command's VALID label retains its existing semantics;
+it does not claim that encrypted entries were decrypted.
+
+The reference classifier accepts UNRAR success status 0 and checksum-error
+status 3. UNRAR 7.20 reports some truncated service blocks with warning status
+1; only the exact stderr line `Unexpected end of archive` identifies that
+warning as structural damage. Generic warnings remain inconclusive. The
+paired classifier distinguishes detected damage, benign mutation, stricter
+rarz validation, missed damage, and inconclusive execution. Misses and
+inconclusive runs fail the bounded mutation gates.
+
+`test_validation_outcome.sh` sweeps 4,096 rarz records and 1,280 reference
+records across all 256 shell exit statuses, checks all 12 pairs of reference
+and rarz outcome categories, and runs seven small real-process controls.
+`./test` discovers it as a CLI suite; `checks.classifiers` runs it against the
+installed package in Nix. Synthetic statuses test classification only. The
+real controls cover pristine data, a payload mutation, encryption, missing
+input, and the reference tool's truncated-service-block warning.
+
+The existing solid sweep yields 36 explicit reference/rarz damage agreements.
+The 42 volume truncations yield 25 reference-confirmed damage detections and
+17 separately reported stricter rarz verdicts. The mutation positions and
+operators are unchanged. The large v70 gate is also unchanged and retains its
+older classification limits; this work does not replay its campaign or give
+it the stronger classifier's guarantees.
+
+Solid, precision-volume, and verify gates now require their declared fixture
+sets, exact nonempty trial counts, and one designated must-detect control per
+archive or volume set. `test_required_cases.sh` injects complete and incomplete
+fixture sets, zero/missing/extra trial records, and missing control results.
+It also runs the three real drivers against an empty injected corpus and
+requires an explicit incomplete failure. Other trials may still be benign or
+unadjudicated stricter results.
+
+The designated controls reuse existing trials, with fixture identities in
+`docs/evidence/rar-fixtures.sha256`. Solid controls overwrite `0xA5` at offsets
+11280 (`rar2_v20_solid`), 13305 (`rar4_v29_solid`), and 13290 (`rar5_solid`).
+Verify controls use offsets 3747 (`rar5_m3`), 4119 (`rar4_m3`), and 7774
+(`rar5_solid`), requiring reference-confirmed damage and a named FAIL with
+exit 1. Each precision-volume set designates its existing 700-byte truncation
+of the first volume. These cases were confirmed as damage by both tools;
+their presence is checked separately from the may-ignore trial counts.
+
 ## Existing evidence by feature
 
 | Feature | Replayable checks and fixtures | What they establish and what remains |
@@ -99,10 +149,10 @@ pinned Zig toolchain. Native execution was checked only on Linux x86-64.
 | RAR3/4 / v29 | `test_solid.sh`, `test_verify.sh`, `root.zig`; `rar4_m*`, `rar4_v29_*`, `rar4_large_window` | Pristine extraction comparisons and legacy deterministic mutations. |
 | RAR3 PPMd | `root.zig` pristine-corpus classifier; `rar4_ppm_xml`, `rar4_ppm_prose`; `generate_ppm_fixtures.sh` | Committed positive regressions. The historical 12/12 mutation result is described in the coverage report; the report alone is not an executable replay of those exact mutation trials. |
 | RAR2 audio | `root.zig` pristine-corpus classifier; `rar2_v20_audio_mono`, `rar2_v20_audio_stereo`; `generate_rar2_audio_fixtures.sh` | Real producer audio regressions. The historical 10/10 mutation count must not be presented as a newly replayed audio mutation campaign. |
-| RAR5 / v50 | `test_decompress.sh`, `test_verify.sh`, `test_integration.sh`; `rar5_m1` through `rar5_m5`, store/stream/filter fixtures | Method and extraction checks. Some older corruption loops have weak acceptance conditions; see below. |
+| RAR5 / v50 | `test_decompress.sh`, `test_verify.sh`, `test_integration.sh`; `rar5_m1` through `rar5_m5`, store/stream/filter fixtures | Method and extraction checks. Bounded mutation loops require explicit verdicts and fail on missed or inconclusive trials. |
 | RAR5 solid filters | `root.zig` pristine classifier; `rar5_solid_wrap_filter`; `generate_wrap_filter_fixture.sh` | Regression for corruption of shared raw decoder history by in-place output filtering. |
 | RAR5 store payload accounting | `root.zig`: `rarz_verify_archive accounts for every pristine and payload-mutated entry` | Five deterministic payload positions per nonempty file, XOR `0x01`; exactly one damaged entry and complete entry accounting are asserted. |
-| Solid v20/v29/v50 | `test_solid.sh` | Three pristine extraction comparisons and 12 fixed-byte overwrite trials per archive. The negative gate catches false acceptance, but does not distinguish every non-VALID outcome. |
+| Solid v20/v29/v50 | `test_solid.sh` | Three pristine extraction comparisons and 12 fixed-byte overwrite trials per archive, classified separately as detected, benign, stricter, missed, or inconclusive. |
 | RAR5 volumes | `test_precision_volumes.sh`, `test_volume_validate.sh`, `test_volumes.sh` | Intact sets, missing volumes, and tail truncations of 24/128/700 bytes per volume. Historical count: 42 damaged sets. |
 | RAR4 volumes | `test_rar4_volumes.sh` | Stored/compressed intact sets and one fixed-byte overwrite at two-thirds of each volume; historical count: nine damaged sets. |
 | Encryption | `root.zig` none/mixed/all classifier and header-encryption tests; `test_verify.sh` Gate G | Encrypted and unsupported content remains incomplete/unverifiable. Header encryption must not become damage or a zero-entry verified success. This does not prove decryption support. |
@@ -124,14 +174,20 @@ and mutation definitions; this index does not rename or strengthen them.
 - `test_solid.sh` writes `0xA5`; it does not XOR a single bit, and can write an
   unchanged byte. `test_v70_corpus.sh` XORs `0xA5`, changing four bits. Neither
   is the current canonical sniper operation despite legacy wording.
-- Several CLI gates classify oracle nonzero exit or absence of `VALID` as
-  rejection. Crashes, timeouts, unsupported results, and resource failures
-  require separate outcome accounting before these can support stronger
-  corruption-detection claims.
-- `test_integration.sh` logs surviving mutations without failing them;
-  `test_decompress.sh` requires only some of five mutations to be rejected.
-  Its pristine validation check searches for `VALID`, which also occurs within
-  `INVALID`. These are existing test-quality gaps, not coverage proofs.
+- The unchanged v70 gate classifies oracle nonzero exit or absence of `VALID`
+  as rejection. Its result still cannot distinguish crashes, timeouts,
+  unsupported results, and resource failures from successful damage detection.
+- The bounded mutation gates retain their legacy sampling positions and
+  fixed-byte overwrites. Explicit outcome classification improves the evidence
+  for those trials; it does not prove complete byte or format coverage.
+- A `stricter` result is an unadjudicated reference-valid/rarz-damaged
+  disagreement. It does not establish stronger correctness or the absence of
+  false positives. Each such case needs its fixture, exact mutation position,
+  and a format invariant before it can be counted as justified rejection; an
+  independently known-valid alternate belongs in a specificity regression.
+- Required-case guards cover the solid, precision-volume, and verify gates.
+  This does not establish fixture-completeness enforcement in every other
+  legacy suite or extend the controls to the unchanged v70 gate.
 - Independent producer coverage remains absent for RAR 1.4 parsing and v15
   decoding, and incomplete for some VM-filter variants such as RGB/Itanium.
 - Recovery/service/quick-open data payloads are not all hashed. Header checks

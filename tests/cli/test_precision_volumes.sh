@@ -22,9 +22,10 @@
 #   really are gone, so refusing is the defensible call). What is never
 #   allowed is the other direction.
 set -u
+source tests/support/validation-outcome.bash || exit 1
 
 RARZ="${RARZ:-zig-out/bin/rarz}"
-FIXTURES="tests/fixtures"
+FIXTURES="${FIXTURES:-tests/fixtures}"
 errors=0
 pass=0
 
@@ -46,39 +47,48 @@ trap 'rm -rf "$work"' EXIT
 
 # Volume sets in the corpus, named by their first part.
 SETS="rar5_vol_store rar5_vol_m3 rar5_vol_large"
+required_volumes=()
+for set_name in $SETS; do
+	if [[ $set_name == rar5_vol_m3 ]]; then parts=(01 02); else parts=(1 2 3 4 5 6); fi
+	for part in "${parts[@]}"; do required_volumes+=("$FIXTURES/$set_name.part$part.rar"); done
+done
+require_fixture_paths "${required_volumes[@]}" || exit 1
 
 echo "=== Precondition: intact volume sets validate, and agree with unrar ==="
 
 for set_name in $SETS; do
 	first=$(find "$FIXTURES" -maxdepth 1 -name "${set_name}.part1.rar" -o -maxdepth 1 -name "${set_name}.part01.rar" | head -1)
-	[ -n "$first" ] || continue
+	[ -n "$first" ] || { fail "$set_name: INCOMPLETE first volume"; continue; }
 
 	d="$work/intact_$set_name"
 	mkdir -p "$d"
 	find "$FIXTURES" -maxdepth 1 -name "${set_name}.part*.rar" -exec cp {} "$d/" \;
 	entry="$d/$(basename "$first")"
 
-	r=$("$RARZ" t "$entry" 2>&1 | grep -c "Validation: VALID")
-	unrar t "$entry" >/dev/null 2>&1 && u=ok || u=damaged
+	observe_rarz_test "$RARZ" "$entry"
+	observe_unrar_test "$entry"
 
-	if [ "$u" = ok ] && [ "$r" -eq 1 ]; then
+	if [[ $unrar_t_class == valid && $rarz_t_class == valid ]]; then
 		ok "$set_name: intact set VALID, agrees with unrar"
 	else
-		fail "$set_name: intact set disagrees (rarz_valid=$r unrar=$u)"
+		fail "$set_name: intact set unrar=$unrar_t_class/$unrar_t_status rarz=$rarz_t_class/$rarz_t_status"
 	fi
 done
 
 echo ""
-echo "=== Damage sweep: unrar damaged => rarz must NOT report VALID ==="
+echo "=== Damage sweep: require explicit verdicts, reject inconclusive runs ==="
 
 for set_name in $SETS; do
 	first=$(find "$FIXTURES" -maxdepth 1 -name "${set_name}.part1.rar" -o -maxdepth 1 -name "${set_name}.part01.rar" | head -1)
-	[ -n "$first" ] || continue
+	[ -n "$first" ] || { fail "$set_name: INCOMPLETE first volume"; continue; }
 	base=$(basename "$first")
+	if [[ $set_name == rar5_vol_m3 ]]; then expected_trials=6; else expected_trials=18; fi
+	controls_passed=0
 
 	total=0
-	agreed=0
-	false_pass=0
+	detected=0
+	benign=0
+	failed=0
 	stricter=0
 
 	# Copy the set ONCE and restore only the damaged volume between iterations.
@@ -107,28 +117,30 @@ for set_name in $SETS; do
 			head -c $((sz - amount)) "$target" > "$target.t" && mv "$target.t" "$target"
 
 			total=$((total + 1))
-			unrar t "$d/$base" >/dev/null 2>&1 && u=ok || u=damaged
-			if "$RARZ" t "$d/$base" 2>&1 | grep -q "Validation: VALID"; then r=valid; else r=invalid; fi
-
-			if [ "$u" = damaged ] && [ "$r" = valid ]; then
-				false_pass=$((false_pass + 1))
-				echo "      MISSED: $volname truncated by $amount — unrar damaged, rarz VALID"
-			elif [ "$u" = ok ] && [ "$r" = invalid ]; then
-				stricter=$((stricter + 1))
-			else
-				agreed=$((agreed + 1))
+			observe_unrar_test "$d/$base"
+			observe_rarz_test "$RARZ" "$d/$base"
+			pair=$(classify_mutation_pair "$unrar_t_class" "$rarz_t_class")
+			# Removing 700 bytes from the first volume is the known payload
+			# truncation control. Shorter/end-block trials may be stricter.
+			if [[ $volname == "$base" && $amount == 700 && $pair == detected ]]; then
+				controls_passed=$((controls_passed + 1))
 			fi
+			case "$pair" in
+				detected) detected=$((detected + 1)) ;;
+				benign) benign=$((benign + 1)) ;;
+				stricter) stricter=$((stricter + 1)) ;;
+				*)
+					failed=$((failed + 1))
+					fail "$volname truncated by $amount: unrar=$unrar_t_class/$unrar_t_status rarz=$rarz_t_class/$rarz_t_status"
+					;;
+			esac
 		done
 	done < <(find "$FIXTURES" -maxdepth 1 -name "${set_name}.part*.rar" | sort)
 
-	if [ "$total" -eq 0 ]; then
-		continue
-	fi
-
-	if [ "$false_pass" -eq 0 ]; then
-		ok "$set_name: $total damaged sets, 0 reported VALID ($agreed agreed, $stricter rarz-stricter)"
-	else
-		fail "$set_name: $false_pass/$total damaged sets reported VALID"
+	if [[ $(classify_required_trials "$expected_trials" "$total" 1 "$controls_passed") != complete ]]; then
+		fail "$set_name: INCOMPLETE ($total/$expected_trials trials, $controls_passed/1 known damage controls)"
+	elif [ "$failed" -eq 0 ]; then
+		ok "$set_name: $total truncations, $detected detected, $benign benign, $stricter stricter"
 	fi
 done
 

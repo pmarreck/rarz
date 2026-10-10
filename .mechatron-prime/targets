@@ -2,3 +2,4 @@
 packages.x86_64-linux.default
 checks.x86_64-linux.default
 checks.x86_64-linux.package-smoke
+checks.x86_64-linux.classifiers

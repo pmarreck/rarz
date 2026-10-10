@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 set -u
+source tests/support/validation-outcome.bash || exit 1
 
-RARZ="zig-out/bin/rarz"
+RARZ="${RARZ:-zig-out/bin/rarz}"
 FIXTURES="tests/fixtures"
 errors=0
 pass=0
+work=$(mktemp -d) || exit 1
+trap 'rm -rf "$work"' EXIT
 
 fail() {
 	echo "  FAIL: $1"
@@ -131,11 +134,11 @@ for f in "$FIXTURES"/rar5_m[1-5].rar; do
 	[ -f "$f" ] || continue
 	name=$(basename "$f")
 
-	output=$("$RARZ" t "$f" 2>&1)
-	if echo "$output" | grep -q "VALID"; then
+	observe_rarz_test "$RARZ" "$f"
+	if [[ $rarz_t_class == valid ]]; then
 		ok "$name: validation reports VALID"
 	else
-		fail "$name: validation did not report VALID"
+		fail "$name: validation $rarz_t_class (exit $rarz_t_status), expected valid"
 	fi
 done
 
@@ -154,22 +157,29 @@ for f in "$FIXTURES"/rar5_m3.rar; do
 	safe_start=16  # skip past signature + headers
 
 	detected=0
+	benign=0
+	stricter=0
 	total=5
 	for i in $(seq 1 $total); do
 		offset=$(( (seed * 31 + i * 17) % (filesize - safe_start) + safe_start ))
-		corrupt_file="/tmp/rarz_corrupt_${name}_${i}.rar"
+		corrupt_file="$work/corrupt_${name}_${i}.rar"
 		cp "$f" "$corrupt_file"
 		printf '\xFF' | dd of="$corrupt_file" bs=1 seek="$offset" count=1 conv=notrunc 2>/dev/null
 
-		if ! "$RARZ" t "$corrupt_file" >/dev/null 2>&1; then
-			((detected += 1))
-		fi
+		observe_unrar_test "$corrupt_file"
+		observe_rarz_test "$RARZ" "$corrupt_file"
+		case "$(classify_mutation_pair "$unrar_t_class" "$rarz_t_class")" in
+			detected) detected=$((detected + 1)) ;;
+			benign) benign=$((benign + 1)) ;;
+			stricter) stricter=$((stricter + 1)) ;;
+			*) fail "$name mutation $i: unrar=$unrar_t_class/$unrar_t_status rarz=$rarz_t_class/$rarz_t_status" ;;
+		esac
 
 		rm -f "$corrupt_file"
 	done
 
 	if [ "$detected" -gt 0 ]; then
-		ok "$name: detected $detected/$total corruptions"
+		ok "$name: $detected checksum-damage detections, $benign benign, $stricter stricter ($total mutations)"
 	else
 		fail "$name: detected 0/$total corruptions"
 	fi

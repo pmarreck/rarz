@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -u
+source tests/support/validation-outcome.bash || exit 1
 
-RARZ="zig-out/bin/rarz"
+RARZ="${RARZ:-zig-out/bin/rarz}"
 errors=0
 
 fail() {
@@ -37,8 +38,9 @@ else
 	if [ "$part_count" -lt 2 ]; then
 		fail "test1: expected at least 2 volumes, got $part_count"
 	else
-		output=$("$RARZ" t "$tmpdir/store.part1.rar" 2>&1)
-		if echo "$output" | grep -q "Validation: VALID"; then
+		observe_rarz_test "$RARZ" "$tmpdir/store.part1.rar"
+		output=$rarz_t_stdout
+		if [[ $rarz_t_class == valid ]]; then
 			echo "  OK: multi-volume store validation VALID ($part_count volumes)"
 		else
 			fail "test1: expected VALID, got: $output"
@@ -62,8 +64,9 @@ if [ -f "$part2" ]; then
 	part2_size=$(wc -c < "$part2" | tr -d ' ')
 	corrupt_pos=$((part2_size / 2))
 	printf '\xFF' | dd of="$part2" bs=1 seek="$corrupt_pos" conv=notrunc 2>/dev/null
-	output=$("$RARZ" t "$tmpdir/corrupt_store/store.part1.rar" 2>&1) || true
-	if echo "$output" | grep -q "Validation: INVALID"; then
+	observe_rarz_test "$RARZ" "$tmpdir/corrupt_store/store.part1.rar"
+	output=$rarz_t_stdout
+	if [[ $rarz_t_class == damaged ]]; then
 		echo "  OK: corrupted multi-volume store detected as INVALID"
 	else
 		fail "test2: expected INVALID, got: $output"
@@ -83,15 +86,17 @@ else
 	part_count=$(ls "$tmpdir"/comp.part*.rar 2>/dev/null | wc -l | tr -d ' ')
 	if [ "$part_count" -lt 2 ]; then
 		# Compressed data may fit in fewer volumes; at least check single validates
-		output=$("$RARZ" t "$tmpdir/comp.part1.rar" 2>&1)
-		if echo "$output" | grep -q "Validation: VALID"; then
+		observe_rarz_test "$RARZ" "$tmpdir/comp.part1.rar"
+		output=$rarz_t_stdout
+		if [[ $rarz_t_class == valid ]]; then
 			echo "  OK: compressed archive validates VALID ($part_count volume(s))"
 		else
 			fail "test3: expected VALID, got: $output"
 		fi
 	else
-		output=$("$RARZ" t "$tmpdir/comp.part1.rar" 2>&1)
-		if echo "$output" | grep -q "Validation: VALID"; then
+		observe_rarz_test "$RARZ" "$tmpdir/comp.part1.rar"
+		output=$rarz_t_stdout
+		if [[ $rarz_t_class == valid ]]; then
 			echo "  OK: multi-volume compressed validation VALID ($part_count volumes)"
 		else
 			fail "test3: expected VALID, got: $output"
@@ -107,8 +112,9 @@ echo "=== Test 4: Single volume validation ==="
 if ! "$RARZ" a -m0 "$tmpdir/single.rar" "$tmpdir/data/file1.txt" 2>/dev/null; then
 	fail "test4: rarz a failed"
 else
-	output=$("$RARZ" t "$tmpdir/single.rar" 2>&1)
-	if echo "$output" | grep -q "Validation: VALID"; then
+	observe_rarz_test "$RARZ" "$tmpdir/single.rar"
+	output=$rarz_t_stdout
+	if [[ $rarz_t_class == valid ]]; then
 		echo "  OK: single volume validation VALID"
 	else
 		fail "test4: expected VALID, got: $output"
@@ -120,8 +126,9 @@ fi
 # ========================================================================
 echo "=== Test 5: Volume count in output ==="
 
-output=$("$RARZ" t "$tmpdir/store.part1.rar" 2>&1) || true
-if echo "$output" | grep -q "volumes)"; then
+observe_rarz_test "$RARZ" "$tmpdir/store.part1.rar"
+output=$rarz_t_stdout
+if [[ $rarz_t_class == valid ]] && echo "$output" | grep -q "volumes)"; then
 	echo "  OK: volume count shown in output"
 else
 	fail "test5: expected volume count in output, got: $output"

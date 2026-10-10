@@ -6,8 +6,9 @@
 # extracted from the original (containing one m3-compressed entry that
 # triggers the decompression bug). See tests/fixtures/rar5_decomp_regression.rar.
 set -u
+source tests/support/validation-outcome.bash || exit 1
 
-RARZ="zig-out/bin/rarz"
+RARZ="${RARZ:-zig-out/bin/rarz}"
 FIXTURE="tests/fixtures/rar5_decomp_regression.rar"
 
 if [[ ! -f "$FIXTURE" ]]; then
@@ -16,7 +17,8 @@ if [[ ! -f "$FIXTURE" ]]; then
 fi
 
 errors=0
-output=$("$RARZ" t "$FIXTURE" 2>&1 || true)
+observe_rarz_test "$RARZ" "$FIXTURE"
+output=$rarz_t_stdout
 
 if [[ "$output" == *"payload CRC32 mismatch"* ]]; then
 	echo "FAIL: rarz reports false-positive 'payload CRC32 mismatch' on archive that unrar t says is OK"
@@ -25,8 +27,8 @@ if [[ "$output" == *"payload CRC32 mismatch"* ]]; then
 	errors=$((errors + 1))
 fi
 
-if [[ "$output" != *"Validation: VALID"* ]]; then
-	echo "FAIL: rarz did not report Validation: VALID"
+if [[ $rarz_t_class != valid ]]; then
+	echo "FAIL: rarz reported $rarz_t_class (exit $rarz_t_status), expected valid"
 	echo "Output:"
 	echo "$output" | sed 's/^/  /'
 	errors=$((errors + 1))

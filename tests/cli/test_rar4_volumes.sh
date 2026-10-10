@@ -17,6 +17,7 @@
 #      Without this, a validate_volumes that returns VALID unconditionally
 #      would pass gate A.
 set -u
+source tests/support/validation-outcome.bash || exit 1
 
 RARZ="${RARZ:-zig-out/bin/rarz}"
 FIXTURES="tests/fixtures"
@@ -41,14 +42,13 @@ for name in rar4_vol_store rar4_vol_m3; do
 	f=$(first_part "$name")
 	[ -n "$f" ] || { fail "$name: no fixture"; continue; }
 
-	unrar t "$f" >/dev/null 2>&1 && u=OK || u=damaged
-	out=$("$RARZ" t "$f" 2>&1)
-	if echo "$out" | grep -q "Validation: VALID"; then t=valid; else t=invalid; fi
+	observe_unrar_test "$f"
+	observe_rarz_test "$RARZ" "$f"
 
-	if [ "$u" = OK ] && [ "$t" = valid ]; then
+	if [[ $unrar_t_class == valid && $rarz_t_class == valid ]]; then
 		ok "$name: VALID, agrees with unrar"
 	else
-		fail "$name: unrar=$u rarz=$t — $(echo "$out" | grep -oE 'Error: .*' | head -1)"
+		fail "$name: unrar=$unrar_t_class/$unrar_t_status rarz=$rarz_t_class/$rarz_t_status"
 	fi
 
 	# verify must reach the same conclusion as t.
@@ -78,18 +78,23 @@ for name in rar4_vol_store rar4_vol_m3; do
 		mfirst=$(ls "$work/set/$name".part*.rar | sort | head -1)
 		# Only count volumes where the mutation actually damaged the archive —
 		# unrar is the arbiter of that, not us.
-		if unrar t "$mfirst" >/dev/null 2>&1; then
+		observe_unrar_test "$mfirst"
+		if [[ $unrar_t_class == valid ]]; then
 			total=$((total - 1))
 			continue
 		fi
-		if "$RARZ" t "$mfirst" 2>&1 | grep -q "Validation: VALID"; then
-			fail "$name: damage in $(basename "$vol") reported VALID"
-		else
+		observe_rarz_test "$RARZ" "$mfirst"
+		if [[ $(classify_mutation_pair "$unrar_t_class" "$rarz_t_class") == detected ]]; then
 			caught=$((caught + 1))
+		else
+			fail "$name $(basename "$vol"): unrar=$unrar_t_class/$unrar_t_status rarz=$rarz_t_class/$rarz_t_status"
 		fi
 	done
-	[ "$total" -gt 0 ] && ok "$name: $caught/$total damaged volumes refused" \
-		|| fail "$name: no mutation damaged the set — gate B proved nothing"
+	if [[ $total -gt 0 && $caught -eq $total ]]; then
+		ok "$name: $caught/$total damaged volumes detected"
+	else
+		fail "$name: $caught/$total damage detections; require a nonempty, fully detected set"
+	fi
 done
 
 echo ""

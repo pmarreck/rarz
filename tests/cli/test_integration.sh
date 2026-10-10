@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 set -u
+source tests/support/validation-outcome.bash || exit 1
 
-RARZ="zig-out/bin/rarz"
+RARZ="${RARZ:-zig-out/bin/rarz}"
 FIXTURES="tests/fixtures"
 errors=0
+work=$(mktemp -d) || exit 1
+trap 'rm -rf "$work"' EXIT
 
 fail() {
 	echo "FAIL: $1"
@@ -37,8 +40,9 @@ for f in "$FIXTURES"/*.rar; do
 	esac
 
 	# rarz t should succeed on all official archives
-	if ! "$RARZ" t "$f" >/dev/null 2>&1; then
-		fail "rarz t failed on $name"
+	observe_rarz_test "$RARZ" "$f"
+	if [[ $rarz_t_class != valid ]]; then
+		fail "$name: rarz=$rarz_t_class/$rarz_t_status, expected valid"
 	fi
 
 	# rarz l should succeed
@@ -105,27 +109,34 @@ for f in "$FIXTURES"/rar5_store.rar "$FIXTURES"/single_file.rar; do
 
 	# Skip signature region (first 8 bytes)
 	safe_start=9
+	detected=0
+	benign=0
+	stricter=0
 
 	for i in $(seq 1 5); do
 		# Deterministic offset from seed
 		offset=$(( (seed * 31 + i * 17) % (filesize - safe_start) + safe_start ))
 
 		# Create corrupted copy
-		corrupt_file="/tmp/rarz_corrupt_${name}_${i}.rar"
+		corrupt_file="$work/corrupt_${name}_${i}.rar"
 		cp "$f" "$corrupt_file"
 
 		# Flip a byte at the computed offset
 		printf '\xFF' | dd of="$corrupt_file" bs=1 seek="$offset" count=1 conv=notrunc 2>/dev/null
 
-		# rarz t should detect corruption (exit non-zero)
-		if "$RARZ" t "$corrupt_file" >/dev/null 2>&1; then
-			# Some mutations may be in the data area and not detectable without
-			# full payload verification. This is expected for "corruption_opaque" regions.
-			echo "  NOTE: $name mutation $i at offset $offset not detected (may be in opaque region)"
-		fi
+		observe_unrar_test "$corrupt_file"
+		observe_rarz_test "$RARZ" "$corrupt_file"
+		case "$(classify_mutation_pair "$unrar_t_class" "$rarz_t_class")" in
+			detected) detected=$((detected + 1)) ;;
+			benign) benign=$((benign + 1)) ;;
+			stricter) stricter=$((stricter + 1)) ;;
+			*) fail "$name mutation $i: unrar=$unrar_t_class/$unrar_t_status rarz=$rarz_t_class/$rarz_t_status" ;;
+		esac
 
 		rm -f "$corrupt_file"
 	done
+	[[ $detected -gt 0 ]] || fail "$name: mutation gate produced no confirmed damage detections"
+	printf '  %s: %s detected, %s benign, %s stricter\n' "$name" "$detected" "$benign" "$stricter"
 done
 
 # --- Summary ---

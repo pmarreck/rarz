@@ -22,12 +22,12 @@
 #   C. Corruption is still DETECTED. Gates A and B alone are satisfiable by
 #      making the decoder forgiving, which would trade a false positive for a
 #      false negative. C is differential against unrar: for each mutation we
-#      compare verdicts, and the failure condition is specifically
-#      "unrar says damaged, rarz says fine".
+#      compare verdicts and reject both missed damage and inconclusive runs.
 set -u
+source tests/support/validation-outcome.bash || exit 1
 
 RARZ="${RARZ:-zig-out/bin/rarz}"
-FIXTURES="tests/fixtures"
+FIXTURES="${FIXTURES:-tests/fixtures}"
 errors=0
 pass=0
 
@@ -65,13 +65,10 @@ find_fixture() {
 SOLID_FIXTURES=""
 for name in rar2_v20_solid.rar rar4_v29_solid.rar rar5_solid.rar; do
 	p=$(find_fixture "$name")
-	[ -n "$p" ] && SOLID_FIXTURES="$SOLID_FIXTURES $p"
+	p=${p:-"$FIXTURES/$name"}
+	SOLID_FIXTURES="$SOLID_FIXTURES $p"
 done
-
-if [ -z "$SOLID_FIXTURES" ]; then
-	echo "ERROR: no solid fixtures found"
-	exit 1
-fi
+require_fixture_paths $SOLID_FIXTURES || exit 1
 
 # =============================================================================
 # Precondition: every fixture really is solid, and really is valid.
@@ -155,12 +152,11 @@ echo "=== Gate B: rarz validates solid archives as VALID ==="
 
 for f in $SOLID_FIXTURES; do
 	name=$(basename "$f")
-	output=$("$RARZ" t "$f" 2>&1)
-	if echo "$output" | grep -q "Validation: VALID"; then
+	observe_rarz_test "$RARZ" "$f"
+	if [[ $rarz_t_class == valid ]]; then
 		ok "$name: VALID"
 	else
-		detail=$(echo "$output" | grep -i "error" | head -1)
-		fail "$name: not VALID ($detail)"
+		fail "$name: $rarz_t_class (exit $rarz_t_status), expected valid"
 	fi
 done
 
@@ -172,8 +168,8 @@ echo "=== Gate C: corruption in solid archives is still detected ==="
 
 # Gates A and B can both be satisfied by a decoder that simply stops
 # complaining. This gate is what stops that: it flips a byte deep in the payload
-# and requires rarz to reach the same verdict unrar does. The failure we care
-# about is one-directional -- unrar says damaged, rarz says fine.
+# and compares explicit verdicts. Crashes, timeouts and unsupported outcomes
+# are inconclusive and fail the gate; they cannot count as damage detection.
 for f in $SOLID_FIXTURES; do
 	name=$(basename "$f")
 	filesize=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null)
@@ -181,38 +177,54 @@ for f in $SOLID_FIXTURES; do
 	# Stay clear of the signature and the first headers; we want payload bytes.
 	safe_start=$((filesize / 4))
 	span=$((filesize - safe_start - 16))
-	[ "$span" -lt 1 ] && continue
+	if [ "$span" -lt 1 ]; then fail "$name: INCOMPLETE mutation range"; continue; fi
+	# Preregistered checksum-damage controls from the hash-pinned corpus.
+	# These are existing trial positions, overwritten with 0xA5, not new shots.
+	case "$name" in
+		rar2_v20_solid.rar) control_offset=11280 ;;
+		rar4_v29_solid.rar) control_offset=13305 ;;
+		rar5_solid.rar) control_offset=13290 ;;
+		*) fail "$name: no declared must-detect control"; continue ;;
+	esac
 
 	total=12
-	agree=0
-	false_ok=0
+	exercised=0
+	controls_passed=0
+	detected=0
+	benign=0
+	stricter=0
+	failed=0
 	for i in $(seq 1 $total); do
 		offset=$(( safe_start + (i * 7919) % span ))
 		corrupt="$(mktemp)"
 		cp "$f" "$corrupt"
-		# XOR-ish flip via a fixed byte; deterministic, no RNG in the test.
+		# Fixed-byte overwrite; the reference decides whether it caused damage.
 		printf '\xA5' | dd of="$corrupt" bs=1 seek="$offset" count=1 conv=notrunc 2>/dev/null
 
-		unrar t "$corrupt" >/dev/null 2>&1
-		unrar_ok=$?
-		"$RARZ" t "$corrupt" 2>&1 | grep -q "Validation: VALID"
-		rarz_ok=$?
-
-		# rc 0 == "considered good" for both, after the grep inversion above.
-		if [ "$unrar_ok" -ne 0 ] && [ "$rarz_ok" -eq 0 ]; then
-			# unrar: damaged. rarz: VALID. This is the dangerous direction.
-			false_ok=$((false_ok + 1))
-		else
-			agree=$((agree + 1))
+		observe_unrar_test "$corrupt"
+		observe_rarz_test "$RARZ" "$corrupt"
+		exercised=$((exercised + 1))
+		pair=$(classify_mutation_pair "$unrar_t_class" "$rarz_t_class")
+		if [[ $offset == "$control_offset" && $pair == detected ]]; then
+			controls_passed=$((controls_passed + 1))
 		fi
+		case "$pair" in
+			detected) detected=$((detected + 1)) ;;
+			benign) benign=$((benign + 1)) ;;
+			stricter) stricter=$((stricter + 1)) ;;
+			*)
+				failed=$((failed + 1))
+				fail "$name mutation $i: unrar=$unrar_t_class/$unrar_t_status rarz=$rarz_t_class/$rarz_t_status"
+				;;
+		esac
 
 		rm -f "$corrupt"
 	done
 
-	if [ "$false_ok" -eq 0 ]; then
-		ok "$name: $agree/$total mutations handled, 0 blessed-while-damaged"
-	else
-		fail "$name: $false_ok/$total mutations reported VALID while unrar reported damage"
+	if [[ $(classify_required_trials "$total" "$exercised" 1 "$controls_passed") != complete ]]; then
+		fail "$name: INCOMPLETE ($exercised/$total trials, $controls_passed/1 known damage controls)"
+	elif [ "$failed" -eq 0 ]; then
+		ok "$name: $detected detected, $benign benign, $stricter stricter ($total mutations)"
 	fi
 done
 

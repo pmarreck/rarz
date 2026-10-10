@@ -6,6 +6,9 @@ A clean-room RAR archive toolkit: parser, validator, extractor, and writer.
 
 Written in Zig with a C FFI and drop-in C CLI.
 
+See [project intent](INTENT.md) for scope and verification requirements, and
+[terminology](TERMINOLOGY.md) for format definitions.
+
 ## Status
 
 **Decompression** — extracts RAR5 archives at all compression levels (m0-m5), plus legacy RAR 1.5-4.x store-method extraction. Verified byte-perfect against independent reference extraction tooling.

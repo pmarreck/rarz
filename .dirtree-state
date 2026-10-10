@@ -1,7 +1,11 @@
 # Dirtree: Stateful directory trees in the CLI for humans and LLMs. https://github.com/pmarreck/dirtree
 ver=1.2
 annotate=[
+	INTENT.md = Project purpose, scope, constraints, and verification requirements
+	TERMINOLOGY.md = RAR format terms and signature families
+	docs/ARCHIVE_EVIDENCE_INDEX.md = Replay map for archive checks, mutation definitions, and evidence gaps
 	docs/MECHA_VALIDATE_V1_RAR_GATE.md = Measured Mecha Validate v1 support matrix, consumer summary contract, classifier evidence, and blockers
+	docs/evidence/rar-fixtures.sha256 = Content hashes of the committed archive fixture corpus
 	include/rarz.h = Stable C ABI for detection, archive inspection, validation summaries, verification, extraction, and creation
 	src/lib/decompress/sink.zig = Output sinks for decoders: Sink vtable, BufferSink (caller buffer, flags overflow), DiscardSink (counts+drops, warms solid windows)
 	tests/cli/test_build_banner.sh = --about surface + invariant 'DEBUG BUILD banner present <=> --about reports Debug'

@@ -29,4 +29,6 @@ annotate=[
 	tests/generate_streaming_fixtures.sh = Generates RAR5 entries far larger than their -md128k dictionary (text + x86-filter) for streaming verification
 	tests/generate_v70_corpus.sh = Deterministic drandomz-seeded RAR7 v70 corpus generator (local cache, 8GiB-window class)
 	tests/generate_wrap_filter_fixture.sh = Solid RAR5 x86 fixture whose filter region straddles the window wrap (GH #15)
+	tests/integration/package-smoke = Execute installed ReleaseFast CLI and verify Linux static linkage and checksum verdicts
+	tests/support/capture.bash = Vendored MIT Bash stdout, stderr and exit status capture helper
 ]

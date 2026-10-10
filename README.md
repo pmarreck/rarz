@@ -44,6 +44,13 @@ nix develop            # enter dev shell with zig + reference RAR tools
 zig build
 ```
 
+`./build` installs the optimized Nix package into `zig-out/bin`. Linux packages
+use static musl linkage, including libc/pthread support for C-hosted Zig threads.
+macOS keeps its native linkage. `./test` runs the ReleaseSafe suites and a
+separate smoke check of the installed ReleaseFast package: executable startup,
+help, pristine and damaged payloads, and a threaded compression round trip.
+Mechatron Prime CI runs the same package smoke through `checks.package-smoke`.
+
 ## Usage
 
 ### CLI

@@ -53,6 +53,9 @@ pub fn build(b: *std.Build) void {
 	// C executable that links the static library through the C FFI
 	const exe = b.addExecutable(.{
 		.name = "rarz",
+		// Ship Linux musl executables without an external loader. Keep libc
+		// enabled below: C-hosted Zig threads require its pthread startup.
+		.linkage = if (target.result.os.tag == .linux and target.result.abi.isMusl()) .static else null,
 		.root_module = b.createModule(.{
 			.target = target,
 			.optimize = optimize,

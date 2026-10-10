@@ -58,6 +58,39 @@ the packaging limitation already documented in the August baseline plan.
 The native ReleaseSafe CLI used by `./test` ran successfully. The bounded
 dependency refresh does not repair or claim resolution of that packaging gap.
 
+## Installed-package execution, October 10, 2026
+
+The Linux package now explicitly targets musl and requests static executable
+linkage while retaining libc/pthread support. The persistent
+`tests/integration/package-smoke` fails on the previous package and passes on
+the corrected ReleaseFast artifact. It executes `--about` and `--help`, accepts
+the producer-created RAR5 store fixture, rejects a one-bit payload mutation,
+and round-trips two compressed files through the C-hosted pthread path. On
+Linux it also rejects ELF artifacts with an interpreter or shared-library
+dependency. Both `./test` and the committed Mechatron Prime CI target list run
+this actual package check.
+
+The full ReleaseSafe unit and 16-suite CLI gate passed, including the existing
+v70 cases. An earlier attempt reached passing subsuites but exited 2 because
+the runner was edited while Bash was reading it; that attempt is not a passing
+master gate. The successful replacement ran with frozen sources, whose hashes
+and Git index tree matched before and after. The v70 archive also matched its
+pre-run backup afterward. Its approved job-specific memory limits were 14 GiB
+soft, 16 GiB hard, no swap, and a 2400-second timeout. The sampled cgroup peak
+was 13,363,724,288 bytes; the final completion receipt did not retain a peak.
+Neither the decoder nor the legacy mutation classifiers changed.
+
+ReleaseFast compilation succeeded for all five intended targets with the
+pinned Zig toolchain. Native execution was checked only on Linux x86-64.
+
+| Target | Compilation | Execution |
+|--------|-------------|-----------|
+| `x86_64-linux-musl` | Nix package, static ELF | Package smoke passed |
+| `aarch64-linux-musl` | Cross-compiled, static ELF | Not run |
+| `aarch64-macos` | Cross-compiled, Mach-O arm64 | Not run |
+| `x86_64-windows-gnu` | Cross-compiled, PE32+ x86-64 | Not run |
+| `aarch64-windows-gnu` | Cross-compiled, PE32+ AArch64 | Not run |
+
 ## Existing evidence by feature
 
 | Feature | Replayable checks and fixtures | What they establish and what remains |

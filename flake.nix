@@ -69,7 +69,7 @@
             mkdir -p $ZIG_GLOBAL_CACHE_DIR
             cp -r ${zigDeps}/* $ZIG_GLOBAL_CACHE_DIR/
             chmod -R u+w $ZIG_GLOBAL_CACHE_DIR
-            zig build --prefix $out -Doptimize=ReleaseFast
+            zig build --prefix $out -Doptimize=ReleaseFast ${pkgs.lib.optionalString pkgs.stdenv.isLinux "-Dtarget=${pkgs.stdenv.hostPlatform.parsed.cpu.name}-linux-musl"}
           '';
 
           installPhase = ''
@@ -78,6 +78,15 @@
             cp include/rarz.h $out/include/ || true
           '';
         };
+
+        checks-package = pkgs.runCommand "${pname}-package-smoke" {
+          nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.binutils ];
+        } ''
+          bash ${self}/tests/integration/package-smoke ${rarz}/bin/rarz
+          mkdir -p $out
+          echo "installed package execution passed" > $out/result
+        '';
 
         checks-test = pkgs.stdenv.mkDerivation {
           pname = "${pname}-tests";
@@ -124,6 +133,7 @@
         packages.default = rarz;
 
         checks.default = checks-test;
+        checks.package-smoke = checks-package;
 
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [

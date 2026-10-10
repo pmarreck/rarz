@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Execute the installed ReleaseFast artifact, including its loader and C FFI.
+set -u
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd) || exit 1
+source "$root/tests/support/capture.bash"
+rarz=${1:?usage: package-smoke /absolute/path/to/installed/rarz}
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/rarz-package-smoke.XXXXXXXX") || exit 1
+# Scratch contains only fixtures created by this invocation.
+trap 'rm -rf "$scratch"' EXIT
+errors=0
+out= err= rc=0
+
+check() {
+	local label=$1 expected_rc=$2 expected_line=$3
+	shift 3
+	capture timeout 30 "$rarz" "$@"
+	if [[ $rc == "$expected_rc" ]] && grep -Fxq -- "$expected_line" <<< "$out"; then
+		printf 'PASS: %s\n' "$label"
+	else
+		printf 'FAIL: %s (exit %s, expected %s; expected line: %s)\n' "$label" "$rc" "$expected_rc" "$expected_line"
+		errors=$((errors + 1))
+	fi
+}
+
+capture timeout 30 "$rarz" --about
+if [[ $rc == 0 && $out == rarz\ *ReleaseFast* && $out != *$'\n'* && -z $err ]]; then
+	printf 'PASS: installed ReleaseFast --about\n'
+else
+	printf 'FAIL: installed ReleaseFast --about (exit %s)\n' "$rc"
+	errors=$((errors + 1))
+fi
+check '--help' 0 'Usage:' --help
+check 'pristine producer fixture' 0 'Validation: VALID' t "$root/tests/fixtures/rar5_store.rar"
+
+# Byte 0x80 is inside medium.txt's stored payload (originally 0x45).
+# Alter a private copy, preserving all archive headers and stored checksums.
+cp "$root/tests/fixtures/rar5_store.rar" "$scratch/damaged.rar" || exit 1
+chmod u+w "$scratch/damaged.rar" || exit 1
+printf '\104' | dd of="$scratch/damaged.rar" bs=1 seek=128 count=1 conv=notrunc status=none || exit 1
+check 'one-bit payload damage' 1 'Validation: INVALID' t "$scratch/damaged.rar"
+
+# Two nonempty entries select the C-hosted pthread compression path.
+cd "$scratch" || exit 1
+printf 'First pthread payload\n' > one.txt
+printf 'Second pthread payload\n' > two.txt
+capture timeout 30 "$rarz" a -m3 threaded.rar one.txt two.txt
+if [[ $rc == 0 ]]; then
+	capture timeout 30 "$rarz" x threaded.rar extracted
+	if [[ $rc == 0 ]] && cmp -s one.txt extracted/one.txt && cmp -s two.txt extracted/two.txt; then
+		printf 'PASS: C-hosted parallel compression preserves both payloads\n'
+	else
+		printf 'FAIL: threaded archive extraction or payload comparison (exit %s)\n' "$rc"
+		errors=$((errors + 1))
+	fi
+else
+	printf 'FAIL: C-hosted parallel compression (exit %s)\n' "$rc"
+	errors=$((errors + 1))
+fi
+
+if [[ $(uname -s) == Linux ]]; then
+	capture readelf -l -d "$rarz"
+	if [[ $rc == 0 ]] && ! grep -Eq 'INTERP|\(NEEDED\)' <<< "$out"; then
+		printf 'PASS: Linux package needs no dynamic loader or shared libraries\n'
+	else
+		printf 'FAIL: Linux package must be statically linked\n'
+		errors=$((errors + 1))
+	fi
+fi
+
+[[ $errors == 0 ]]

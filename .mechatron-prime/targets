@@ -1,3 +1,4 @@
-# Release artifact and its independent ReleaseSafe test derivation.
+# Release artifact, ReleaseSafe unit tests, and installed-package execution.
 packages.x86_64-linux.default
 checks.x86_64-linux.default
+checks.x86_64-linux.package-smoke

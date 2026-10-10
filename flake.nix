@@ -25,7 +25,7 @@
 
         isDarwin = pkgs.stdenv.isDarwin;
 
-        zigDepsHash = "sha256-KrwTu200E7aiyP2PUTQLx6umntZTBWBxt3Bohx0wyBM=";
+        zigDepsHash = "sha256-LVJqd/hSp1YI2XQqsFRXLfXomoM3SDP02ppmhr7D/Us=";
 
         zigDeps = pkgs.stdenv.mkDerivation {
           pname = "${pname}-zig-deps";

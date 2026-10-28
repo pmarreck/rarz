@@ -1268,6 +1268,7 @@ pub fn validate(data: []const u8) ValidationResult {
 
 	// Step 2+3: Validate based on family
 	return switch (family) {
+		.rar5_recovery => invalid_result(.rar5_recovery, "RAR5 recovery volumes are recognized; recovery data verification is not supported"),
 		// RAR 1.4 has no parser here, so nothing about the file has been
 		// examined. That must REFUSE, not pass.
 		//
@@ -2715,7 +2716,7 @@ pub fn headers_encrypted(data: []const u8, fmt: detect_mod.FormatResult, family:
 			if (!rar4_headers.validate_header_crc(data[fmt.signature_offset + fmt.signature_len ..], block)) return false;
 			return rar4_headers.parse_main_flags(block.flags).password;
 		},
-		.rar14 => return false,
+		.rar14, .rar5_recovery => return false,
 	}
 }
 

@@ -13,6 +13,16 @@ directory records after their children. The CLI now follows that order for
 top-level and nested directories, so directory permissions and times are
 restored after descendant creation. Empty directories retain their records.
 
+A subsequent complete run exposed a traversal-order-dependent UNRAR failure
+when an empty directory appeared first: names ending in `/` could produce
+"Cannot create directory" with "File exists". Directory names now omit that
+suffix, matching the producer; the directory flag retains their type. The
+attribute-set test compares exact names without normalizing away this defect.
+Failure diagnostics and fixtures are retained for investigation.
+The corrected names passed 64 isolated disk-backed repetitions in both store
+and compressed modes, followed by complete 475-unit/CLI/v70 acceptance with
+the recovery-volume changes.
+
 An independent CLI regression first failed for store and compressed archives,
 then isolated the remaining directory failure after the host-value correction.
 The checks require UNRAR to identify all entries as Unix and restore nonempty

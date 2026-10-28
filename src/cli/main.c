@@ -383,7 +383,7 @@ static int entry_list_add_file(entry_list *list, const char *archive_name,
 
 /**
  * Add a directory entry to the list.
- * archive_name should include trailing '/'.
+ * archive_name omits a trailing slash; the directory flag carries the type.
  */
 static int entry_list_add_dir(entry_list *list, const char *archive_name, struct stat *st) {
 	uint32_t mtime;
@@ -466,7 +466,7 @@ static int walk_directory(entry_list *list, const char *fs_path, const char *arc
 			char dir_archive[4096];
 			snprintf(dir_archive, sizeof(dir_archive), "%s/", child_archive);
 			if (walk_directory(list, child_path, dir_archive) != 0 ||
-			    entry_list_add_dir(list, dir_archive, &st) != 0) {
+			    entry_list_add_dir(list, child_archive, &st) != 0) {
 				closedir(dir);
 				return -1;
 			}
@@ -722,6 +722,7 @@ static const char *format_name(int32_t family) {
 	case 14: return "RAR1.4";
 	case 15: return "RAR1.5-4.x";
 	case 50: return "RAR5";
+	case 51: return "RAR5 recovery volume";
 	default: return "unknown";
 	}
 }
@@ -792,7 +793,7 @@ static int cmd_test(const char *path) {
 		printf("Note: encrypted entries were not verified; any unencrypted entries were (use \x27rarz verify\x27 for a per-entry report)\n");
 			}
 
-			if (!result.is_valid) {
+			if (!result.is_valid && result.family != 51) {
 				printf("Result: INVALID\n");
 				if (result.error_msg)
 					printf("  Error: %s\n", result.error_msg);
@@ -801,7 +802,11 @@ static int cmd_test(const char *path) {
 			/* -hp is a property, not damage: INVALID here would repeat the
 			 * false-damage claim this path used to make ("header CRC mismatch"
 			 * on ciphertext). UNVERIFIABLE + INFO states what is known. */
-			if (!result.is_valid && result.error_msg &&
+			if (result.family == 51) {
+				printf("Validation: UNVERIFIABLE\n");
+				printf("Info: recovery data verification is not supported\n");
+				ret = EX_UNAVAILABLE;
+			} else if (!result.is_valid && result.error_msg &&
 			    strstr(result.error_msg, "headers are encrypted")) {
 				printf("Validation: UNVERIFIABLE\n");
 				printf("Info: header encryption (-hp) is not covered without a password\n");
@@ -845,7 +850,11 @@ static int cmd_test(const char *path) {
 
 	int ret;
 	/* See the volume path above: -hp is a property, not damage. */
-	if (!result.is_valid && result.error_msg &&
+	if (result.family == 51) {
+		printf("Validation: UNVERIFIABLE\n");
+		printf("Info: recovery data verification is not supported\n");
+		ret = EX_UNAVAILABLE;
+	} else if (!result.is_valid && result.error_msg &&
 	    strstr(result.error_msg, "headers are encrypted")) {
 		printf("Validation: UNVERIFIABLE\n");
 		printf("Info: header encryption (-hp) is not covered without a password\n");
@@ -948,6 +957,8 @@ static int cmd_verify(const char *path) {
 	 * parser for it, so it yielded zero entries and `verify` printed
 	 * "Verified 0 files" and exited 0 on a file it had not looked at. */
 	if (count == 0) {
+		if (rarz_archive_format(archive) == 51)
+			printf("Info: recovery data verification is not supported\n");
 		if (rarz_header_encrypted(archive)) {
 			printf("  %-10s headers are encrypted (-hp); nothing can be enumerated\n", "UNVERIFIED");
 			printf("Info: header encryption is not covered without a password\n");
@@ -1552,7 +1563,7 @@ static int cmd_add(int argc, char **argv) {
 			char dir_archive[4096];
 			snprintf(dir_archive, sizeof(dir_archive), "%s/", dir_base);
 			if (walk_directory(&list, clean_path, dir_archive) != 0 ||
-			    entry_list_add_dir(&list, dir_archive, &st) != 0) {
+			    entry_list_add_dir(&list, dir_base, &st) != 0) {
 				fprintf(stderr, "error: cannot add directory '%s'\n", path);
 				progrez_finish(pctx);
 				progrez_destroy(pctx);

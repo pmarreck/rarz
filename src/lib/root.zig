@@ -163,6 +163,7 @@ export fn rarz_detect_format(data_ptr: ?[*]const u8, len: usize) i32 {
 		.rar14 => @as(i32, 14),
 		.rar15 => @as(i32, 15),
 		.rar50 => @as(i32, 50),
+		.rar5_recovery => @as(i32, 51),
 	} else 0;
 }
 
@@ -174,6 +175,7 @@ export fn rarz_detect_format_sfx(data_ptr: ?[*]const u8, len: usize, max_sfx_off
 		.rar14 => @as(i32, 14),
 		.rar15 => @as(i32, 15),
 		.rar50 => @as(i32, 50),
+		.rar5_recovery => @as(i32, 51),
 	} else 0;
 }
 
@@ -242,8 +244,8 @@ export fn rarz_open(data_ptr: ?[*]const u8, len: usize) ?*ArchiveHandle {
 				return null;
 			};
 		},
-		.rar14 => {
-			// RAR 1.4 is too ancient — leave files empty
+		.rar14, .rar5_recovery => {
+			// Recognized containers without a file-entry parser remain incomplete.
 		},
 	}
 
@@ -261,6 +263,7 @@ export fn rarz_archive_format(archive: ?*const ArchiveHandle) i32 {
 		.rar14 => @as(i32, 14),
 		.rar15 => @as(i32, 15),
 		.rar50 => @as(i32, 50),
+		.rar5_recovery => @as(i32, 51),
 	};
 }
 
@@ -403,6 +406,7 @@ export fn rarz_validate(data_ptr: ?[*]const u8, len: usize) RarzValidationResult
 		.rar14 => @as(i32, 14),
 		.rar15 => @as(i32, 15),
 		.rar50 => @as(i32, 50),
+		.rar5_recovery => @as(i32, 51),
 	} else 0;
 
 	// All error messages from policy.validate are compile-time string literals,
@@ -458,6 +462,7 @@ export fn rarz_validate_volumes(
 		.rar14 => @as(i32, 14),
 		.rar15 => @as(i32, 15),
 		.rar50 => @as(i32, 50),
+		.rar5_recovery => @as(i32, 51),
 	} else 0;
 
 	const error_msg: ?[*:0]const u8 = if (result.error_message) |msg|
@@ -1333,7 +1338,7 @@ export fn rarz_verify_archive(
 		.no_checksum_entry_count = 0,
 		.error_entry_count = 0,
 		.directory_count = 0,
-		.format_supported = @intFromBool(a.family != .rar14),
+		.format_supported = @intFromBool(a.family == .rar15 or a.family == .rar50),
 		.encrypted_entry_count = 0,
 	};
 
@@ -1345,8 +1350,8 @@ export fn rarz_verify_archive(
 		return summary.status;
 	}
 
-	// RAR 1.4 is recognised but has no parser. Zero enumerated entries is an
-	// incomplete result for that family, not a vacuous success.
+	// Recognized containers without a parser cannot establish integrity from
+	// an empty entry list.
 	if (summary.format_supported == 0) {
 		summary.status = ARCHIVE_VERIFY_INCOMPLETE;
 		clearLastError();
@@ -2152,6 +2157,43 @@ test "abi version is 1" {
 test "rarz_detect_format identifies RAR5" {
 	const sig = detect.RAR50_SIG ++ [_]u8{ 0x00, 0x00 };
 	try testing.expectEqual(@as(i32, 50), rarz_detect_format(&sig, sig.len));
+}
+
+test "RAR5 recovery volumes are recognized but never verified as archives" {
+	const signature = "Rar!\x1aRev";
+	try testing.expectEqual(@as(i32, 51), rarz_detect_format(signature.ptr, signature.len));
+	const archive = rarz_open(signature.ptr, signature.len) orelse return error.TestUnexpectedResult;
+	defer rarz_close(archive);
+	try testing.expectEqual(@as(i32, 51), rarz_archive_format(archive));
+	try testing.expectEqual(@as(u32, 0), rarz_file_count(archive));
+	try testing.expectEqual(@as(u8, 0), rarz_header_encrypted(archive));
+	var summary: RarzVerifyArchiveSummary = undefined;
+	try testing.expectEqual(ARCHIVE_VERIFY_INCOMPLETE, rarz_verify_archive(archive, &summary));
+	try testing.expectEqual(@as(u8, 0), summary.format_supported);
+	try testing.expectEqual(@as(u32, 0), summary.encrypted_entry_count);
+	const result = rarz_validate(signature.ptr, signature.len);
+	try testing.expectEqual(@as(i32, 0), result.is_valid);
+	try testing.expectEqual(@as(i32, 51), result.family);
+	try testing.expectEqual(@as(i32, 0), result.has_encrypted);
+}
+
+test "recovery detection classifies every signature byte and truncation" {
+	const signature = "Rar!\x1aRev";
+	for (0..signature.len) |length| {
+		try testing.expectEqual(@as(i32, 0), rarz_detect_format(signature.ptr, length));
+	}
+	var bytes: [8]u8 = signature.*;
+	for (0..bytes.len) |offset| {
+		for (0..256) |value| {
+			bytes[offset] = @intCast(value);
+			const expected: i32 = if (bytes[offset] == signature[offset]) 51 else 0;
+			try testing.expectEqual(expected, rarz_detect_format(&bytes, bytes.len));
+		}
+		bytes[offset] = signature[offset];
+	}
+	const embedded = "stub" ++ signature ++ "Rar!\x1a\x07\x01\x00";
+	try testing.expectEqual(@as(i32, 0), rarz_detect_format(embedded.ptr, embedded.len));
+	try testing.expectEqual(@as(i32, 51), rarz_detect_format_sfx(embedded.ptr, embedded.len, 5));
 }
 
 test "rarz_detect_format identifies RAR 1.5-4.x" {

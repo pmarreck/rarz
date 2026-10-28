@@ -6,8 +6,8 @@ export LC_ALL=C
 source tests/support/capture.bash || exit 1
 RARZ=$(realpath "${RARZ:-zig-out/bin/rarz}") || exit 1
 scratch=$(mktemp -d) || exit 1
-trap 'rm -rf "$scratch"' EXIT
 errors=0
+trap 'if [[ $errors == 0 ]]; then rm -rf "$scratch"; else printf "Failure fixtures retained at %s\n" "$scratch"; fi' EXIT
 out='' err='' rc=0
 fail() { printf 'FAIL: %s\n' "$1"; errors=$((errors+1)); }
 mkdir "$scratch/source" || exit 1
@@ -34,7 +34,7 @@ for method in 0 3; do
   line=${line%$'\r'}
   [[ $line != *'Host OS: Unix'* ]] || unix_entries=$((unix_entries+1))
   case "$line" in
-   *'Name: '*) name=${line#*Name: }; name=${name%/} ;;
+   *'Name: '*) name=${line#*Name: } ;;
    *'Attributes: '*) attributes+="$name=${line#*Attributes: }"$'\n' ;;
   esac
  done <<< "$out"
@@ -44,7 +44,7 @@ for method in 0 3; do
  [[ $observed_attributes == "$expected_attributes" ]] || fail "m$method archived attributes differ from the source set"
  mkdir "extract-$method" || exit 1
  capture unrar x -p- -idq -o+ "archive-$method.rar" "extract-$method/"
- [[ $rc == 0 ]] || { fail "reference extraction failed for m$method"; continue; }
+ [[ $rc == 0 ]] || { fail "reference extraction failed for m$method (exit $rc): $err"; continue; }
  [[ $(stat -c %a "extract-$method/source") == 710 ]] || fail "m$method directory mode lost"
  [[ $(stat -c %a "extract-$method/source/nested") == 731 ]] || fail "m$method nested directory mode lost"
  [[ $(stat -c %a "extract-$method/source/script.sh") == 751 ]] || fail "m$method executable mode lost"

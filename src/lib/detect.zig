@@ -6,6 +6,7 @@ pub const RarFamily = enum {
 	rar14, // RAR 1.4 (ancient, signature: 52 45 7E 5E)
 	rar15, // RAR 1.5-4.x (signature: 52 61 72 21 1A 07 00)
 	rar50, // RAR5+ (signature: 52 61 72 21 1A 07 01 00)
+	rar5_recovery, // RAR5 recovery volume; recognition does not verify parity data
 };
 
 pub const FormatResult = struct {
@@ -18,12 +19,18 @@ pub const FormatResult = struct {
 pub const RAR14_SIG = [4]u8{ 0x52, 0x45, 0x7E, 0x5E };
 pub const RAR15_SIG = [7]u8{ 0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00 };
 pub const RAR50_SIG = [8]u8{ 0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00 };
+pub const RAR5_RECOVERY_SIG = "Rar!\x1aRev".*;
 
 /// Attempt to match a RAR signature at the given offset within data.
 /// Returns a FormatResult with the matched family, or null if no match.
 /// Checks most specific first (RAR5 before RAR 1.5-4.x).
 fn try_match_at(data: []const u8, offset: usize) FormatResult {
 	const no_match = FormatResult{ .family = null, .signature_offset = 0, .signature_len = 0 };
+	if (offset + RAR5_RECOVERY_SIG.len <= data.len and
+		std.mem.eql(u8, data[offset..][0..RAR5_RECOVERY_SIG.len], &RAR5_RECOVERY_SIG))
+	{
+		return .{ .family = .rar5_recovery, .signature_offset = offset, .signature_len = RAR5_RECOVERY_SIG.len };
+	}
 
 	// Check RAR5 (8 bytes) — must check before RAR 1.5-4.x since RAR5 is a superset
 	if (offset + RAR50_SIG.len <= data.len) {
@@ -66,7 +73,7 @@ fn try_match_at(data: []const u8, offset: usize) FormatResult {
 
 /// Detect RAR format family from raw bytes.
 ///
-/// First checks offset 0 for all three signatures (most specific first).
+/// First checks offset 0 for archive and recovery signatures.
 /// If not found at offset 0 and max_sfx_offset > 0, scans byte-by-byte
 /// up to max_sfx_offset looking for any signature (SFX prefix scanning).
 ///

@@ -34,14 +34,15 @@ void rarz_clear_error(void);
 
 /**
  * Detect RAR format family from buffer.
- * Returns: 0=unknown, 14=RAR1.4, 15=RAR1.5-4.x, 50=RAR5+
+ * Returns: 0=unknown, 14=RAR1.4, 15=RAR1.5-4.x, 50=RAR5+, 51=RAR5 recovery.
+ * Recognition alone does not establish integrity or supported verification.
  */
 int32_t rarz_detect_format(const uint8_t *data, size_t len);
 
 /**
  * Detect RAR format family with SFX prefix scanning.
  * Scans up to max_sfx_offset bytes for a RAR signature.
- * Returns: 0=unknown, 14=RAR1.4, 15=RAR1.5-4.x, 50=RAR5+
+ * Returns: 0=unknown, 14=RAR1.4, 15=RAR1.5-4.x, 50=RAR5+, 51=RAR5 recovery.
  */
 int32_t rarz_detect_format_sfx(const uint8_t *data, size_t len, size_t max_sfx_offset);
 
@@ -71,7 +72,7 @@ rarz_archive *rarz_open_volumes(const uint8_t **volumes,
 /** Close archive and free handle. */
 void rarz_close(rarz_archive *archive);
 
-/** Get format family (0/14/15/50). */
+/** Get format family (0/14/15/50/51). */
 int32_t rarz_archive_format(const rarz_archive *archive);
 
 /** Get number of file entries. */
@@ -109,8 +110,8 @@ int32_t rarz_file_info(const rarz_archive *archive, uint32_t index,
 /* ========================================================================== */
 
 typedef struct {
-	int32_t is_valid;       /* 1=valid, 0=invalid */
-	int32_t family;         /* 0/14/15/50 */
+	int32_t is_valid;       /* 1=valid, 0=not validated; inspect family/error_msg */
+	int32_t family;         /* 0/14/15/50/51; recovery (51) is unsupported */
 	int32_t has_encrypted;  /* 1 if encrypted content found */
 	uint32_t block_count;
 	uint32_t file_count;
@@ -321,7 +322,7 @@ typedef struct {
  *
  * Returns the same value written to out_summary->status. Damage takes
  * precedence over incomplete evidence, while every count remains available.
- * RAR 1.4 is currently reported INCOMPLETE with format_supported=0.
+ * RAR 1.4 and RAR5 recovery volumes report INCOMPLETE with format_supported=0.
  */
 int32_t rarz_verify_archive(const rarz_archive *archive,
 							rarz_verify_archive_summary *out_summary);

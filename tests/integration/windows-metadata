@@ -24,7 +24,7 @@ touch -d @4294967295 source/future || exit 1
 touch -d @951782400 source/nested source/empty source || exit 1
 for method in 0 3; do
 	capture rar a "-m$method" -idq "archive-$method.rar" source
-	[[ $rc == 0 ]] || { fail "producer m$method failed: $err"; continue; }
+	[[ $rc == 0 ]] || { fail "producer m$method failed (exit $rc): $out $err"; continue; }
 	mkdir "output-$method" || exit 1
 	capture wine "$candidate" x "archive-$method.rar" "output-$method"
 	[[ $rc == 0 ]] || fail "Windows m$method extraction failed: $err"

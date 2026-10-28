@@ -20,6 +20,7 @@
             builtins.elem (nixpkgs.lib.getName pkg) [ "rar" "unrar" ];
         };
         zig = zig-overlay.packages.${system}."0.16.0";
+        rarProducer = import ./nix/rar-producer.nix { inherit pkgs; };
 
         pname = "rarz";
         version = "0.1.0";
@@ -205,7 +206,7 @@
           '';
         } // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
           windows-metadata = pkgs.runCommand "rarz-windows-metadata" {
-            nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.diffutils pkgs.rar pkgs.wineWow64Packages.stable ];
+            nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.diffutils rarProducer pkgs.wineWow64Packages.stable ];
           } ''
             cd ${self}
             bash tests/integration/windows-metadata ${targetPackages.mswin-amd64-ReleaseFast}/bin/rarz.exe
@@ -229,7 +230,7 @@
           ++ pkgs.lib.optionals (builtins.hasAttr system corruption-reader.packages) [
             corruption-reader.packages.${system}.default
           ] ++ pkgs.lib.optionals (builtins.elem system [ "x86_64-linux" "x86_64-darwin" "aarch64-darwin" ]) [
-            rar
+            rarProducer
           ];
         };
       }

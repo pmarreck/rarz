@@ -8,9 +8,9 @@ Completed records: [docs/PLAN_LOG.md](docs/PLAN_LOG.md). Historical decisions an
 
 ## Correctness queue
 
-- [ ] Verify exact-commit CI for recovery-volume recognition and canonical directory names; complete 475-unit/CLI/v70 and native macOS acceptance passed (#36; context: docs/plan_context/recovery-volumes.md).
+- [x] Recognize recovery volumes without integrity claims and normalize directory names; complete 475-unit/CLI/v70 and native macOS acceptance passed, followed by exact CI in 71 seconds (done 2026-10-28 03:06 EDT; commit c6a8b25; #36; context: docs/plan_context/recovery-volumes.md).
 - [x] Verify exact-commit CI for archive-comment checksums and the UNRAR exit-zero diagnostic rule; complete 473-unit/CLI/v70 and native macOS acceptance passed, followed by exact CI in 56 seconds (done 2026-10-28 02:01 EDT; commit 84cf819; #21; context: docs/plan_context/rar2-comments.md).
-- [ ] Add per-part packed CRC checks to split-volume validation (#26).
+- [ ] Verify exact-commit CI for packed-part CRC validation and writer correction; complete 477-unit/CLI/v70 and native macOS acceptance passed (#26; context: docs/plan_context/packed-crc.md).
 - [ ] Verify binary/decimal volume-size suffix behavior against the producer CLI (#33).
 - [ ] Validate RAR5 UTF-8 filenames without conflating invalid encoding with unsupported decoding (#30).
 - [ ] Parse RAR5 file-version extra records and prevent versioned-name collisions (#32).
@@ -50,4 +50,3 @@ Completed records: [docs/PLAN_LOG.md](docs/PLAN_LOG.md). Historical decisions an
 - [x] Correct writer header/caller-buffer bounds and reject impossible volume capacity; full 465-unit/CLI/v70 and native macOS checks passed, then exact-commit CI passed in 103 seconds (done 2026-10-28 00:36 EDT; commit 1251857, context: docs/plan_context/writer-bounds.md).
 - [x] Resolve #29 unknown-block skip semantics: both flag values remain readable in eight RAR4/RAR5 reference controls; eight CRC mutations are rejected, so flag absence alone is not a damage rule (done 2026-10-28 00:22 EDT; context: docs/plan_context/unknown-blocks.md).
 - [x] Propagate FFI parser errors and preserve complete vintage EOF and ENDARC padding; full 457-unit/CLI/v70 and native macOS checks passed, then exact-commit CI passed in 216 seconds (done 2026-10-28 00:01 EDT; commit 67fa938, context: docs/plan_context/archive-collection.md).
-- [x] Reject the three RAR2 partial-header campaign misses and all 18 related cuts while preserving valid vintage EOF; complete ./test passed 452 units and all CLI suites, and exact-commit CI passed in 112 seconds (done 2026-10-27 23:34 EDT; commit 279bb66, context: docs/plan_context/rar2-truncation.md).

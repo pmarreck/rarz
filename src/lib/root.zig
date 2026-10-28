@@ -1735,6 +1735,12 @@ fn collectRar4FilesUnified(alloc: std.mem.Allocator, volumes: []const VolumeData
 			switch (block.?) {
 				.file => |fh| {
 					const header_end = vol.block_data_offset + fh.block.header_offset + fh.block.head_size;
+					const flags = rar4_headers.parse_file_flags(fh.block.flags);
+					if (flags.split_after and !flags.password) {
+						if (header_end > vol.data.len or fh.packed_size > vol.data.len - header_end) return error.EndOfData;
+						if (integrity.crc32(vol.data[header_end..][0..@intCast(fh.packed_size)]) != fh.file_crc)
+							return error.InvalidChecksum;
+					}
 					try all.append(alloc, .{
 						.fh = fh,
 						.volume_index = @intCast(vi),
@@ -1845,6 +1851,12 @@ fn collectRar5FilesUnified(alloc: std.mem.Allocator, volumes: []const VolumeData
 				.file => |fb| {
 					// Compute the absolute offset of packed data in this volume
 					const header_end = vol.block_data_offset + fb.header.header_start + 4 + fb.header.crc_data_len;
+					if (fb.header.flags.split_after and fb.has_crc32 and !rar5_headers.extra_has_encryption(fb.extra_data)) {
+						const size = fb.header.data_size orelse 0;
+						if (header_end > vol.data.len or size > vol.data.len - header_end) return error.EndOfData;
+						if (integrity.crc32(vol.data[header_end..][0..@intCast(size)]) != fb.data_crc32.?)
+							return error.InvalidChecksum;
+					}
 					try all_file_blocks.append(alloc, .{
 						.fb = fb,
 						.volume_index = @intCast(vi),
@@ -3111,7 +3123,7 @@ test "rarz_open_volumes with mix of complete and split files" {
 		fbp += encode_vint(0x0004, fb[fbp..]); // has_crc32
 		fbp += encode_vint(big_data.len, fb[fbp..]);
 		fbp += encode_vint(0x20, fb[fbp..]);
-		std.mem.writeInt(u32, fb[fbp..][0..4], integrity.crc32(big_data), .little);
+		std.mem.writeInt(u32, fb[fbp..][0..4], integrity.crc32(big_chunk1), .little);
 		fbp += 4;
 		fbp += encode_vint(0, fb[fbp..]);
 		fbp += encode_vint(0, fb[fbp..]);

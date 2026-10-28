@@ -261,7 +261,14 @@ fn validate_rar4_payload(data: []const u8, sig_offset: usize) ValidationResult {
 			},
 			.file => |f| {
 				const fflags = rar4_headers.parse_file_flags(f.block.flags);
-				// Split files: the CRC covers the whole file, not this chunk.
+				if (fflags.split_after and !fflags.password) {
+					const start = sig_offset + f.block.header_offset + f.block.head_size;
+					if (start > data.len or f.packed_size > data.len - start)
+						return invalid_result(.rar15, "declared payload extends beyond end of volume (truncated)");
+					if (integrity.crc32(data[start..][0..@intCast(f.packed_size)]) != f.file_crc)
+						return invalid_result(.rar15, "packed-part CRC32 mismatch");
+				}
+				// The completing part's CRC needs the reassembled file.
 				if (fflags.split_before or fflags.split_after) continue;
 				// Encrypted ENTRY: its payload cannot be checked without the
 				// password. Skip this entry only — every other entry in the
@@ -553,7 +560,15 @@ fn validate_rar5_payload(data: []const u8, sig_offset: usize, sig_len: u8) Valid
 
 		switch (block) {
 			.file => |f| {
-				// Skip split files — payload CRC covers the full file, not chunks
+				if (f.header.flags.split_after and f.has_crc32 and !rar5_headers.extra_has_encryption(f.extra_data)) {
+					const start = block_start + f.header.header_start + 4 + f.header.crc_data_len;
+					const size = f.header.data_size orelse 0;
+					if (start > data.len or size > data.len - start)
+						return invalid_result(.rar50, "declared payload extends beyond end of volume (truncated)");
+					if (integrity.crc32(data[start..][0..@intCast(size)]) != f.data_crc32.?)
+						return invalid_result(.rar50, "packed-part CRC32 mismatch");
+				}
+				// The completing part's CRC needs the reassembled file.
 				if (f.header.flags.split_before or f.header.flags.split_after) continue;
 				// Encrypted ENTRY: its payload cannot be checked without the
 				// password. Skip this entry only — every other entry in the
@@ -798,6 +813,8 @@ fn validate_volumes_rar4(volumes: []const []const u8) ValidationResult {
 					if (payload_end > vol_data.len) {
 						return invalid_result(.rar15, "declared payload extends beyond end of volume (truncated)");
 					}
+					if (fflags.split_after and integrity.crc32(vol_data[payload_start..payload_end]) != f.file_crc)
+						return invalid_result(.rar15, "packed-part CRC32 mismatch");
 					chunks.append(alloc, .{
 						.data_ptr = vol_data[payload_start..payload_end].ptr,
 						.data_len = @intCast(f.packed_size),
@@ -997,6 +1014,9 @@ pub fn validate_volumes(volumes: []const []const u8) ValidationResult {
 					if (payload_end > vol_data.len) {
 						return invalid_result(.rar50, "declared payload extends beyond end of volume (truncated)");
 					}
+					if (f.header.flags.split_after and f.has_crc32 and !rar5_headers.extra_has_encryption(f.extra_data) and
+						integrity.crc32(vol_data[payload_start..payload_end]) != f.data_crc32.?)
+						return invalid_result(.rar50, "packed-part CRC32 mismatch");
 					{
 						chunks.append(alloc, .{
 							.volume_idx = vi,
@@ -2623,6 +2643,41 @@ test "validate_volumes: official rar m3 multi-volume fixture validates (spanning
 	const vols = [_][]const u8{ part1, part2 };
 	const vr = validate_volumes(&vols);
 	try testing.expect(vr.is_valid);
+}
+
+test "split-volume packed CRC mismatch cannot hide behind an intact final CRC" {
+	const first: []const u8 = @embedFile("rar5_vol_m3_part01");
+	const second: []const u8 = @embedFile("rar5_vol_m3_part02");
+	const bytes = try testing.allocator.dupe(u8, first);
+	defer testing.allocator.free(bytes);
+	const volumes = [_][]const u8{ bytes, second };
+	try testing.expect(validate_volumes(&volumes).is_valid);
+	const blocks = bytes[detect_mod.RAR50_SIG.len..];
+	var iter = rar5_headers.walk_blocks(blocks);
+	var checked: usize = 0;
+	while (try iter.next()) |block| {
+		if (block == .end_archive) break;
+		if (block != .file or !block.file.header.flags.split_after) continue;
+		const f = block.file;
+		var fields = reader_mod.Reader.init(blocks[f.header.body_start..]);
+		const flags = try fields.read_vint();
+		_ = try fields.read_vint(); // unpacked size
+		_ = try fields.read_vint(); // attributes
+		if (flags & 2 != 0) _ = try fields.read_u32_le();
+		try testing.expect(flags & 4 != 0);
+		const crc_offset = f.header.body_start + fields.position();
+		blocks[crc_offset] ^= 1;
+		const header = f.header.header_start;
+		write_u32_le(blocks, header, integrity.crc32(blocks[header + 4 ..][0..f.header.crc_data_len]));
+		var header_reader = reader_mod.Reader.init(blocks);
+		header_reader.pos = header;
+		const reparsed = try rar5_headers.parse_block_header(&header_reader);
+		try testing.expect(rar5_headers.validate_header_crc(blocks, reparsed));
+		try testing.expectEqual(false, validate_volumes(&volumes).is_valid);
+		try testing.expectEqual(false, validate(bytes).is_valid);
+		checked += 1;
+	}
+	try testing.expect(checked > 0);
 }
 
 test "validate: truncated RAR4 archive must NOT be VALID" {

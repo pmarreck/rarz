@@ -253,7 +253,7 @@ fn file_block_size(entry: FileEntry) usize {
 /// Write a file block for volume splitting. Like write_file_block but with:
 /// - split_before/split_after header flags
 /// - custom data chunk (may be a subset of the file data)
-/// - unpacked_size and data_crc always reflect the FULL file, not the chunk
+/// - unpacked_size describes the full file; CRC describes packed parts until the last
 /// compression_info=0 (store mode).
 fn write_file_block_split(
 	out: []u8,
@@ -263,7 +263,7 @@ fn write_file_block_split(
 	split_before: bool,
 	split_after: bool,
 ) usize {
-	const full_data_crc = integrity.crc32(entry.data);
+	const full_data_crc = integrity.crc32(if (split_after) data_chunk else entry.data);
 
 	var file_flags: u64 = 0;
 	if (entry.is_directory) file_flags |= 0x01;
@@ -383,7 +383,7 @@ fn write_file_block_precompressed_split(
 	split_before: bool,
 	split_after: bool,
 ) usize {
-	const data_crc = integrity.crc32(entry.data);
+	const data_crc = integrity.crc32(if (split_after) compressed_chunk else entry.data);
 
 	var file_flags: u64 = 0;
 	if (entry.is_directory) file_flags |= 0x01;
@@ -1745,6 +1745,37 @@ test "write_archive_volumes: file split across volumes" {
 			try testing.expect(f.header.flags.split_before);
 		},
 		else => return error.EndOfData,
+	}
+}
+
+test "split-volume CRCs describe packed parts until the completing part" {
+	const data = "Unique piece of a split archive payload. " ** 100;
+	const entries = [_]FileEntry{.{ .name = "split.txt", .data = data, .mtime = 0, .is_directory = false }};
+	for ([_]u3{ 0, 3 }) |method| {
+		var volumes = try write_archive_volumes_compressed(testing.allocator, &entries, .{ .volume_size = 100 }, method);
+		defer volumes.deinit();
+		try testing.expect(volumes.count > 1);
+		var packed_parts: usize = 0;
+		var final_parts: usize = 0;
+		for (volumes.volumes[0..volumes.count]) |volume| {
+			const blocks = volume[detect.RAR50_SIG.len..];
+			var iter = rar5_headers.walk_blocks(blocks);
+			while (try iter.next()) |block| {
+				if (block != .file) continue;
+				const f = block.file;
+				const start = f.header.header_start + 4 + f.header.crc_data_len;
+				const packed_bytes = blocks[start..][0..@intCast(f.header.data_size.?)];
+				if (f.header.flags.split_after) {
+					try testing.expectEqual(integrity.crc32(packed_bytes), f.data_crc32.?);
+					packed_parts += 1;
+				} else {
+					try testing.expectEqual(integrity.crc32(data), f.data_crc32.?);
+					final_parts += 1;
+				}
+			}
+		}
+		try testing.expect(packed_parts > 0);
+		try testing.expectEqual(@as(usize, 1), final_parts);
 	}
 }
 

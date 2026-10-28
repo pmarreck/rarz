@@ -2,7 +2,7 @@
 
 [![Mechatron Prime CI](https://img.shields.io/endpoint?url=https%3A%2F%2Fthelio-nixos.tail66c90.ts.net%2Fbadges%2Frarz.json&style=for-the-badge)](https://thelio-nixos.tail66c90.ts.net/mechatron-prime/)
 
-A clean-room RAR archive toolkit: parser, validator, extractor, and writer.
+A RAR archive toolkit: parser, validator, extractor, and writer.
 
 Written in Zig with a C FFI and drop-in C CLI.
 
@@ -182,9 +182,14 @@ rarz validates archives to the deepest level possible:
 - **Structural** — all header checksums (CRC16 for RAR4, CRC32 for RAR5) pass
 - **Full** — structural + payload integrity (CRC32 data verification for store-method files)
 
-## Clean-Room Implementation
+## Implementation provenance
 
-This is a clean-room implementation derived from format specification documents only, not from reading proprietary source code. See `RAR_SPECIFICATION.md` and `RAR_COMPRESSION_ALGORITHMS_EXHAUSTIVE.md` for the specifications used.
+Clean-room development is the project's intended constraint. Historical
+specifications include reference-source evaluation, and the PPMd implementation
+is documented as a reference decoder port. The repository therefore does not
+currently substantiate a specification-only implementation claim. See the
+[provenance review](docs/PROVENANCE_REVIEW_20261028.md) for the evidence and
+unresolved remediation decision.
 
 ## License
 

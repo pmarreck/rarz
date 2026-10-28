@@ -25,7 +25,7 @@ Completed records: [docs/PLAN_LOG.md](docs/PLAN_LOG.md). Historical decisions an
 - [ ] Coordinate a PPM heap admission contract with the consumer; requested its authoritative contract, since header dictionary size omits the stream-declared heap of up to 256 MiB (context: docs/plan_context/development-history.md).
 - [ ] Audit current no-checksum, unsupported-filter, and service-payload reporting against the published consumer contract before changing verdicts (context: docs/ARCHIVE_EVIDENCE_INDEX.md).
 - [ ] Reconcile the existing flake lock with the current nixpkgs freshness policy in a separate toolchain milestone.
-- [ ] Publish the provenance review and factual README correction; the recorded reference port contradicts the specification-only claim, and audit-versus-replacement scope awaits an owner decision (context: INTENT.md).
+- [ ] Resolve provenance remediation scope after the published review and README correction; exact source/license audit versus independent replacement planning awaits an owner decision (context: docs/PROVENANCE_REVIEW_20261028.md).
 
 ## Explicitly deferred
 

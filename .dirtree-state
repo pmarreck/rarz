@@ -11,6 +11,7 @@ annotate=[
 	docs/COVERAGE_20261028_SEED44.md = Uncached-reference campaign with one preserved RAR2 miss
 	docs/MECHA_VALIDATE_V1_RAR_GATE.md = Measured Mecha Validate v1 support matrix, consumer summary contract, classifier evidence, and blockers
 	docs/PLAN_LOG.md = Retired completion records with historical evidence qualifications
+	docs/PROVENANCE_REVIEW_20261028.md = Repository evidence contradicting the unconditional specification-only implementation claim
 	docs/REFERENCE_EXCEPTION_ADJUDICATION_20261028.md = Independent adjudication of historical reference failures without changing sample counts
 	docs/evidence/coverage-20261015-candidate.sha256 = Frozen source, dependency, and binary identities
 	docs/evidence/coverage-20261015-cases.jsonl = Replay records for all 14 observed anomalies

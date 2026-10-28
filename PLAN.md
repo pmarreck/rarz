@@ -5,6 +5,7 @@ Completed records: [docs/PLAN_LOG.md](docs/PLAN_LOG.md). Historical decisions an
 ## Current milestone
 
 - [ ] Complete cross-platform-project-build-arch conformance through native runtime qualification: complete macOS CLI/isolation suite and Linux ARM64/Windows runtime; macOS ARM64 units and package smoke pass (context: docs/plan_context/build-layout.md).
+- [ ] Resolve the native macOS assessment memory contract: the 1 GiB virtual-memory cap is rejected before execution; preserving the hard-cap requirement versus qualifying a distinct resident-memory limit awaits an owner decision (context: docs/plan_context/assessment-tool-probes.md).
 
 ## Correctness queue
 
@@ -13,13 +14,13 @@ Completed records: [docs/PLAN_LOG.md](docs/PLAN_LOG.md). Historical decisions an
 
 ## Evidence and resource follow-ups
 
+- [ ] Verify exact-commit CI for retained assessment identity-probe failures; full 505-unit/CLI/v70 suite and optimized build pass, and native reproduction retains the real limit-setup failure (context: docs/plan_context/assessment-tool-probes.md).
 - [ ] Add tested interruption propagation from ./test to its admitted runtime scope; awaiting the shared wrapper's owning-scope cancellation contract before integration.
-- [x] Verify exact-commit CI for independent adjudication of all nine reference exceptions; full 503-unit/CLI/v70 suite and optimized build passed, followed by exact CI in 46 seconds, with historical classifications and confidence intervals preserved (done 2026-10-28 05:33 EDT; commit d0cbdea; context: docs/REFERENCE_EXCEPTION_ADJUDICATION_20261028.md).
 - [x] Verify exact-commit CI for versioned legacy mutation gates and distinct execution outcomes; full 503-unit/CLI/v70 suite, optimized build, and native macOS classifier/driver checks passed, followed by exact CI in 53 seconds (done 2026-10-28 05:51 EDT; commit d79d607; context: docs/plan_context/legacy-mutation-records.md).
 - [x] Verify exact-commit CI for the 17 stricter volume cases; full 505-unit/CLI/v70 suite and optimized build passed, followed by exact CI in 60 seconds, with historical classes preserved (done 2026-10-28 06:28 EDT; commit 4c20da1; context: docs/QUICKOPEN_TRUNCATION_ADJUDICATION_20261028.md).
 - [ ] Coordinate a PPM heap admission contract with the consumer; requested its authoritative contract, since header dictionary size omits the stream-declared heap of up to 256 MiB (context: docs/plan_context/development-history.md).
 - [x] Audit current no-checksum, unsupported-filter, and service-payload reporting against the published consumer contract; the adapter preserves incomplete counts but file verification does not cover ancillary payloads, and PPM/packed-input admission remains open (done 2026-10-28 06:11 EDT; context: docs/plan_context/consumer-contract-audit.md).
-- [ ] Verify exact-commit CI for the nixpkgs refresh and tested Linux producer launcher; full 505-unit/CLI/v70, five-target publication, native macOS checks, and optimized build pass (context: docs/plan_context/toolchain-refresh.md).
+- [x] Verify exact-commit CI for the nixpkgs refresh and tested Linux producer launcher; full 505-unit/CLI/v70, five-target publication, native macOS checks, and optimized build passed, followed by exact CI in 47 seconds (done 2026-10-28 06:40 EDT; commit 995d681; context: docs/plan_context/toolchain-refresh.md).
 - [ ] Resolve provenance remediation scope after the published review and README correction; exact source/license audit versus independent replacement planning awaits an owner decision (context: docs/PROVENANCE_REVIEW_20261028.md).
 
 ## Explicitly deferred

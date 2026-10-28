@@ -88,5 +88,14 @@ chmod +x "$scratch/broken-mutator"
 capture ./assess-coverage --mutator "$scratch/broken-mutator" --output "$scratch/broken" tests/fixtures/rar5_m3.rar
 [[ $rc == 2 ]] || fail 'broken mutation report must fail'
 [[ -f $scratch/broken/mutation.jsonl ]] || fail 'failed mutation diagnostic was discarded'
+cat > "$scratch/failed-identity" <<'MOCK'
+#!/usr/bin/env bash
+printf 'fixture resource setup failed\n' >&2
+exit 125
+MOCK
+chmod +x "$scratch/failed-identity"
+capture ./assess-coverage --mutator "$scratch/failed-identity" --output "$scratch/identity-failure" tests/fixtures/rar5_m3.rar
+[[ $rc == 2 ]] || fail 'failed identity probe must return incomplete'
+jq -e '.status == "incomplete" and (.error | contains("mutator identity probe failed")) and .tools.mutator.identity.exit == 125 and (.tools.mutator.identity.stderr | contains("fixture resource setup failed"))' "$scratch/identity-failure/summary.json" >/dev/null 2>&1 || fail 'identity probe failure was mislabeled or its evidence lost'
 [[ $errors == 0 ]] || exit 1
 printf 'PASS: assessment adapters, no-op accounting, misses and pristine control\n'

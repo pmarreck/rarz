@@ -143,15 +143,16 @@ local function main()
 		u.class=u.truncated and 'tool-error' or stats.reference(u.exit,u.stderr)
 		return r,u
 	end
-	for _,key in ipairs({'rarz','mutator','reference'}) do
-		local about=run(key=='reference' and {options[key]} or {options[key],'--about'})
-		report.tools[key]={path=options[key],sha256=hash(options[key]),about=about.stdout..about.stderr}
-	end
-	assert(stats.consumer_version(report.tools.mutator.about),'consumer CLI v1 requires corruption-reader >=0.7.0')
 	local records=assert(io.open(dir..'/trials.jsonl','wb'))
 	local serial=0
 	local function log(value) assert(records:write(encode(value)..'\n')); assert(records:flush()) end
 	local ok,problem=pcall(function()
+		for _,key in ipairs({'rarz','mutator','reference'}) do
+			local about=run(key=='reference' and {options[key]} or {options[key],'--about'})
+			report.tools[key]={path=options[key],sha256=hash(options[key]),about=about.stdout..about.stderr,identity=about}
+			assert(about.exit==0 and not about.truncated,key..' identity probe failed (exit '..about.exit..'); see tools.'..key..'.identity')
+		end
+		assert(stats.consumer_version(report.tools.mutator.about),'consumer CLI v1 requires corruption-reader >=0.7.0')
 		for _,path in ipairs(inputs) do
 			local item={path=path,sha256=hash(path)}; report.inputs[#report.inputs+1]=item
 			local r,u=observe(path); item.rarz=r; item.reference=u

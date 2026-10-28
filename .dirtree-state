@@ -25,6 +25,7 @@ annotate=[
 	docs/evidence/coverage-20261028.json = Seed-43 per-pair statistical evidence and tool identities
 	docs/evidence/rar-fixtures.sha256 = Content hashes of the committed archive fixture corpus
 	docs/plan_context/archive-collection.md = FFI parser-error propagation, independent controls, and reference limits
+	docs/plan_context/assessment-tool-probes.md = Incomplete identity-probe evidence and the native memory-limit dependency
 	docs/plan_context/build-layout.md = Build layout, publication controls, and qualification limits
 	docs/plan_context/compilation-source.md = Compilation dependencies and source-boundary reuse evidence
 	docs/plan_context/consumer-contract-audit.md = Published verification evidence, consumer mapping, and resource-admission gaps

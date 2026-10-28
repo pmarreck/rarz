@@ -4,13 +4,12 @@ Completed records: [docs/PLAN_LOG.md](docs/PLAN_LOG.md). Historical decisions an
 
 ## Current milestone
 
-- [ ] Verify exact-commit CI for the RAR2 overlong-match guard and seed-44 report; complete 471-unit/CLI/v70 and native macOS acceptance passed (context: docs/COVERAGE_20261028_SEED44.md).
 - [ ] Qualify the complete macOS CLI/isolation suite and native Linux ARM64/Windows runtime; macOS ARM64 units and package smoke now pass (context: docs/plan_context/build-layout.md).
 
 ## Correctness queue
 
 - [ ] Recognize recovery-volume signatures without claiming recovery-data verification (#36).
-- [ ] Integrate archive-comment CRC/payload verification and the exact UNRAR exit-zero damage diagnostic rule; original RAR 2.90 fixtures and focused regressions now reproduce and cover #21.
+- [ ] Verify exact-commit CI for archive-comment checksums and the UNRAR exit-zero diagnostic rule; complete 473-unit/CLI/v70 and native macOS acceptance passed (#21; context: docs/plan_context/rar2-comments.md).
 - [ ] Add per-part packed CRC checks to split-volume validation (#26).
 - [ ] Verify binary/decimal volume-size suffix behavior against the producer CLI (#33).
 - [ ] Validate RAR5 UTF-8 filenames without conflating invalid encoding with unsupported decoding (#30).
@@ -44,6 +43,7 @@ Completed records: [docs/PLAN_LOG.md](docs/PLAN_LOG.md). Historical decisions an
 
 ## Recent completions
 
+- [x] Publish seed-44 evidence and reject its overlong RAR2 match; full 471-unit/CLI/v70 and native macOS acceptance passed, followed by exact CI in 51 seconds (done 2026-10-28 01:53 EDT; commit a2f7550, context: docs/COVERAGE_20261028_SEED44.md).
 - [x] Bound Nix compilation inputs and verify documentation reuse plus source invalidation; full 469-unit/CLI/v70 and native macOS checks passed, then exact CI passed in 69 seconds (done 2026-10-28 01:38 EDT; commit e80ea1e, context: docs/plan_context/compilation-source.md).
 - [x] Reject initial Huffman repeats and overflowing tenth-byte VINT values; full 469-unit/CLI/v70 acceptance and exact CI passed in 147 seconds (done 2026-10-28 01:12 EDT; commit 752511b, context: docs/plan_context/integer-and-table-bounds.md).
 - [x] Verify exact-commit CI for uncached reference and seed-43 evidence commit c2cb48d; passed in 95 seconds (done 2026-10-28 00:58 EDT; context: docs/COVERAGE_20261028.md).

@@ -193,6 +193,24 @@ fn validate_rar4_structural(data: []const u8, sig_offset: usize) ValidationResul
 // RAR4 payload validation (store-method files)
 // ============================================================================
 
+fn validateRar4ArchiveComment(comment: []const u8) bool {
+	const fixed_size = 13;
+	if (comment.len < fixed_size or comment[2] != 0x75) return false;
+	if (std.mem.readInt(u16, comment[5..7], .little) != comment.len) return false;
+	if (integrity.crc16(comment[2..fixed_size]) != std.mem.readInt(u16, comment[0..2], .little)) return false;
+	const unpacked_size = std.mem.readInt(u16, comment[7..9], .little);
+	const method = comment[10];
+	if (method < 0x30 or method > 0x35) return false;
+	const payload = comment[fixed_size..];
+	var verify = sink.VerifySink.init(false);
+	if (method == 0x30) {
+		verify.sink().write(payload);
+	} else {
+		dispatch.decompressRar4ToSink(std.heap.page_allocator, payload, unpacked_size, comment[9], method - 0x30, 0, verify.sink()) catch return false;
+	}
+	return verify.len == unpacked_size and @as(u16, @truncate(verify.crc32())) == std.mem.readInt(u16, comment[11..13], .little);
+}
+
 fn validate_rar4_payload(data: []const u8, sig_offset: usize) ValidationResult {
 	// First do structural validation
 	var structural = validate_rar4_structural(data, sig_offset);
@@ -231,6 +249,16 @@ fn validate_rar4_payload(data: []const u8, sig_offset: usize) ValidationResult {
 		const block = maybe_block orelse break;
 
 		switch (block) {
+			.main => |m| {
+				if (m.flags.comment) {
+					const start = sig_offset + m.block.header_offset;
+					if (!validateRar4ArchiveComment(data[start + 13 .. start + m.block.head_size])) {
+						structural.is_valid = false;
+						structural.error_message = "archive comment verification failed";
+						return structural;
+					}
+				}
+			},
 			.file => |f| {
 				const fflags = rar4_headers.parse_file_flags(f.block.flags);
 				// Split files: the CRC covers the whole file, not this chunk.
@@ -1170,6 +1198,45 @@ pub fn validate_volumes(volumes: []const []const u8) ValidationResult {
 // ============================================================================
 // Main entry point
 // ============================================================================
+
+test "legacy stored comment size and payload controls retain the producer checksum" {
+	const producer = @embedFile("rar2_v20_comment");
+	const text = "Independent RAR 2.90 archive comment control.\n";
+	try std.testing.expectEqual(std.mem.readInt(u16, producer[31..33], .little), integrity.crc16(text));
+	var comment: [13 + text.len]u8 = undefined;
+	@memcpy(comment[0..13], producer[20..33]);
+	@memcpy(comment[13..], text);
+	comment[10] = 0x30;
+	for (0..comment.len + 4) |declared_size| {
+		write_u16_le(&comment, 5, @intCast(declared_size));
+		write_u16_le(&comment, 0, integrity.crc16(comment[2..13]));
+		try std.testing.expectEqual(declared_size == comment.len, validateRar4ArchiveComment(&comment));
+	}
+	write_u16_le(&comment, 5, comment.len);
+	write_u16_le(&comment, 0, integrity.crc16(comment[2..13]));
+	for (13..comment.len) |offset| {
+		comment[offset] ^= 1;
+		try std.testing.expect(!validateRar4ArchiveComment(&comment));
+		comment[offset] ^= 1;
+	}
+	for (0..13) |size| try std.testing.expect(!validateRar4ArchiveComment(comment[0..size]));
+	try std.testing.expect(validateRar4ArchiveComment(&comment));
+}
+
+test "RAR2 producer archive comments retain separate header and payload checksums" {
+	const commented = @embedFile("rar2_v20_comment");
+	const control = @embedFile("rar2_v20_comment_control");
+	try std.testing.expectEqual(true, validate(control).is_valid);
+	try std.testing.expectEqual(true, validate(commented).is_valid);
+	// The producer's MAIN_HEAD is 89 bytes: 13 fixed bytes plus one comment.
+	// Its nested comment has a 13-byte header and a compressed payload.
+	for ([_]usize{ 7, 10, 20, 27, 31, 45 }) |offset| {
+		const damaged = try std.testing.allocator.dupe(u8, commented);
+		defer std.testing.allocator.free(damaged);
+		damaged[offset] ^= 1;
+		try std.testing.expectEqual(false, validate(damaged).is_valid);
+	}
+}
 
 /// Validate a RAR archive.
 ///

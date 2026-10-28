@@ -195,6 +195,8 @@ pub fn build(b: *std.Build) void {
 	// end-of-archive block, which our truncation rule wrongly required.
 	unit_tests.root_module.addAnonymousImport("rar2_v20_store", .{ .root_source_file = b.path("tests/fixtures/rar2_v20_store.rar") });
 	unit_tests.root_module.addAnonymousImport("rar2_v20_m3", .{ .root_source_file = b.path("tests/fixtures/rar2_v20_m3.rar") });
+	unit_tests.root_module.addAnonymousImport("rar2_v20_comment", .{ .root_source_file = b.path("tests/fixtures/rar2_v20_comment.rar") });
+	unit_tests.root_module.addAnonymousImport("rar2_v20_comment_control", .{ .root_source_file = b.path("tests/fixtures/rar2_v20_comment_control.rar") });
 	// Minimal v20 COMPRESSED archive: 61 bytes of text -> 20 packed. Small
 	// enough to trace bit-by-bit against unpack20.cpp.
 	unit_tests.root_module.addAnonymousImport("rar2_v20_min", .{ .root_source_file = b.path("tests/fixtures/rar2_v20_min.rar") });

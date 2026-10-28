@@ -26,13 +26,16 @@ classify_rarz_test() {
 
 # UNRAR's checksum-error status is 3. Version 7.20 also reports truncated
 # service blocks with warning status 1 and an explicit end-of-archive error.
+# Corrupt archive-comment payloads can return 0 with an explicit diagnostic.
 # Generic warnings, fatal errors, unavailable input and timeouts are inconclusive.
 classify_unrar_test() {
-	local status=$1 diagnostic=${2-} line truncated=0
+	local status=$1 diagnostic=${2-} line truncated=0 corrupt_comment=0
 	while IFS= read -r line; do
 		line=${line%$'\r'}
 		[[ $line == 'Unexpected end of archive' ]] && truncated=1
+		[[ $line == 'The archive comment is corrupt' ]] && corrupt_comment=1
 	done <<< "$diagnostic"
+	if [[ $status == 0 && $corrupt_comment == 1 ]]; then printf 'damaged\n'; return; fi
 	case "$status:$truncated" in
 		0:0) printf 'valid\n' ;;
 		3:*|1:1) printf 'damaged\n' ;;

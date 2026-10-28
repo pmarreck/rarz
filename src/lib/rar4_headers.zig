@@ -252,8 +252,11 @@ pub fn validate_header_crc(data: []const u8, header: BlockHeader) bool {
 	const start = header.header_offset;
 	const end = start + header.head_size;
 	if (end > data.len) return false;
-	// CRC covers bytes from offset+2 (after the 2-byte CRC field) through end of header
-	const crc_data = data[start + 2 .. end];
+	// RAR 2.x embeds archive comments in MAIN_HEAD's total size, but its
+	// own CRC ends after RESERVED2. The nested comment has separate checksums.
+	const crc_size: usize = if (header.header_type == .main and header.flags & 0x0002 != 0) 13 else header.head_size;
+	if (crc_size > header.head_size) return false;
+	const crc_data = data[start + 2 .. start + crc_size];
 	const computed = integrity.crc16(crc_data);
 	return computed == header.head_crc;
 }

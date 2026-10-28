@@ -31,7 +31,9 @@ function M.rarz(status,output)
 	return 'tool-error'
 end
 function M.reference(status,diagnostic)
-	local truncated=('\n'..diagnostic:gsub('\r\n','\n')..'\n'):find('\nUnexpected end of archive\n',1,true)
+	local lines='\n'..diagnostic:gsub('\r\n','\n')..'\n'
+	local truncated=lines:find('\nUnexpected end of archive\n',1,true)
+	if status==0 and lines:find('\nThe archive comment is corrupt\n',1,true) then return 'damaged' end
 	if status==0 and not truncated then return 'valid' end
 	if status==3 or (status==1 and truncated) then return 'damaged' end
 	if status==13 and ('\n'..diagnostic):match('\nERROR: Bad archive [^\n]+') then return 'damaged' end

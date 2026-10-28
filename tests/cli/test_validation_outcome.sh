@@ -63,6 +63,10 @@ check_reference_sets() {
 	[[ $valid_codes == "$want_valid" && $damaged_codes == "$want_damage" ]] || fail "$label: unrar valid='$valid_codes' damaged='$damaged_codes', expected '$want_valid'/'$want_damage'"
 }
 check_reference_sets ordinary '' '0 ' '3 '
+check_reference_sets corrupt-comment 'The archive comment is corrupt' '' '0 3 '
+check_reference_sets corrupt-comment-crlf $'The archive comment is corrupt\r\n' '' '0 3 '
+check_reference_sets corrupt-comment-prefix 'Cannot open The archive comment is corrupt' '0 ' '3 '
+check_reference_sets corrupt-comment-filename 'The archive comment is corrupt.rar' '0 ' '3 '
 check_reference_sets generic-warning 'Unrecognized warning' '0 ' '3 '
 check_reference_sets truncated 'Unexpected end of archive' '' '1 3 '
 check_reference_sets truncated-crlf $'Unexpected end of archive\r\nTruncated at the service block: quick open information\r\n' '' '1 3 '

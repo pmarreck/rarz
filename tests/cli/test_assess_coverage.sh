@@ -40,6 +40,13 @@ capture ./assess-coverage --profile "$scratch/primary-header.json" --margin 0.49
 [[ $rc == 0 ]] || fail "reference must read damaged primary headers instead of cached quick-open copies (exit $rc): $err"
 jq -e '.cells[0].eligible == 4 and .cells[0].detected == 4 and .cells[0].counts.disagreement == 0' "$scratch/primary-header/summary.json" >/dev/null 2>&1 || fail 'primary-header corruption escaped the reference oracle'
 jq -e '.reference_args == ["t","-p-","-idq","-qo-"]' "$scratch/primary-header/summary.json" >/dev/null 2>&1 || fail 'reference invocation is missing from evidence'
+cat > "$scratch/comment-payload.json" <<'PROFILE'
+{"profile":1,"name":"comment_payload","root":{"zone":{"kind":"range","unit":"bits","anchor":"start","start":367,"length":1,"count":1},"do":{"op":"flip"}}}
+PROFILE
+capture ./assess-coverage --profile "$scratch/comment-payload.json" --margin 0.49 --max-attempts 4 --output "$scratch/comment-payload" tests/fixtures/rar2_v20_comment.rar
+[[ $rc == 0 ]] || fail "comment damage with reference exit zero was misclassified (exit $rc): $err"
+jq -e '.cells[0].eligible == 4 and .cells[0].detected == 4 and .cells[0].counts.disagreement == 0' "$scratch/comment-payload/summary.json" >/dev/null 2>&1 || fail 'comment damage did not enter the confirmed-damage denominator'
+jq -s -e 'length == 4 and all(.[]; .reference.exit == 0 and .reference.class == "damaged")' "$scratch/comment-payload/trials.jsonl" >/dev/null 2>&1 || fail 'comment diagnostic control did not exercise reference exit zero'
 cat > "$scratch/accept-all" <<'MOCK'
 #!/usr/bin/env bash
 if [[ $1 == --about ]]; then printf 'test validator\n'; else printf 'Validation: VALID\n'; fi

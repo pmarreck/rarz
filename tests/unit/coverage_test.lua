@@ -41,6 +41,10 @@ assert(c.reference(124,'Unexpected end of archive\n')=='tool-error')
 assert(c.reference(13,'ERROR: Bad archive /tmp/case.rar\n')=='damaged')
 assert(c.reference(13,'other fatal error\n')=='tool-error')
 local diagnostics={
+	{text='The archive comment is corrupt\n',comment=true},
+	{text='\nThe archive comment is corrupt\r\n',comment=true},
+	{text='prefix The archive comment is corrupt\n',comment=false},
+	{text='The archive comment is corrupt.rar\n',comment=false},
 	{text='',truncated=false,bad=false},
 	{text='warning\n',truncated=false,bad=false},
 	{text='Unexpected end of archive\n',truncated=true,bad=false},
@@ -53,6 +57,7 @@ for status=0,255 do for _,d in ipairs(diagnostics) do
 	local expected='tool-error'
 	if status==0 and not d.truncated then expected='valid' end
 	if status==3 or (status==1 and d.truncated) or (status==13 and d.bad) then expected='damaged' end
+	if status==0 and d.comment then expected='damaged' end
 	assert(c.reference(status,d.text)==expected)
 end end
 assert(c.pair('damaged','damaged')=='detected')

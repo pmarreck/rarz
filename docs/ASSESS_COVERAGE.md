@@ -97,7 +97,10 @@ Only explicit, matching verdict/exit pairs count as rarz detection. UNRAR
 damage classification accepts checksum-error exit 3, exit 1 with the exact
 `Unexpected end of archive` diagnostic, and exit 13 with the `ERROR: Bad
 archive ...` diagnostic observed in UNRAR 7.20. Other nonzero results remain
-inconclusive. This reference is an operational oracle, not a complete formal
+inconclusive. An exit-zero result with the exact `The archive comment is corrupt`
+diagnostic also proves comment damage; an independent producer mutation
+[establishes that exception](plan_context/rar2-comments.md). This reference is
+an operational oracle, not a complete formal
 specification of RAR validity. Disagreements need examination before changing
 either decoder's interpretation.
 

@@ -1672,10 +1672,11 @@ fn collectRar5Files(alloc: std.mem.Allocator, block_data: []const u8) ![]rar5_he
 
 	var iter = rar5_headers.walk_blocks(block_data);
 	while (true) {
-		const block = iter.next() catch break;
+		const block = try iter.next();
 		if (block == null) break;
 		switch (block.?) {
 			.file => |fb| try files.append(alloc, fb),
+			.end_archive => break,
 			else => {},
 		}
 	}
@@ -1689,10 +1690,11 @@ fn collectRar4Files(alloc: std.mem.Allocator, block_data: []const u8) ![]rar4_he
 
 	var iter = rar4_headers.walk_blocks(block_data);
 	while (true) {
-		const block = iter.next() catch break;
+		const block = try iter.next();
 		if (block == null) break;
 		switch (block.?) {
 			.file => |fh| try files.append(alloc, fh),
+			.end_archive => break,
 			else => {},
 		}
 	}
@@ -1723,7 +1725,7 @@ fn collectRar4FilesUnified(alloc: std.mem.Allocator, volumes: []const VolumeData
 	for (volumes, 0..) |vol, vi| {
 		var iter = rar4_headers.walk_blocks(vol.data[vol.block_data_offset..]);
 		while (true) {
-			const block = iter.next() catch break;
+			const block = try iter.next();
 			if (block == null) break;
 			switch (block.?) {
 				.file => |fh| {
@@ -1734,6 +1736,7 @@ fn collectRar4FilesUnified(alloc: std.mem.Allocator, volumes: []const VolumeData
 						.packed_data_offset = header_end,
 					});
 				},
+				.end_archive => break,
 				else => {},
 			}
 		}
@@ -1831,7 +1834,7 @@ fn collectRar5FilesUnified(alloc: std.mem.Allocator, volumes: []const VolumeData
 		const block_data = vol.data[vol.block_data_offset..];
 		var iter = rar5_headers.walk_blocks(block_data);
 		while (true) {
-			const block = iter.next() catch break;
+			const block = try iter.next();
 			if (block == null) break;
 			switch (block.?) {
 				.file => |fb| {
@@ -1843,6 +1846,7 @@ fn collectRar5FilesUnified(alloc: std.mem.Allocator, volumes: []const VolumeData
 						.packed_data_offset = header_end,
 					});
 				},
+				.end_archive => break,
 				else => {},
 			}
 		}
@@ -2427,6 +2431,54 @@ test "rarz_max_dictionary_size reports the window the decoder will allocate" {
 	const r14_archive = rarz_open(&rar14, rar14.len) orelse return error.TestUnexpectedResult;
 	defer rarz_close(r14_archive);
 	try testing.expectEqual(@as(u64, 0), rarz_max_dictionary_size(r14_archive));
+}
+
+fn expectMalformedCollectionRejected(data: []const u8, lengths: []const usize, volume_api: bool) !void {
+	for (lengths) |length| {
+		const pointers = [_][*]const u8{data.ptr};
+		const sizes = [_]usize{length};
+		const handle = if (volume_api)
+			rarz_open_volumes(&pointers, &sizes, 1)
+		else
+			rarz_open(data.ptr, length);
+		defer if (handle) |archive| rarz_close(archive);
+		try testing.expect(handle == null);
+	}
+}
+
+test "RAR4 single archive collection rejects incomplete final headers" {
+	try expectMalformedCollectionRejected(@embedFile("rar2_v20_m3"), &.{ 11997, 12138, 12400 }, false);
+}
+
+test "RAR4 volume collection rejects incomplete final headers" {
+	try expectMalformedCollectionRejected(@embedFile("rar2_v20_m3"), &.{ 11997, 12138, 12400 }, true);
+}
+
+test "RAR5 single archive collection rejects incomplete final headers" {
+	const data: []const u8 = @embedFile("rar5_store");
+	try expectMalformedCollectionRejected(data, &.{data.len - 1}, false);
+}
+
+test "RAR5 volume collection rejects incomplete final headers" {
+	const data: []const u8 = @embedFile("rar5_store");
+	try expectMalformedCollectionRejected(data, &.{data.len - 1}, true);
+}
+
+test "archive collection stops at ENDARC before trailing padding" {
+	for ([_][]const u8{ @embedFile("rar4_store"), @embedFile("rar5_store") }) |data| {
+		const padded = try testing.allocator.alloc(u8, data.len + 7);
+		defer testing.allocator.free(padded);
+		@memcpy(padded[0..data.len], data);
+		@memset(padded[data.len..], 0xa5);
+		for ([_]bool{ false, true }) |volume_api| {
+			const pointers = [_][*]const u8{padded.ptr};
+			const sizes = [_]usize{padded.len};
+			const handle = (if (volume_api) rarz_open_volumes(&pointers, &sizes, 1)
+				else rarz_open(padded.ptr, padded.len)) orelse return error.TestUnexpectedResult;
+			defer rarz_close(handle);
+			try testing.expect(rarz_file_count(handle) > 0);
+		}
+	}
 }
 
 test "header-encrypted archives are not-covered, never damaged and never blessed" {

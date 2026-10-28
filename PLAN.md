@@ -4,12 +4,11 @@ Completed records: [docs/PLAN_LOG.md](docs/PLAN_LOG.md). Historical decisions an
 
 ## Current milestone
 
-- [ ] Publish the RAR2 partial-header fix after its complete 452-unit/CLI acceptance and verify exact-commit CI (context: docs/plan_context/rar2-truncation.md).
-- [ ] Qualify native macOS ARM64, Linux ARM64, and Windows runtime/isolation on their respective runners; current evidence is Linux AMD64 runtime plus five-target cross-build/publication checks (context: docs/plan_context/build-layout.md).
+- [ ] Publish the accepted FFI parser-error fix and verify exact-commit CI; all 457 units, complete CLI/v70, and native macOS checks pass (context: docs/plan_context/archive-collection.md).
+- [ ] Qualify the complete macOS CLI/isolation suite and native Linux ARM64/Windows runtime; macOS ARM64 units and package smoke now pass (context: docs/plan_context/build-layout.md).
 
 ## Correctness queue
 
-- [ ] Reproduce and prevent FFI collection from swallowing parser errors and verifying a surviving archive prefix; cover single and multi-volume readers.
 - [ ] Determine whether header/checksum damage can be proved before returning UNVERIFIABLE for the six corrupted inputs resembling encrypted headers (context: docs/COVERAGE_20261015.md).
 - [ ] Reproduce and fix writer header overflow for names near 4096 bytes (#20).
 - [ ] Verify unknown-block skip semantics against the format contract and add rejection controls where required (#29).
@@ -50,7 +49,7 @@ Completed records: [docs/PLAN_LOG.md](docs/PLAN_LOG.md). Historical decisions an
 
 ## Recent completions
 
-- [x] Reject the three RAR2 partial-header campaign misses and all 18 related cuts while preserving valid vintage EOF; complete ./test passed 452 units and all CLI suites (done 2026-10-27 23:19 EDT; commit pending, context: docs/plan_context/rar2-truncation.md).
+- [x] Reject the three RAR2 partial-header campaign misses and all 18 related cuts while preserving valid vintage EOF; complete ./test passed 452 units and all CLI suites, and exact-commit CI passed in 112 seconds (done 2026-10-27 23:34 EDT; commit 279bb66, context: docs/plan_context/rar2-truncation.md).
 - [x] Publish corruption assessment, v70 memory correction, timestamps, and Nix target publication; exact commit 5e11586 passed Mechatron Prime CI in 87 seconds (done 2026-10-27 23:11 EDT; context: docs/plan_context/build-layout.md).
 - [x] Implement cross-platform-project-build-arch build/run/test layout, verified five-target publication, native profile checks, and assessment selection; complete ./test passed with native runtime limits documented (done 2026-10-27 23:02 EDT; commit 5e11586, context: docs/plan_context/build-layout.md).
 - [x] Trace and fix eager dictionary writes; pass 450 ReleaseSafe units and the full pristine/two-mutation v70 gate at 11.03 GiB peak, preserving source corpus bytes (done 2026-10-27 21:41 EDT; uncommitted, context: docs/plan_context/v70-memory.md).

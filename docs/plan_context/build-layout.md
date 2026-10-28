@@ -47,3 +47,11 @@ identity checks. The assessment default-path regression proves that a stale
 flat binary cannot override `bin/PF/rarz`. `./build --all` published all five
 targets while preserving the old flat outputs. All seven declared CI targets
 also built locally. These results retain the native runtime limits above.
+
+Subsequent native macOS ARM64 Nix checks passed 452 safety-checked unit tests
+and the installed-package smoke test, including pristine/damaged validation
+and threaded compression. This advances native package qualification; the
+complete CLI suite and its OS isolation boundary remain unqualified there.
+Windows AMD64 `--about` also executed successfully under Wine 11.16 with the
+correct compiled identity. Emulation startup is distinct from native Windows
+archive-validation evidence.

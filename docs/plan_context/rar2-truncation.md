@@ -20,5 +20,6 @@ report remains historical evidence; its counts are not rewritten after a fix.
 Complete `./test` passed on October 27, 2026: all 452 safety-checked unit tests,
 every CLI suite, and the pristine/two-mutation v70 gate. Runtime peak was
 11,837,755,392 bytes. This establishes `rarz t` and iterator behavior. The FFI
-collection paths still swallow parser errors; their verification consequences
-are a separate queued regression and are not claimed fixed here.
+collection paths still swallowed parser errors at that checkpoint; their verification consequences
+were a separate queued regression. Their follow-up is documented in
+[archive collection](archive-collection.md).

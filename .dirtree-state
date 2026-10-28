@@ -13,6 +13,7 @@ annotate=[
 	docs/evidence/coverage-20261015-cases.jsonl = Replay records for all 14 observed anomalies
 	docs/evidence/coverage-20261015.json = Public-safe per-pair counts, intervals, and tool identities
 	docs/evidence/rar-fixtures.sha256 = Content hashes of the committed archive fixture corpus
+	docs/plan_context/archive-collection.md = FFI parser-error propagation, independent controls, and reference limits
 	docs/plan_context/build-layout.md = Build layout, publication controls, and qualification limits
 	docs/plan_context/development-history.md = Archived development decisions and measurements; superseded claims remain historical
 	docs/plan_context/rar2-truncation.md = Diagnosis and independent controls for incomplete legacy archive headers

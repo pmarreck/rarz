@@ -20,6 +20,8 @@ for order in plain-first encrypted-first; do
 	[[ $rc == 0 ]] || { fail "$order reference rejected pristine volumes"; continue; }
 	capture "$RARZ" t "$first"
 	[[ $rc == 0 && $out == *'Encrypted: yes'* ]] || fail "$order intact mixed-volume classification failed"
+	capture "$RARZ" verify "$first"
+	[[ $rc == 69 && $out != *'FAIL'* ]] || fail "$order per-file verification must report encrypted content as incomplete, not damage (exit $rc)"
 	part=1; [[ $order == plain-first ]] || part=2
 	# Change only the first plaintext payload byte; preserve all header checksums.
 	luajit - "$scratch/$prefix.part$part.rar" <<'LUA'

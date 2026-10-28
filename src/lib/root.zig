@@ -1057,6 +1057,12 @@ export fn rarz_verify_file(
 			clearLastError();
 			return VERIFY_OK;
 		}
+		if (uf.is_encrypted) {
+			setLastError("entry is encrypted; contents cannot be verified without a password");
+			res.is_encrypted = 1;
+			res.status = VERIFY_UNSUPPORTED;
+			return VERIFY_UNSUPPORTED;
+		}
 		if (uf.packed_chunks.len == 0) {
 			setLastError("file has no packed data");
 			return VERIFY_ERROR;
@@ -2871,6 +2877,50 @@ test "rarz_verify_archive keeps mixed encryption incomplete rather than valid or
 	try testing.expectEqual(@as(u32, 1), summary.verified_entry_count);
 	try testing.expectEqual(@as(u32, 0), summary.damaged_entry_count);
 	try testing.expectEqual(@as(u32, 1), summary.unsupported_entry_count);
+}
+
+test "multi-volume C verification preserves encrypted entry accounting in either order" {
+	const cases = [_][2][]const u8{
+		.{ @embedFile("rar5_mixed_plain_first_1"), @embedFile("rar5_mixed_plain_first_2") },
+		.{ @embedFile("rar5_mixed_encrypted_first_1"), @embedFile("rar5_mixed_encrypted_first_2") },
+	};
+	for (cases, 0..) |bytes, order| {
+		const pointers = [_][*]const u8{ bytes[0].ptr, bytes[1].ptr };
+		const lengths = [_]usize{ bytes[0].len, bytes[1].len };
+		const archive = rarz_open_volumes(&pointers, &lengths, 2) orelse return error.TestUnexpectedResult;
+		defer rarz_close(archive);
+		var entry: RarzVerifyResult = undefined;
+		const encrypted_index: u32 = @intCast(1 - order);
+		try testing.expectEqual(VERIFY_UNSUPPORTED, rarz_verify_file(archive, encrypted_index, &entry));
+		try testing.expectEqual(@as(u8, 1), entry.is_encrypted);
+		try testing.expectEqual(@as(u64, 0), entry.bytes_verified);
+		var summary: RarzVerifyArchiveSummary = undefined;
+		try testing.expectEqual(ARCHIVE_VERIFY_INCOMPLETE, rarz_verify_archive(archive, &summary));
+		try testing.expectEqual(@as(u32, 2), summary.entry_count);
+		try testing.expectEqual(summary.entry_count, summary.accountedEntryCount());
+		try testing.expectEqual(@as(u32, 1), summary.verified_entry_count);
+		try testing.expectEqual(@as(u32, 1), summary.unsupported_entry_count);
+		try testing.expectEqual(@as(u32, 1), summary.encrypted_entry_count);
+		try testing.expectEqual(@as(u32, 0), summary.damaged_entry_count);
+	}
+}
+
+test "volume-open C verification classifies the complete encryption corpus" {
+	for (encryption_corpus) |fixture| {
+		const pointers = [_][*]const u8{fixture.bytes.ptr};
+		const lengths = [_]usize{fixture.bytes.len};
+		const archive = rarz_open_volumes(&pointers, &lengths, 1) orelse return error.TestUnexpectedResult;
+		defer rarz_close(archive);
+		var summary: RarzVerifyArchiveSummary = undefined;
+		const expected = if (fixture.encrypted > 0) ARCHIVE_VERIFY_INCOMPLETE else ARCHIVE_VERIFY_VERIFIED;
+		try testing.expectEqual(expected, rarz_verify_archive(archive, &summary));
+		try testing.expectEqual(fixture.encrypted + fixture.plain, summary.entry_count);
+		try testing.expectEqual(summary.entry_count, summary.accountedEntryCount());
+		try testing.expectEqual(fixture.plain, summary.verified_entry_count);
+		try testing.expectEqual(fixture.encrypted, summary.encrypted_entry_count);
+		try testing.expectEqual(fixture.encrypted, summary.unsupported_entry_count);
+		try testing.expectEqual(@as(u32, 0), summary.damaged_entry_count);
+	}
 }
 
 test "rarz_extract_to_buffer extracts stored file" {

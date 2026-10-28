@@ -172,36 +172,46 @@
           test-artifacts = mkRarz { optimize = "ReleaseSafe"; testArtifacts = true; };
         };
 
-        checks.default = checks-test;
-        checks.package-smoke = checks-package;
-        checks.classifiers = checks-classifiers;
-        checks.v70-controls = pkgs.runCommand "rarz-v70-controls" {
-          nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.diffutils pkgs.gnugrep ];
-        } ''
-          cp -R ${self} source
-          chmod -R u+w source
-          cd source
-          patchShebangs tests
-          bash tests/cli/test_v70_controls.sh
-          mkdir -p $out
-        '';
-        checks.test-driver = pkgs.runCommand "rarz-test-driver" {
-          nativeBuildInputs = [ pkgs.bash pkgs.coreutils ];
-        } ''
-          cd ${self}
-          bash tests/cli/test_test_driver.sh
-          mkdir -p $out
-        '';
-        checks.build-publication = assert sourceBoundaryTests; pkgs.runCommand "rarz-build-publication" {
-          nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.jq pkgs.llvmPackages.llvm
-            (pkgs.luajit.withPackages (ps: [ ps.lua-cjson ])) ];
-        } ''
-          cp -R ${self} source
-          chmod -R u+w source
-          cd source
-          bash tests/integration/build-matrix ${publicationProducts} ${mkRarz { optimize = "ReleaseSafe"; }} ${mkRarz { optimize = "Debug"; }}
-          mkdir -p $out
-        '';
+        checks = {
+          default = checks-test;
+          package-smoke = checks-package;
+          classifiers = checks-classifiers;
+          v70-controls = pkgs.runCommand "rarz-v70-controls" {
+            nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.diffutils pkgs.gnugrep ];
+          } ''
+            cp -R ${self} source
+            chmod -R u+w source
+            cd source
+            patchShebangs tests
+            bash tests/cli/test_v70_controls.sh
+            mkdir -p $out
+          '';
+          test-driver = pkgs.runCommand "rarz-test-driver" {
+            nativeBuildInputs = [ pkgs.bash pkgs.coreutils ];
+          } ''
+            cd ${self}
+            bash tests/cli/test_test_driver.sh
+            mkdir -p $out
+          '';
+          build-publication = assert sourceBoundaryTests; pkgs.runCommand "rarz-build-publication" {
+            nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.jq pkgs.llvmPackages.llvm
+              (pkgs.luajit.withPackages (ps: [ ps.lua-cjson ])) ];
+          } ''
+            cp -R ${self} source
+            chmod -R u+w source
+            cd source
+            bash tests/integration/build-matrix ${publicationProducts} ${mkRarz { optimize = "ReleaseSafe"; }} ${mkRarz { optimize = "Debug"; }}
+            mkdir -p $out
+          '';
+        } // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          windows-metadata = pkgs.runCommand "rarz-windows-metadata" {
+            nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.diffutils pkgs.rar pkgs.wineWow64Packages.stable ];
+          } ''
+            cd ${self}
+            bash tests/integration/windows-metadata ${targetPackages.mswin-amd64-ReleaseFast}/bin/rarz.exe
+            mkdir -p $out
+          '';
+        };
 
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [

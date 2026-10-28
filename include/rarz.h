@@ -106,6 +106,26 @@ typedef struct {
 int32_t rarz_file_info(const rarz_archive *archive, uint32_t index,
                        rarz_file_entry *out);
 
+enum {
+	RARZ_TIME_NONE = 0,
+	RARZ_TIME_UNIX = 1,
+	RARZ_TIME_DOS_LOCAL = 2
+};
+
+/* Additive metadata view; the existing rarz_file_entry layout is unchanged.
+ * RAR5 time is whole Unix seconds, including epoch zero when present.
+ * RAR4 time is the base header's local DOS calendar value, with no time zone.
+ * Subseconds, access/creation times, and RAR4 extended time are not exposed. */
+typedef struct {
+	uint64_t attributes;
+	uint32_t mtime_raw;
+	uint8_t mtime_kind;
+	uint8_t has_posix_mode;
+} rarz_metadata;
+
+int32_t rarz_file_metadata(const rarz_archive *archive, uint32_t index,
+                          rarz_metadata *out);
+
 /* ========================================================================== */
 /* Validation                                                                 */
 /* ========================================================================== */

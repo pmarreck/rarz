@@ -42,6 +42,7 @@ const PackedChunk = struct {
 
 const UnifiedFile = struct {
 	name: []const u8,
+	attributes: u64 = 0,
 	unpacked_size: u64,
 	compression: rar5_headers.CompressionInfo,
 	data_crc32: ?u32,
@@ -287,6 +288,47 @@ const RarzFileEntry = extern struct {
 	split_before: u8,
 	split_after: u8,
 };
+
+const RarzMetadata = extern struct {
+	attributes: u64,
+	mtime_raw: u32,
+	mtime_kind: u8, // 0 absent, 1 Unix seconds, 2 local DOS calendar fields
+	has_posix_mode: u8,
+};
+
+fn fileMetadata(attributes: u64, mtime: ?u32, host_os: u64, rar4: bool) RarzMetadata {
+	return .{
+		.attributes = attributes,
+		.mtime_raw = mtime orelse 0,
+		.mtime_kind = if (mtime == null) 0 else if (rar4) 2 else 1,
+		.has_posix_mode = @intFromBool(host_os == (if (rar4) @as(u64, 3) else 1)),
+	};
+}
+
+export fn rarz_file_metadata(archive: ?*const ArchiveHandle, index: u32, out: ?*RarzMetadata) i32 {
+	const a = archive orelse { setLastError("null archive handle"); return -1; };
+	const result = out orelse { setLastError("null output pointer"); return -1; };
+	var metadata: ?RarzMetadata = null;
+	if (a.unified_files) |files| {
+		if (index < files.len) {
+			const file = files[index];
+			metadata = fileMetadata(file.attributes, file.mtime, file.host_os, file.rar4 != null);
+		}
+	} else if (a.rar5_files) |files| {
+		if (index < files.len) {
+			const file = files[index];
+			metadata = fileMetadata(file.attributes, file.mtime, file.host_os, false);
+		}
+	} else if (a.rar4_files) |files| {
+		if (index < files.len) {
+			const file = files[index];
+			metadata = fileMetadata(file.attributes, file.mtime, file.host_os, true);
+		}
+	}
+	result.* = metadata orelse { setLastError("file index out of range"); return -1; };
+	clearLastError();
+	return 0;
+}
 
 export fn rarz_file_info(archive: ?*const ArchiveHandle, index: u32, out: ?*RarzFileEntry) i32 {
 	const a = archive orelse {
@@ -1806,6 +1848,7 @@ fn collectRar4FilesUnified(alloc: std.mem.Allocator, volumes: []const VolumeData
 
 		try unified.append(alloc, .{
 			.name = first.fh.file_name,
+			.attributes = first.fh.attributes,
 			.unpacked_size = first.fh.unpacked_size,
 			// CompressionInfo is RAR5-shaped and cannot hold a RAR4 method
 			// (0x30-0x35 in a u3). Only the store-vs-compressed distinction is
@@ -1941,6 +1984,7 @@ fn collectRar5FilesUnified(alloc: std.mem.Allocator, volumes: []const VolumeData
 
 		try unified.append(alloc, .{
 			.name = try versionedName(alloc, first.fb),
+			.attributes = first.fb.attributes,
 			.unpacked_size = first.fb.unpacked_size,
 			.compression = first.fb.compression,
 			.data_crc32 = last_fb.data_crc32,
@@ -2242,6 +2286,70 @@ test "split parts merge only within the same file version" {
 		try testing.expectEqual(@as(i32, 0), rarz_file_info(handle, 0, &entry));
 		try testing.expectEqual(@as(u64, if (continuation_version == 1) 2 else 1), entry.packed_size);
 		try testing.expectEqualSlices(u8, "a;1", entry.name.?[0..entry.name_len]);
+	}
+}
+
+test "metadata API distinguishes absent time from Unix epoch and retains modes" {
+	for ([_]?u32{ null, 0, 951782400 }) |mtime| {
+		var bytes: [128]u8 = undefined;
+		@memcpy(bytes[0..8], &detect.RAR50_SIG);
+		var pos: usize = 8;
+		pos += build_rar5_block(bytes[pos..], 1, 0, null, null, &.{0});
+		var body: [32]u8 = undefined;
+		var n: usize = 0;
+		for ([_]u64{ if (mtime != null) 2 else 0, 0, 0o100751 }) |value|
+			n += encode_vint(value, body[n..]);
+		if (mtime) |value| {
+			std.mem.writeInt(u32, body[n..][0..4], value, .little);
+			n += 4;
+		}
+		body[n..][0..4].* = .{ 0, 1, 1, 'a' };
+		n += 4;
+		pos += build_rar5_block(bytes[pos..], 2, 0, null, null, body[0..n]);
+		pos += build_rar5_block(bytes[pos..], 5, 0, null, null, &.{0});
+		const pointers = [_][*]const u8{&bytes};
+		const lengths = [_]usize{pos};
+		for ([_]bool{ false, true }) |volumes| {
+			const handle = (if (volumes) rarz_open_volumes(&pointers, &lengths, 1) else rarz_open(&bytes, pos)) orelse return error.TestUnexpectedResult;
+			defer rarz_close(handle);
+			var metadata: RarzMetadata = undefined;
+			try testing.expectEqual(@as(i32, 0), rarz_file_metadata(handle, 0, &metadata));
+			try testing.expectEqual(@as(u64, 0o100751), metadata.attributes);
+			try testing.expectEqual(@as(u8, 1), metadata.has_posix_mode);
+			try testing.expectEqual(@as(u8, if (mtime != null) 1 else 0), metadata.mtime_kind);
+			try testing.expectEqual(mtime orelse 0, metadata.mtime_raw);
+			try testing.expectEqual(@as(i32, -1), rarz_file_metadata(handle, 1, &metadata));
+			try testing.expectEqual(@as(i32, -1), rarz_file_metadata(handle, 0, null));
+		}
+	}
+	var metadata: RarzMetadata = undefined;
+	try testing.expectEqual(@as(i32, -1), rarz_file_metadata(null, 0, &metadata));
+}
+
+test "metadata API identifies RAR4 Unix modes and local DOS time" {
+	const bytes = @embedFile("rar4_x86_filter");
+	const pointers = [_][*]const u8{bytes.ptr};
+	const lengths = [_]usize{bytes.len};
+	for ([_]bool{ false, true }) |volumes| {
+		const handle = (if (volumes) rarz_open_volumes(&pointers, &lengths, 1) else rarz_open(bytes.ptr, bytes.len)) orelse return error.TestUnexpectedResult;
+		defer rarz_close(handle);
+		var metadata: RarzMetadata = undefined;
+		try testing.expectEqual(@as(i32, 0), rarz_file_metadata(handle, 0, &metadata));
+		try testing.expectEqual(@as(u64, 0o100755), metadata.attributes);
+		try testing.expectEqual(@as(u8, 1), metadata.has_posix_mode);
+		try testing.expectEqual(@as(u8, 2), metadata.mtime_kind);
+		// The independent listing is 2026-08-05 10:32:29; DOS stores even seconds.
+		try testing.expectEqual(@as(u32, (46 << 25) | (8 << 21) | (5 << 16) | (10 << 11) | (32 << 5) | 14), metadata.mtime_raw);
+	}
+}
+
+test "metadata classifies the complete byte-sized host set by format" {
+	for ([_]bool{ false, true }) |rar4| {
+		for (0..256) |host| {
+			const metadata = fileMetadata(0o100755, 0, host, rar4);
+			const unix_host = if (rar4) host == 3 else host == 1;
+			try testing.expectEqual(@as(u8, @intFromBool(unix_host)), metadata.has_posix_mode);
+		}
 	}
 }
 

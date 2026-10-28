@@ -1,5 +1,13 @@
 # Timestamp interoperability
 
+Current status, 2026-10-28: the additive metadata API now distinguishes absent
+time, Unix seconds, and local DOS calendar fields without changing the existing
+file-info ABI. Whole-second extraction timestamps and POSIX permissions are
+restored, including directories after their children. RAR5 Unix host value and
+directory naming were also corrected. See [extraction metadata](extraction-metadata.md)
+for current acceptance; the sections below retain the earlier milestone and
+interruption evidence.
+
 Issue #31 identifies two epoch errors: the CLI packed filesystem times as DOS
 dates before passing them to the RAR5 writer, and listing interpreted RAR5
 Unix seconds as DOS bit fields. Existing payload comparisons did not compare

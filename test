@@ -18,6 +18,9 @@ system=$(nix eval --impure --raw --expr builtins.currentSystem) || exit 1
 smoke_failed=0
 nix build --no-link ".#checks.$system.package-smoke" || smoke_failed=1
 nix build --no-link ".#checks.$system.build-publication" || smoke_failed=1
+if [[ $system == x86_64-linux ]]; then
+	nix build --no-link ".#checks.$system.windows-metadata" || smoke_failed=1
+fi
 runtime=(nix develop -c bash tests/support/run-suite "$product" "$project" "$scratch")
 if command -v build-budget >/dev/null && ! [[ $(cat /proc/self/cgroup 2>/dev/null) == *agentbuilds.slice* ]]; then
 	build-budget --project rarz -- "${runtime[@]}"

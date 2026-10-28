@@ -5,11 +5,14 @@
 #include <errno.h>
 #include <time.h>
 #ifndef _WIN32
+#include <fcntl.h>
 #include <unistd.h>
 #include <libgen.h>
 #include <dirent.h>
 #else
 #include <io.h>
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #define isatty _isatty
 #define fileno _fileno
 #endif
@@ -1249,6 +1252,71 @@ cleanup:
 	return result;
 }
 
+typedef struct { uint32_t index, name_length; } metadata_target;
+
+static int metadata_children_first(const void *a, const void *b) {
+	uint32_t left = ((const metadata_target *)a)->name_length;
+	uint32_t right = ((const metadata_target *)b)->name_length;
+	if (left != right) return (left < right) - (left > right);
+	left = ((const metadata_target *)a)->index;
+	right = ((const metadata_target *)b)->index;
+	return (left > right) - (left < right);
+}
+
+static int metadata_unix_time(const rarz_metadata *metadata, time_t *stamp) {
+	if (metadata->mtime_kind == RARZ_TIME_UNIX) {
+		*stamp = (time_t)metadata->mtime_raw;
+		return 0;
+	}
+	if (metadata->mtime_kind != RARZ_TIME_DOS_LOCAL) return -1;
+	uint32_t raw = metadata->mtime_raw;
+	struct tm calendar = {0};
+	calendar.tm_year = (int)((raw >> 25) & 127) + 80;
+	calendar.tm_mon = (int)((raw >> 21) & 15) - 1;
+	calendar.tm_mday = (int)((raw >> 16) & 31);
+	calendar.tm_hour = (int)((raw >> 11) & 31);
+	calendar.tm_min = (int)((raw >> 5) & 63);
+	calendar.tm_sec = (int)(raw & 31) * 2;
+	calendar.tm_isdst = -1;
+	struct tm expected = calendar;
+	*stamp = mktime(&calendar);
+	if (*stamp == (time_t)-1 || calendar.tm_year != expected.tm_year ||
+	    calendar.tm_mon != expected.tm_mon || calendar.tm_mday != expected.tm_mday ||
+	    calendar.tm_hour != expected.tm_hour || calendar.tm_min != expected.tm_min ||
+	    calendar.tm_sec != expected.tm_sec) return -1;
+	return 0;
+}
+
+static int restore_entry_metadata(rarz_archive *archive, uint32_t index, const char *path) {
+	rarz_metadata metadata;
+	if (rarz_file_metadata(archive, index, &metadata) != 0) return -1;
+	if (metadata.mtime_kind != RARZ_TIME_NONE) {
+		time_t stamp;
+		if (metadata_unix_time(&metadata, &stamp) != 0) { errno = EINVAL; return -1; }
+#ifdef _WIN32
+		const uint64_t windows_epoch_seconds = 11644473600ULL;
+		const uint64_t ticks_per_second = 10000000ULL;
+		uint64_t ticks = ((uint64_t)stamp + windows_epoch_seconds) * ticks_per_second;
+		FILETIME modified = { (DWORD)ticks, (DWORD)(ticks >> 32) };
+		HANDLE file = CreateFileA(path, FILE_WRITE_ATTRIBUTES,
+		                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		                         NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+		if (file == INVALID_HANDLE_VALUE) { errno = EIO; return -1; }
+		BOOL updated = SetFileTime(file, NULL, NULL, &modified);
+		BOOL closed = CloseHandle(file);
+		if (!updated || !closed) { errno = EIO; return -1; }
+#else
+		struct timespec times[2] = { { .tv_sec = 0, .tv_nsec = UTIME_OMIT }, { .tv_sec = stamp, .tv_nsec = 0 } };
+		if (utimensat(AT_FDCWD, path, times, 0) != 0) return -1;
+#endif
+	}
+#ifndef _WIN32
+	/* Restore access permissions without installing setuid/setgid bits. */
+	if (metadata.has_posix_mode && chmod(path, (mode_t)(metadata.attributes & 0777)) != 0) return -1;
+#endif
+	return 0;
+}
+
 static int cmd_extract(const char *archive_path, const char *dest_dir) {
 	uint8_t **vol_bufs = NULL;
 	size_t *vol_lens = NULL;
@@ -1271,6 +1339,16 @@ static int cmd_extract(const char *archive_path, const char *dest_dir) {
 		free(vol_lens);
 		return 1;
 	}
+	metadata_target *targets = calloc(count ? count : 1, sizeof(*targets));
+	if (!targets) {
+		fprintf(stderr, "error: cannot allocate extraction metadata\n");
+		rarz_close(archive);
+		for (int i = 0; i < vol_count; i++) free(vol_bufs[i]);
+		free(vol_bufs);
+		free(vol_lens);
+		return 1;
+	}
+	uint32_t target_count = 0;
 
 	/* Pre-compute total unpacked size for progress tracking */
 	uint64_t total_size = 0;
@@ -1320,6 +1398,8 @@ static int cmd_extract(const char *archive_path, const char *dest_dir) {
 				fprintf(stderr, "error: cannot create directory '%s': %s\n",
 				        out_path, strerror(errno));
 				errors++;
+			} else {
+				targets[target_count++] = (metadata_target){ i, entry.name_len };
 			}
 			continue;
 		}
@@ -1378,6 +1458,7 @@ static int cmd_extract(const char *archive_path, const char *dest_dir) {
 		}
 
 		bytes_done += (uint64_t)extracted;
+		targets[target_count++] = (metadata_target){ i, entry.name_len };
 		progrez_update(pctx, files_done, bytes_done);
 
 		if (!g_is_tty) {
@@ -1387,6 +1468,26 @@ static int cmd_extract(const char *archive_path, const char *dest_dir) {
 
 	progrez_finish(pctx);
 	progrez_destroy(pctx);
+
+	/* All contents exist before restoring times. Children precede parents so
+	 * restrictive directory modes cannot block restoration below them. */
+	qsort(targets, target_count, sizeof(*targets), metadata_children_first);
+	for (uint32_t i = 0; i < target_count; i++) {
+		rarz_file_entry entry;
+		if (rarz_file_info(archive, targets[i].index, &entry) != 0) { errors++; continue; }
+		char name[4096], path[8192];
+		if (entry.name_len >= sizeof(name)) { errors++; continue; }
+		memcpy(name, entry.name, entry.name_len);
+		name[entry.name_len] = 0;
+		normalize_archive_path(name);
+		if (dest_dir) snprintf(path, sizeof(path), "%s/%s", dest_dir, name);
+		else snprintf(path, sizeof(path), "%s", name);
+		if (restore_entry_metadata(archive, targets[i].index, path) != 0) {
+			fprintf(stderr, "error: cannot restore metadata for '%s': %s\n", path, strerror(errno));
+			errors++;
+		}
+	}
+	free(targets);
 
 	printf("Extracted %u file%s", file_count, file_count == 1 ? "" : "s");
 	if (errors > 0) {

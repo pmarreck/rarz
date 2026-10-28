@@ -4,20 +4,17 @@ Completed records: [docs/PLAN_LOG.md](docs/PLAN_LOG.md). Historical decisions an
 
 ## Current milestone
 
-- [ ] Qualify the complete macOS CLI/isolation suite and native Linux ARM64/Windows runtime; macOS ARM64 units and package smoke now pass (context: docs/plan_context/build-layout.md).
+- [ ] Complete cross-platform-project-build-arch conformance through native runtime qualification: complete macOS CLI/isolation suite and Linux ARM64/Windows runtime; macOS ARM64 units and package smoke pass (context: docs/plan_context/build-layout.md).
 
 ## Correctness queue
 
 - [x] Recognize recovery volumes without integrity claims and normalize directory names; complete 475-unit/CLI/v70 and native macOS acceptance passed, followed by exact CI in 71 seconds (done 2026-10-28 03:06 EDT; commit c6a8b25; #36; context: docs/plan_context/recovery-volumes.md).
-- [x] Verify exact-commit CI for archive-comment checksums and the UNRAR exit-zero diagnostic rule; complete 473-unit/CLI/v70 and native macOS acceptance passed, followed by exact CI in 56 seconds (done 2026-10-28 02:01 EDT; commit 84cf819; #21; context: docs/plan_context/rar2-comments.md).
 - [x] Verify exact-commit CI for packed-part CRC validation and writer correction; complete 477-unit/CLI/v70 and native macOS acceptance passed, followed by exact CI in 76 seconds (done 2026-10-28 03:20 EDT; commit e4904a7; #26; context: docs/plan_context/packed-crc.md).
 - [x] Match producer integer volume units and reject overflow; complete 479-unit/CLI/v70, native macOS checks, and optimized build passed, then exact CI passed in 57 seconds (done 2026-10-28 03:46 EDT; commit 0945c7a; #33; context: docs/plan_context/volume-size-units.md).
 - [x] Validate RAR5 UTF-8 names independently of decoder support; complete 479-unit/CLI/v70, native macOS checks, and optimized build passed, then exact CI passed in 57 seconds (done 2026-10-28 03:46 EDT; commit 0945c7a; #30; context: docs/plan_context/utf8-names.md).
 - [x] Bound RAR5 headers and extra-record traversal; complete 486-unit/CLI/v70, native macOS checks, and optimized build passed, then exact CI passed in 51 seconds (done 2026-10-28 04:00 EDT; commit d20bcd4; #4; context: docs/plan_context/extra-record-bounds.md).
-- [ ] Verify exact-commit CI for RAR5 version records, distinct historical names, and extraction collision checks; complete 489-unit/CLI/v70, native macOS checks, and optimized build passed (#32; context: docs/plan_context/file-versions.md).
-- [ ] Restore extraction metadata, including directory times after children and RAR4 executable permissions (#35).
-- [ ] Define timestamp presence and time basis in a richer metadata API before closing the remaining normalization scope of #31 (context: docs/plan_context/timestamps.md).
-- [x] Correct RAR5 Unix host value and directory ordering; complete 473-unit/CLI/v70 and native macOS acceptance passed, followed by exact CI in 51 seconds (done 2026-10-28 02:45 EDT; commit c1e0dae; context: docs/plan_context/rar5-unix-metadata.md).
+- [x] Preserve RAR5 version records, distinct historical names, and extraction collision checks; complete 489-unit/CLI/v70, native macOS checks, optimized build, and exact CI passed in 85 seconds (done 2026-10-28 04:23 EDT; commit bd04561; #32; context: docs/plan_context/file-versions.md).
+- [ ] Verify exact-commit CI for extraction metadata and the additive timestamp API; complete 492-unit/CLI/v70 suite, native macOS checks, Windows emulation gate, and optimized build passed (#35, #31; context: docs/plan_context/extraction-metadata.md).
 - [ ] Account for encrypted RAR4 service/comment blocks and parse SALT/EXT_TIME fields (#11, #5).
 
 ## Evidence and resource follow-ups
@@ -40,9 +37,3 @@ Completed records: [docs/PLAN_LOG.md](docs/PLAN_LOG.md). Historical decisions an
 - [ ] Revisit input-side streaming only if a consumer requires it; output-side streaming verification is already delivered (context: docs/plan_context/development-history.md).
 - [ ] Consider handle arenas, FFI/helper separation, shared writer construction, and endian helper cleanup only when touching those paths for a measured need.
 - [ ] Build the remaining CLI argument-compatibility matrix against official rar behavior.
-
-## Recent completions
-
-- [x] Publish seed-44 evidence and reject its overlong RAR2 match; full 471-unit/CLI/v70 and native macOS acceptance passed, followed by exact CI in 51 seconds (done 2026-10-28 01:53 EDT; commit a2f7550, context: docs/COVERAGE_20261028_SEED44.md).
-- [x] Bound Nix compilation inputs and verify documentation reuse plus source invalidation; full 469-unit/CLI/v70 and native macOS checks passed, then exact CI passed in 69 seconds (done 2026-10-28 01:38 EDT; commit e80ea1e, context: docs/plan_context/compilation-source.md).
-- [x] Reject initial Huffman repeats and overflowing tenth-byte VINT values; full 469-unit/CLI/v70 acceptance and exact CI passed in 147 seconds (done 2026-10-28 01:12 EDT; commit 752511b, context: docs/plan_context/integer-and-table-bounds.md).

@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Exercise the actual AMD64 Windows executable under Wine in a Nix sandbox.
+set -u
+source tests/support/capture.bash || exit 1
+candidate=$1
+out='' err='' rc=0
+errors=0
+fail() { printf 'FAIL: %s\n' "$1"; errors=$((errors+1)); }
+export HOME="$TMPDIR/home" WINEPREFIX="$TMPDIR/wine" WINEDEBUG=-all
+export WINEDLLOVERRIDES='mscoree,mshtml=' TZ=UTC0
+export XDG_RUNTIME_DIR="$TMPDIR/runtime" FONTCONFIG_FILE="$TMPDIR/fonts.conf"
+mkdir -p "$HOME" "$TMPDIR/work" "$XDG_RUNTIME_DIR" || exit 1
+chmod 700 "$XDG_RUNTIME_DIR" || exit 1
+printf '<fontconfig><cachedir>%s/font-cache</cachedir></fontconfig>\n' "$TMPDIR" > "$FONTCONFIG_FILE"
+trap 'wineserver -k >/dev/null 2>&1; wineserver -w >/dev/null 2>&1' EXIT
+capture wine "$candidate" --about
+[[ $rc == 0 && $out == *'PF=mswin-amd64'* ]] || { fail "Windows startup failed: $out $err"; exit 1; }
+cd "$TMPDIR/work" || exit 1
+mkdir -p source/nested source/empty || exit 1
+printf 'Epoch control\n' > source/nested/epoch
+printf 'Future control\n' > source/future
+touch -d @0 source/nested/epoch || exit 1
+touch -d @4294967295 source/future || exit 1
+touch -d @951782400 source/nested source/empty source || exit 1
+for method in 0 3; do
+	capture rar a "-m$method" -idq "archive-$method.rar" source
+	[[ $rc == 0 ]] || { fail "producer m$method failed: $err"; continue; }
+	mkdir "output-$method" || exit 1
+	capture wine "$candidate" x "archive-$method.rar" "output-$method"
+	[[ $rc == 0 ]] || fail "Windows m$method extraction failed: $err"
+	for path in source source/nested source/empty source/nested/epoch source/future; do
+		[[ $(stat -c %Y "output-$method/$path") == $(stat -c %Y "$path") ]] || fail "Windows m$method mtime differs for $path"
+	done
+	cmp source/nested/epoch "output-$method/source/nested/epoch" >/dev/null || fail 'epoch contents differ'
+	cmp source/future "output-$method/source/future" >/dev/null || fail 'future contents differ'
+done
+[[ $errors == 0 ]] || exit 1
+printf 'PASS: Windows AMD64 metadata under Wine (native runtime remains unqualified)\n'

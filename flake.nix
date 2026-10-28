@@ -24,6 +24,16 @@
         pname = "rarz";
         version = "0.1.0";
 
+        sourceFilter = import ./nix/source-filter.nix;
+        sourceBoundaryTests = import ./tests/unit/source-filter.nix sourceFilter;
+        compilationSource = pkgs.lib.cleanSourceWith {
+          name = "rarz-build-source";
+          src = self;
+          filter = path: type:
+            sourceFilter (if toString path == toString self then ""
+              else pkgs.lib.removePrefix "${self}/" (toString path)) type;
+        };
+
         isDarwin = pkgs.stdenv.isDarwin;
 
         zigDepsHash = "sha256-LVJqd/hSp1YI2XQqsFRXLfXomoM3SDP02ppmhr7D/Us=";
@@ -31,7 +41,7 @@
         zigDeps = pkgs.stdenv.mkDerivation {
           pname = "${pname}-zig-deps";
           inherit version;
-          src = self;
+          src = compilationSource;
           nativeBuildInputs = with pkgs; [ zig git cacert ]
             ++ pkgs.lib.optionals isDarwin [
               pkgs.darwin.cctools
@@ -55,7 +65,7 @@
           else "${pkgs.stdenv.hostPlatform.parsed.cpu.name}-macos";
         mkRarz = { optimize, target ? nativeTarget, testArtifacts ? false }: pkgs.stdenv.mkDerivation {
           inherit pname version;
-          src = self;
+          src = compilationSource;
 
           nativeBuildInputs = [ zig ]
             ++ pkgs.lib.optionals isDarwin [
@@ -117,7 +127,7 @@
         checks-test = pkgs.stdenv.mkDerivation {
           pname = "${pname}-tests";
           inherit version;
-          src = self;
+          src = compilationSource;
 
           nativeBuildInputs = [ zig ]
             ++ pkgs.lib.optionals isDarwin [
@@ -182,7 +192,7 @@
           bash tests/cli/test_test_driver.sh
           mkdir -p $out
         '';
-        checks.build-publication = pkgs.runCommand "rarz-build-publication" {
+        checks.build-publication = assert sourceBoundaryTests; pkgs.runCommand "rarz-build-publication" {
           nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.jq pkgs.llvmPackages.llvm
             (pkgs.luajit.withPackages (ps: [ ps.lua-cjson ])) ];
         } ''

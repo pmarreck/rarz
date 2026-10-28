@@ -11,7 +11,6 @@ Completed records: [docs/PLAN_LOG.md](docs/PLAN_LOG.md). Historical decisions an
 ## Correctness queue
 
 - [ ] Recognize recovery-volume signatures without claiming recovery-data verification (#36).
-- [ ] Verify exact-commit CI for initial Huffman-repeat and tenth-byte VINT guards; complete 469-unit/CLI/v70 acceptance and native build passed (#3, #8; context: docs/plan_context/integer-and-table-bounds.md).
 - [ ] Reproduce the RAR2 embedded-comment header CRC report with an independent fixture (#21).
 - [ ] Add per-part packed CRC checks to split-volume validation (#26).
 - [ ] Verify binary/decimal volume-size suffix behavior against the producer CLI (#33).
@@ -25,7 +24,7 @@ Completed records: [docs/PLAN_LOG.md](docs/PLAN_LOG.md). Historical decisions an
 
 ## Evidence and resource follow-ups
 
-- [ ] Bound Nix compilation source inputs so documentation-only edits reuse built products while required fixtures and adapter checks remain declared dependencies.
+- [ ] Verify exact-commit CI for bounded Nix compilation inputs; complete 469-unit/CLI/v70 acceptance, native macOS checks, and documentation/source invalidation controls passed (context: docs/plan_context/compilation-source.md).
 - [ ] Add tested interruption propagation from ./test to its admitted runtime scope; retain the distinction between interrupted parent and still-running child.
 - [ ] Adjudicate reference missing-volume and memory-limit outcomes from both campaigns without treating generic failures as damage; all six header-CRC disagreements resolve with quick-open disabled (context: docs/COVERAGE_20261028.md).
 - [ ] Migrate remaining legacy mutation gates to versioned definitions with distinct crash, timeout, and resource outcomes (context: docs/ARCHIVE_EVIDENCE_INDEX.md).
@@ -47,6 +46,7 @@ Completed records: [docs/PLAN_LOG.md](docs/PLAN_LOG.md). Historical decisions an
 
 ## Recent completions
 
+- [x] Reject initial Huffman repeats and overflowing tenth-byte VINT values; full 469-unit/CLI/v70 acceptance and exact CI passed in 147 seconds (done 2026-10-28 01:12 EDT; commit 752511b, context: docs/plan_context/integer-and-table-bounds.md).
 - [x] Verify exact-commit CI for uncached reference and seed-43 evidence commit c2cb48d; passed in 95 seconds (done 2026-10-28 00:58 EDT; context: docs/COVERAGE_20261028.md).
 - [x] Correct writer header/caller-buffer bounds and reject impossible volume capacity; full 465-unit/CLI/v70 and native macOS checks passed, then exact-commit CI passed in 103 seconds (done 2026-10-28 00:36 EDT; commit 1251857, context: docs/plan_context/writer-bounds.md).
 - [x] Resolve #29 unknown-block skip semantics: both flag values remain readable in eight RAR4/RAR5 reference controls; eight CRC mutations are rejected, so flag absence alone is not a damage rule (done 2026-10-28 00:22 EDT; context: docs/plan_context/unknown-blocks.md).

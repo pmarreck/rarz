@@ -10,6 +10,11 @@ provides a separate 18-pair statistical campaign, exact candidate identities,
 and replayable findings. It does not replace the historical acceptance
 evidence below.
 
+The [seed-44 follow-up](COVERAGE_20261028_SEED44.md) disables reference quick-open
+and meets the same 18-pair precision target. It records 6,929 detections, one
+RAR2 decoded-size miss, and three reference-inconclusive cases. Its historical
+miss remains recorded after the targeted decoder correction.
+
 ## Replay
 
 Run `./test` for the complete local entry point. On a shared Linux build host:

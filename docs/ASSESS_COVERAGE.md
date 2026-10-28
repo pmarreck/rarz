@@ -1,8 +1,10 @@
 # Corrupt-input detection assessment
 
-The [October 28 campaign](COVERAGE_20261028.md) contains fresh seed-43 results
-and the quick-open reference finding. The [October 15 campaign](COVERAGE_20261015.md)
-preserves the first default run and its original gaps.
+The [seed-44 campaign](COVERAGE_20261028_SEED44.md) uses the uncached reference
+protocol and preserves one newly found RAR2 decoded-size miss. The prior
+[seed-43 campaign](COVERAGE_20261028.md) records the quick-open reference finding.
+The [October 15 campaign](COVERAGE_20261015.md) preserves the first default run
+and its original gaps.
 
 `./assess-coverage` measures how often `rarz t` rejects damage confirmed by
 the independent UNRAR implementation. Supply one or more known-good,

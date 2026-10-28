@@ -822,15 +822,18 @@ pub const Session = struct {
             }
         };
 
+        // Clipping an overlong final match can preserve the original CRC while
+        // concealing a malformed compressed stream. Check before either output
+        // path reports success; streaming callers may already have a prefix.
+        if (st.written_size > st.unpacked_size) return error.InvalidData;
+
         // Streaming entry: emit whatever is still held back and we are done.
         if (st.stream_out != null) {
             try flushDecoded(st, 0);
             return;
         }
 
-        const out_size: usize = @intCast(@min(st.written_size, st.unpacked_size));
-        // A trailing match may overshoot the declared size, so measure how far
-        // the cursor actually moved rather than assuming it moved out_size.
+        const out_size: usize = @intCast(st.written_size);
         const consumed = st.window.write_pos - start_pos;
         if (!st.window.emitTo(out, consumed, out_size)) {
             // The entry is larger than the window, so its opening bytes have
@@ -1081,6 +1084,63 @@ test "unpack20: real RAR 2.90 store archive decodes byte-identically" {
     const data: []const u8 = @embedFile("rar2_v20_store");
     const result = policy.validate(data);
     try std.testing.expect(result.is_valid);
+}
+
+test "unpack20: reject seed-44 trailing match overshoot" {
+	const rar4 = @import("../rar4_headers.zig");
+	const archive = @embedFile("rar2_v20_m3");
+	var iter = rar4.BlockIterator{ .data = archive, .pos = 0 };
+	var found = false;
+	while (try iter.next()) |block| switch (block) {
+		.file => |f| {
+			if (!std.mem.eql(u8, f.file_name, "text1.txt")) continue;
+			found = true;
+			const start = f.block.header_offset + f.block.head_size;
+			const payload = archive[start .. start + @as(usize, @intCast(f.packed_size))];
+			const mutant = try std.testing.allocator.dupe(u8, payload);
+			defer std.testing.allocator.free(mutant);
+			try std.testing.expectEqual(@as(u8, 0xf5), mutant[12393 - start]);
+			mutant[12393 - start] ^= 0x08;
+			for ([_]u5{ 13, 16 }) |bits| {
+				var session = try Session.init(std.testing.allocator, bits);
+				defer session.deinit();
+				var pristine = sink.VerifySink.init(false);
+				try session.decodeFile(payload, f.unpacked_size, false, pristine.sink());
+				try std.testing.expectEqual(f.unpacked_size, pristine.len);
+				try std.testing.expectEqual(f.file_crc, pristine.crc32());
+				var damaged = sink.DiscardSink{};
+				try std.testing.expectError(error.InvalidData, session.decodeFile(mutant, f.unpacked_size, false, damaged.sink()));
+				try std.testing.expect(damaged.len <= f.unpacked_size);
+			}
+		},
+		else => {},
+	};
+	try std.testing.expect(found);
+}
+
+test "unpack20: refuse a match crossing a streaming entry's declared end" {
+	const rar4 = @import("../rar4_headers.zig");
+	const archive = @embedFile("rar2_v20_md64_large");
+	var iter = rar4.BlockIterator{ .data = archive, .pos = 0 };
+	var found = false;
+	while (try iter.next()) |block| switch (block) {
+		.file => |f| {
+			found = true;
+			const start = f.block.header_offset + f.block.head_size;
+			const payload = archive[start .. start + @as(usize, @intCast(f.packed_size))];
+			var session = try Session.init(std.testing.allocator, 16);
+			defer session.deinit();
+			var pristine = sink.VerifySink.init(false);
+			try session.decodeFile(payload, f.unpacked_size, false, pristine.sink());
+			try std.testing.expectEqual(f.unpacked_size, pristine.len);
+			try std.testing.expectEqual(f.file_crc, pristine.crc32());
+			var shortened = sink.DiscardSink{};
+			try std.testing.expectError(error.InvalidData, session.decodeFile(payload, 65537, false, shortened.sink()));
+			try std.testing.expect(shortened.len > 0 and shortened.len <= 65537);
+		},
+		else => {},
+	};
+	try std.testing.expect(found);
 }
 
 test "unpack20: minimal real v20 COMPRESSED archive decodes" {

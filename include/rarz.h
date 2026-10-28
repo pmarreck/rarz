@@ -83,7 +83,8 @@ uint32_t rarz_file_count(const rarz_archive *archive);
 /* ========================================================================== */
 
 typedef struct {
-	const char *name;       /* UTF-8, NOT null-terminated */
+	const char *name;       /* UTF-8, NOT null-terminated; valid until close.
+	                        * RAR5 historical revisions include a ;N suffix. */
 	uint32_t name_len;
 	uint64_t unpacked_size;
 	uint64_t packed_size;

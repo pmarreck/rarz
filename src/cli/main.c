@@ -1204,6 +1204,51 @@ static int cmd_list(const char *path) {
 /* cmd_extract                                                                */
 /* ========================================================================== */
 
+typedef struct {
+	char *name;
+	int directory;
+} extraction_name;
+
+static int compare_extraction_names(const void *a, const void *b) {
+	return strcmp(((const extraction_name *)a)->name, ((const extraction_name *)b)->name);
+}
+
+/* Check the complete name set before any output is created. A literal name
+ * ending in ;N can coincide with a historical revision's generated name. */
+static int check_extraction_names(rarz_archive *archive, uint32_t count) {
+	if (count == 0) return 0;
+	extraction_name *names = calloc(count, sizeof(*names));
+	if (!names) { fprintf(stderr, "error: cannot allocate extraction names\n"); return -1; }
+	int result = -1;
+	for (uint32_t i = 0; i < count; i++) {
+		rarz_file_entry entry;
+		if (rarz_file_info(archive, i, &entry) != 0) goto cleanup;
+		if (entry.name_len >= 4096 || memchr(entry.name, 0, entry.name_len)) {
+			fprintf(stderr, "error: extraction name is too long or contains a null byte\n");
+			goto cleanup;
+		}
+		names[i].name = malloc((size_t)entry.name_len + 1);
+		if (!names[i].name) { fprintf(stderr, "error: cannot allocate extraction name\n"); goto cleanup; }
+		memcpy(names[i].name, entry.name, entry.name_len);
+		names[i].name[entry.name_len] = 0;
+		normalize_archive_path(names[i].name);
+		names[i].directory = entry.is_directory;
+	}
+	qsort(names, count, sizeof(*names), compare_extraction_names);
+	for (uint32_t i = 1; i < count; i++) {
+		if (strcmp(names[i - 1].name, names[i].name) == 0 &&
+		    (!names[i - 1].directory || !names[i].directory)) {
+			fprintf(stderr, "error: duplicate extraction path '%s'\n", names[i].name);
+			goto cleanup;
+		}
+	}
+	result = 0;
+cleanup:
+	for (uint32_t i = 0; i < count; i++) free(names[i].name);
+	free(names);
+	return result;
+}
+
 static int cmd_extract(const char *archive_path, const char *dest_dir) {
 	uint8_t **vol_bufs = NULL;
 	size_t *vol_lens = NULL;
@@ -1219,6 +1264,13 @@ static int cmd_extract(const char *archive_path, const char *dest_dir) {
 
 	uint32_t count = rarz_file_count(archive);
 	int errors = 0;
+	if (check_extraction_names(archive, count) != 0) {
+		rarz_close(archive);
+		for (int i = 0; i < vol_count; i++) free(vol_bufs[i]);
+		free(vol_bufs);
+		free(vol_lens);
+		return 1;
+	}
 
 	/* Pre-compute total unpacked size for progress tracking */
 	uint64_t total_size = 0;

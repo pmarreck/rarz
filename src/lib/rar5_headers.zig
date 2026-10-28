@@ -85,6 +85,7 @@ pub const FileBlock = struct {
 	host_os: u64,
 	name: []const u8,
 	extra_data: ?[]const u8, // raw extra area bytes for later parsing
+	version: ?u64 = null,
 };
 
 pub const ExtraRecord = struct {
@@ -283,7 +284,29 @@ pub fn parse_file_block(r: *reader_mod.Reader, header: BlockHeader) ParseError!F
 		.host_os = host_os,
 		.name = name,
 		.extra_data = extra_data,
+		.version = try extra_file_version(extra_data),
 	};
+}
+
+fn extra_file_version(extra_data: ?[]const u8) ParseError!?u64 {
+	var records = reader_mod.Reader.init(extra_data orelse return null);
+	// Block iteration validates framing; direct metadata parsing retains its
+	// existing tolerance for unavailable unrelated records.
+	while (next_extra_record(&records) catch return null) |record| {
+		if (record.field_type != 4) continue;
+		var body = reader_mod.Reader.init(record.data);
+		_ = try body.read_vint(); // Reserved flags; no flags are currently defined.
+		return try body.read_vint();
+	}
+	return null;
+}
+
+test "version fields stay within their record and skip unrelated metadata" {
+	for ([_][]const u8{ &.{ 1, 4 }, &.{ 2, 4, 0 }, &.{ 3, 4, 0, 0x80, 1, 99 } }) |extra|
+		try testing.expectError(error.EndOfData, extra_file_version(extra));
+	try testing.expectEqual(@as(?u64, 128), try extra_file_version(&.{ 1, 99, 4, 4, 0, 0x80, 1 }));
+	try testing.expectEqual(@as(?u64, null), try extra_file_version(&.{ 1, 99 }));
+	try testing.expectEqual(@as(?u64, null), try extra_file_version(null));
 }
 
 // Read only within each declared record. Unavailable or unrepresentable extra

@@ -1680,13 +1680,23 @@ fn collectRar5Files(alloc: std.mem.Allocator, block_data: []const u8) ![]rar5_he
 		const block = try iter.next();
 		if (block == null) break;
 		switch (block.?) {
-			.file => |fb| try files.append(alloc, fb),
+			.file => |fb| {
+				var file = fb;
+				file.name = try versionedName(alloc, fb);
+				try files.append(alloc, file);
+			},
 			.end_archive => break,
 			else => {},
 		}
 	}
 
 	return files.toOwnedSlice(alloc);
+}
+
+// The handle arena owns generated names for the same lifetime as borrowed names.
+fn versionedName(alloc: std.mem.Allocator, file: rar5_headers.FileBlock) ![]const u8 {
+	if (file.version) |version| return std.fmt.allocPrint(alloc, "{s};{d}", .{ file.name, version });
+	return file.name;
 }
 
 fn collectRar4Files(alloc: std.mem.Allocator, block_data: []const u8) ![]rar4_headers.FileHeader {
@@ -1913,6 +1923,7 @@ fn collectRar5FilesUnified(alloc: std.mem.Allocator, volumes: []const VolumeData
 
 				// Verify name matches
 				if (!std.mem.eql(u8, first.fb.name, cont.fb.name)) break;
+				if (first.fb.version != cont.fb.version) break;
 
 				const cont_data_size = cont.fb.header.data_size orelse 0;
 				try chunks.append(alloc, .{
@@ -1929,7 +1940,7 @@ fn collectRar5FilesUnified(alloc: std.mem.Allocator, volumes: []const VolumeData
 		}
 
 		try unified.append(alloc, .{
-			.name = first.fb.name,
+			.name = try versionedName(alloc, first.fb),
 			.unpacked_size = first.fb.unpacked_size,
 			.compression = first.fb.compression,
 			.data_crc32 = last_fb.data_crc32,
@@ -2164,6 +2175,74 @@ fn build_rar5_with_file(buf: []u8, filename: []const u8, file_data: []const u8) 
 test "abi version is 1" {
 	const v = rarz_abi_version();
 	try testing.expectEqual(@as(u32, 1), v);
+}
+
+test "single and volume APIs retain distinct RAR5 versioned names" {
+	var bytes: [512]u8 = undefined;
+	@memcpy(bytes[0..8], &detect.RAR50_SIG);
+	var pos: usize = 8;
+	pos += build_rar5_block(bytes[pos..], 1, 0, null, null, &.{0});
+	const cases = [_]struct { version: ?u64, name: []const u8 }{
+		.{ .version = null, .name = "a" },
+		.{ .version = 0, .name = "a;0" },
+		.{ .version = 1, .name = "a;1" },
+		.{ .version = 128, .name = "a;128" },
+		.{ .version = std.math.maxInt(u64), .name = "a;18446744073709551615" },
+	};
+	for (cases) |case| {
+		var body: [32]u8 = undefined;
+		body[0..7].* = .{ 0, 0, 0, 0, 1, 1, 'a' };
+		var length: usize = 7;
+		var extra: ?u64 = null;
+		if (case.version) |version| {
+			const size = reader.vint_size(version) + 2;
+			body[7..10].* = .{ @intCast(size), 4, 0 };
+			length = 10 + encode_vint(version, body[10..]);
+			extra = size + 1;
+		}
+		pos += build_rar5_block(bytes[pos..], 2, if (extra != null) 1 else 0, extra, null, body[0..length]);
+	}
+	pos += build_rar5_block(bytes[pos..], 5, 0, null, null, &.{0});
+	const snapshot = bytes;
+	const pointers = [_][*]const u8{&bytes};
+	const lengths = [_]usize{pos};
+	for ([_]bool{ false, true }) |volumes| {
+		const handle = (if (volumes) rarz_open_volumes(&pointers, &lengths, 1) else rarz_open(&bytes, pos)) orelse return error.TestUnexpectedResult;
+		defer rarz_close(handle);
+		try testing.expectEqual(@as(u32, cases.len), rarz_file_count(handle));
+		for (cases, 0..) |case, i| {
+			var entry: RarzFileEntry = undefined;
+			try testing.expectEqual(@as(i32, 0), rarz_file_info(handle, @intCast(i), &entry));
+			try testing.expectEqualSlices(u8, case.name, entry.name.?[0..entry.name_len]);
+		}
+	}
+	try testing.expectEqualSlices(u8, snapshot[0..pos], bytes[0..pos]);
+}
+
+test "split parts merge only within the same file version" {
+	for ([_]u8{ 1, 2 }) |continuation_version| {
+		var bytes: [256]u8 = undefined;
+		@memcpy(bytes[0..8], &detect.RAR50_SIG);
+		var pos: usize = 8;
+		pos += build_rar5_block(bytes[pos..], 1, 0, null, null, &.{0});
+		var body = [_]u8{ 0, 2, 0, 0, 1, 1, 'a', 3, 4, 0, 1 };
+		pos += build_rar5_block(bytes[pos..], 2, 0x13, 4, 1, &body);
+		bytes[pos] = 'x';
+		pos += 1;
+		body[10] = continuation_version;
+		pos += build_rar5_block(bytes[pos..], 2, 0x0b, 4, 1, &body);
+		bytes[pos] = 'y';
+		pos += 1;
+		pos += build_rar5_block(bytes[pos..], 5, 0, null, null, &.{0});
+		const pointers = [_][*]const u8{&bytes};
+		const lengths = [_]usize{pos};
+		const handle = rarz_open_volumes(&pointers, &lengths, 1) orelse return error.TestUnexpectedResult;
+		defer rarz_close(handle);
+		var entry: RarzFileEntry = undefined;
+		try testing.expectEqual(@as(i32, 0), rarz_file_info(handle, 0, &entry));
+		try testing.expectEqual(@as(u64, if (continuation_version == 1) 2 else 1), entry.packed_size);
+		try testing.expectEqualSlices(u8, "a;1", entry.name.?[0..entry.name_len]);
+	}
 }
 
 test "rarz_detect_format identifies RAR5" {

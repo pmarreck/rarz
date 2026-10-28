@@ -14,6 +14,11 @@ const pack50 = @import("compress/pack50.zig");
 pub const encode_vint = reader_mod.encode_vint;
 pub const vint_size = reader_mod.vint_size;
 
+const max_name_bytes = 4096;
+// Six body VINTs, three framing VINTs, and two fixed-width 32-bit fields.
+// A u64 VINT occupies at most ten bytes, including its final bit.
+const max_file_header_contents = max_name_bytes + 9 * 10 + 2 * 4;
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -134,7 +139,7 @@ fn write_file_block(out: []u8, pos: usize, entry: FileEntry) usize {
 		0x20;
 
 	// Build the file-specific body
-	var body: [4096]u8 = undefined;
+	var body: [max_file_header_contents]u8 = undefined;
 	var bpos: usize = 0;
 	bpos += encode_vint(file_flags, body[bpos..]);
 	bpos += encode_vint(if (entry.is_directory) 0 else entry.data.len, body[bpos..]); // unpacked_size
@@ -161,7 +166,7 @@ fn write_file_block(out: []u8, pos: usize, entry: FileEntry) usize {
 	const header_flags: u64 = if (data_size > 0) 0x02 else 0;
 
 	// Build the full contents (type + flags + [data_size] + body)
-	var contents: [4096]u8 = undefined;
+	var contents: [max_file_header_contents]u8 = undefined;
 	var cpos: usize = 0;
 	// header_type = 2 (file)
 	cpos += encode_vint(2, contents[cpos..]);
@@ -272,7 +277,7 @@ fn write_file_block_split(
 	else
 		0x20;
 
-	var body: [4096]u8 = undefined;
+	var body: [max_file_header_contents]u8 = undefined;
 	var bpos: usize = 0;
 	bpos += encode_vint(file_flags, body[bpos..]);
 	bpos += encode_vint(if (entry.is_directory) 0 else entry.data.len, body[bpos..]); // full unpacked_size
@@ -296,7 +301,7 @@ fn write_file_block_split(
 	if (split_before) header_flags |= 0x08;
 	if (split_after) header_flags |= 0x10;
 
-	var contents: [4096]u8 = undefined;
+	var contents: [max_file_header_contents]u8 = undefined;
 	var cpos: usize = 0;
 	cpos += encode_vint(2, contents[cpos..]); // type = file
 	cpos += encode_vint(header_flags, contents[cpos..]);
@@ -393,7 +398,7 @@ fn write_file_block_precompressed_split(
 		0x20;
 	const dict_bits: u4 = 3;
 
-	var body: [4096]u8 = undefined;
+	var body: [max_file_header_contents]u8 = undefined;
 	var bpos: usize = 0;
 	bpos += encode_vint(file_flags, body[bpos..]);
 	bpos += encode_vint(entry.data.len, body[bpos..]);
@@ -416,7 +421,7 @@ fn write_file_block_precompressed_split(
 	if (split_before) header_flags |= 0x08;
 	if (split_after) header_flags |= 0x10;
 
-	var contents: [4096]u8 = undefined;
+	var contents: [max_file_header_contents]u8 = undefined;
 	var cpos: usize = 0;
 	cpos += encode_vint(2, contents[cpos..]);
 	cpos += encode_vint(header_flags, contents[cpos..]);
@@ -566,7 +571,7 @@ pub fn write_archive(entries: []const FileEntry, output: []u8) WriteError!usize 
 
 	// Validate entries
 	for (entries) |entry| {
-		if (entry.name.len > 4096) return error.NameTooLong;
+		if (entry.name.len > max_name_bytes) return error.NameTooLong;
 	}
 	if (entries.len > 65535) return error.TooManyFiles;
 
@@ -623,7 +628,7 @@ fn write_file_block_precompressed(
 	const dict_bits: u4 = 3; // 2^(3+17) = 1MB dictionary
 
 	// Build file body
-	var body: [4096]u8 = undefined;
+	var body: [max_file_header_contents]u8 = undefined;
 	var bpos: usize = 0;
 	bpos += encode_vint(file_flags, body[bpos..]);
 	bpos += encode_vint(entry.data.len, body[bpos..]); // unpacked_size
@@ -649,7 +654,7 @@ fn write_file_block_precompressed(
 	const header_flags: u64 = if (data_size > 0) 0x02 else 0;
 
 	// Build contents
-	var contents: [4096]u8 = undefined;
+	var contents: [max_file_header_contents]u8 = undefined;
 	var cpos: usize = 0;
 	cpos += encode_vint(2, contents[cpos..]); // type = file
 	cpos += encode_vint(header_flags, contents[cpos..]);
@@ -722,7 +727,7 @@ pub fn write_archive_compressed(
 
 	// Validate entries
 	for (entries) |entry| {
-		if (entry.name.len > 4096) return error.NameTooLong;
+		if (entry.name.len > max_name_bytes) return error.NameTooLong;
 	}
 	if (entries.len > 65535) return error.TooManyFiles;
 
@@ -806,6 +811,17 @@ pub fn write_archive_compressed(
 		if (r.failed) return error.CompressionFailed;
 	}
 
+	// Check the exact compressed size before touching the caller's buffer.
+	var needed: usize = detect.RAR50_SIG.len + main_block_size() + end_block_size();
+	for (entries, results) |entry, result| {
+		if (result.data) |compressed| {
+			needed += file_block_header_size_compressed(entry, compressed.len, method, false, false) + compressed.len;
+		} else {
+			needed += file_block_size(entry);
+		}
+	}
+	if (output.len < needed) return error.BufferTooSmall;
+
 	// Write archive sequentially using pre-compressed data
 	var pos: usize = 0;
 
@@ -873,6 +889,7 @@ fn write_volumes_from_payloads(
 	payloads: []const FilePayload,
 	config: VolumeConfig,
 ) !VolumeResult {
+	if (config.volume_size == 0) return error.VolumeTooSmall;
 	// Volume flags for multi-volume archives
 	const VOLUME_FLAG: u64 = 0x01;
 	const VOLNUMBER_FLAG: u64 = 0x02;
@@ -915,7 +932,8 @@ fn write_volumes_from_payloads(
 		pos = write_main_block_ex(vol_buf, pos, archive_flags, vol_num);
 
 		const overhead = detect.RAR50_SIG.len + main_block_size_exact(archive_flags, vol_num) + end_block_size_ex(END_NEXT_VOLUME);
-		const usable = if (config.volume_size > overhead) config.volume_size - overhead else 256;
+		if (config.volume_size < overhead) return error.VolumeTooSmall;
+		const usable = config.volume_size - overhead;
 
 		var written_in_vol: u64 = 0;
 		while (file_idx < payloads.len) {
@@ -956,6 +974,7 @@ fn write_volumes_from_payloads(
 					file_block_header_size(p.entry, 1, is_continuation, true);
 
 				if (written_in_vol + header_for_split >= usable) {
+					if (written_in_vol == 0) return error.VolumeTooSmall;
 					// Can't fit even a header — end this volume
 					break;
 				}
@@ -1033,6 +1052,9 @@ pub fn write_archive_volumes(
 	entries: []const FileEntry,
 	config: VolumeConfig,
 ) !VolumeResult {
+	for (entries) |entry| {
+		if (entry.name.len > max_name_bytes) return error.NameTooLong;
+	}
 	// Build payloads (no compression)
 	const payloads = try allocator.alloc(FilePayload, entries.len);
 	defer allocator.free(payloads);
@@ -1057,6 +1079,9 @@ pub fn write_archive_volumes_compressed(
 	config: VolumeConfig,
 	method: u3,
 ) !VolumeResult {
+	for (entries) |entry| {
+		if (entry.name.len > max_name_bytes) return error.NameTooLong;
+	}
 	if (method == 0) {
 		return write_archive_volumes(allocator, entries, config);
 	}
@@ -1933,5 +1958,93 @@ test "policy.validate: truncated archive must NOT be VALID" {
 			std.debug.print("truncating {d} byte(s) still reported VALID\n", .{cut});
 			return error.TruncatedArchiveReportedValid;
 		}
+	}
+}
+
+fn expectWrittenLongName(archive: []const u8, name: []const u8) !void {
+	const validation = policy.validate(archive);
+	try testing.expect(validation.is_valid);
+	const blocks = archive[detect.RAR50_SIG.len..];
+	var iter = rar5_headers.walk_blocks(blocks);
+	var files: usize = 0;
+	while (try iter.next()) |block| {
+		if (block == .file) {
+			files += 1;
+			try testing.expectEqualSlices(u8, name, block.file.name);
+			try testing.expect(rar5_headers.validate_header_crc(blocks, block.file.header));
+		}
+	}
+	try testing.expectEqual(@as(usize, 1), files);
+}
+
+test "all writer paths preserve names through the 4096-byte limit" {
+	const name = "n" ** 4096;
+	const output = try testing.allocator.alloc(u8, 32768);
+	defer testing.allocator.free(output);
+	for ([_]usize{ 4070, 4080, 4095, 4096 }) |length| {
+		for ([_]bool{ false, true }) |directory| {
+			const entries = [_]FileEntry{.{
+				.name = name[0..length],
+				.data = if (directory) "" else "payload" ** 16,
+				.mtime = std.math.maxInt(u32),
+				.attributes = std.math.maxInt(u32),
+				.is_directory = directory,
+			}};
+			for ([_]u3{ 0, 3 }) |method| {
+				const size = try write_archive_compressed(testing.allocator, &entries, output, method);
+				try expectWrittenLongName(output[0..size], entries[0].name);
+				var volumes = try write_archive_volumes_compressed(testing.allocator, &entries, .{ .volume_size = 16384 }, method);
+				defer volumes.deinit();
+				try testing.expectEqual(@as(usize, 1), volumes.count);
+				try expectWrittenLongName(volumes.volumes[0], entries[0].name);
+			}
+		}
+	}
+}
+
+test "volume writers reject names above the filename limit" {
+	const entries = [_]FileEntry{.{ .name = "n" ** 4097, .data = "", .mtime = 0, .is_directory = false }};
+	for ([_]u3{ 0, 3 }) |method| {
+		if (write_archive_volumes_compressed(testing.allocator, &entries, .{ .volume_size = 16384 }, method)) |value| {
+			var volumes = value;
+			volumes.deinit();
+			return error.TestUnexpectedResult;
+		} else |err| try testing.expectEqual(error.NameTooLong, err);
+	}
+}
+
+test "volume writers reject a volume too small for the file header" {
+	const entries = [_]FileEntry{.{ .name = "n" ** 4096, .data = "", .mtime = 0, .is_directory = false }};
+	for ([_]u3{ 0, 3 }) |method| {
+		// Bound the old no-progress loop through its allocator, not a timeout.
+		var bounded = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 32 });
+		if (write_archive_volumes_compressed(bounded.allocator(), &entries, .{ .volume_size = 4096 }, method)) |value| {
+			var volumes = value;
+			volumes.deinit();
+			return error.TestUnexpectedResult;
+		} else |err| try testing.expectEqual(error.VolumeTooSmall, err);
+	}
+}
+
+test "volume writers reject zero capacity without division by zero" {
+	for ([_]u64{ 0, 1, 8, 16 }) |capacity| {
+		try testing.expectError(error.VolumeTooSmall, write_archive_volumes(testing.allocator, &.{}, .{ .volume_size = capacity }));
+	}
+}
+
+test "compressed writer checks output capacity before writing" {
+	const directory = [_]FileEntry{.{ .name = "dir", .data = "", .mtime = 0, .is_directory = true }};
+	const file = [_]FileEntry{.{ .name = "file", .data = "a payload" ** 8, .mtime = 0, .is_directory = false }};
+	const output = try testing.allocator.alloc(u8, 4096);
+	defer testing.allocator.free(output);
+	for ([_][]const FileEntry{ &.{}, &directory, &file }) |entries| {
+		const size = try write_archive_compressed(testing.allocator, entries, output, 3);
+		for ([_]usize{ 0, 7, 8, 12, size - 1 }) |capacity| {
+			@memset(output, 0xa5);
+			try testing.expectError(error.BufferTooSmall, write_archive_compressed(testing.allocator, entries, output[0..capacity], 3));
+			for (output) |byte| try testing.expectEqual(@as(u8, 0xa5), byte);
+		}
+		try testing.expectEqual(size, try write_archive_compressed(testing.allocator, entries, output[0..size], 3));
+		try testing.expect(policy.validate(output[0..size]).is_valid);
 	}
 }

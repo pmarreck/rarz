@@ -20,6 +20,7 @@ annotate=[
 	docs/plan_context/rar2-truncation.md = Diagnosis and independent controls for incomplete legacy archive headers
 	docs/plan_context/timestamps.md = Timestamp encodings, independent interop controls and metadata API limits
 	docs/plan_context/v70-memory.md = Dictionary allocation trace, lazy history initialization, and v70 gate evidence
+	docs/plan_context/writer-bounds.md = Writer filename, caller-buffer, and volume-capacity regressions
 	include/rarz.h = Stable C ABI for detection, archive inspection, validation summaries, verification, extraction, and creation
 	run = Build current host source and execute the exact product
 	scripts/build-core.lua = Pure build target selection and executable inspection rules

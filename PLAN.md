@@ -4,13 +4,14 @@ Completed records: [docs/PLAN_LOG.md](docs/PLAN_LOG.md). Historical decisions an
 
 ## Current milestone
 
-- [ ] Publish accepted plaintext header CRC checks and verify exact-commit CI; all 460 units, complete CLI/v70, and native macOS checks pass (context: docs/plan_context/encryption-header-crc.md).
-- [ ] Run a fresh seed-43 corruption campaign with 95% pointwise confidence and ±5-point precision per input/profile pair; preserve the historical report.
+- [ ] Verify exact-commit CI for the latest shipment, including plaintext header CRC checks from f53956e (context: docs/plan_context/encryption-header-crc.md).
+- [ ] Publish the seed-43 campaign: all 18 pairs detected 385/385 damaged inputs within the requested precision; retain four disagreements and six inconclusive reference outcomes.
+- [ ] Disable reference quick-open caching with its red/green regression and run a separately identified campaign; cached headers hid all four seed-43 disagreements.
 - [ ] Qualify the complete macOS CLI/isolation suite and native Linux ARM64/Windows runtime; macOS ARM64 units and package smoke now pass (context: docs/plan_context/build-layout.md).
 
 ## Correctness queue
 
-- [ ] Finish acceptance of writer filename/header bounds, caller-buffer capacity checks, and refusal of impossible volume sizes (#20).
+- [ ] Publish accepted writer bounds and verify CI; complete 465-unit/CLI/v70 acceptance passed (#20; context: docs/plan_context/writer-bounds.md).
 - [ ] Verify unknown-block skip semantics against the format contract and add rejection controls where required (#29).
 - [ ] Recognize recovery-volume signatures without claiming recovery-data verification (#36).
 - [ ] Reject invalid initial Huffman repeat symbols without desynchronizing the stream (#3).

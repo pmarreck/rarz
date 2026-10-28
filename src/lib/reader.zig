@@ -41,6 +41,7 @@ pub const Reader = struct {
 			if (count >= 10) return error.EndOfData;
 			const byte = self.data[self.pos];
 			self.pos += 1;
+			if (count == 9 and byte > 1) return error.EndOfData;
 			const value_bits: u64 = @intCast(byte & 0x7F);
 			result |= value_bits << @as(u6, @intCast(shift));
 			count += 1;
@@ -242,4 +243,42 @@ test "sequential reads work correctly" {
 	try testing.expectEqual(@as(u64, 0x42), vint);
 	// should be at end
 	try testing.expectEqual(@as(usize, 0), r.remaining());
+}
+
+test "read_vint classifies every tenth byte without truncating overflow" {
+	for ([_]u8{ 0x80, 0xff }) |prefix| {
+		for (0..256) |last| {
+			var bytes = [_]u8{prefix} ** 11;
+			bytes[9] = @intCast(last);
+			bytes[10] = 0x00;
+			var reader = Reader.init(&bytes);
+			if (last <= 1) {
+				const low: u64 = if (prefix == 0xff) std.math.maxInt(u64) >> 1 else 0;
+				const expected = low | (@as(u64, @intCast(last)) << 63);
+				try testing.expectEqual(expected, try reader.read_vint());
+			} else {
+				try testing.expectError(error.EndOfData, reader.read_vint());
+			}
+			try testing.expectEqual(@as(usize, 10), reader.position());
+		}
+	}
+}
+
+test "canonical vint round trips at every bit-width boundary" {
+	for (0..65) |shift| {
+		const boundary: u128 = @as(u128, 1) << @as(u7, @intCast(shift));
+		for ([_]u128{ boundary - 1, boundary, boundary + 1 }) |wide| {
+			if (wide > std.math.maxInt(u64)) continue;
+			const value: u64 = @intCast(wide);
+			var bytes: [10]u8 = undefined;
+			const size = encode_vint(value, &bytes);
+			try testing.expectEqual(vint_size(value), size);
+			var reader = Reader.init(bytes[0..size]);
+			const decoded = try reader.read_vint();
+			try testing.expectEqual(value, decoded);
+			var encoded: [10]u8 = undefined;
+			const encoded_size = encode_vint(decoded, &encoded);
+			try testing.expectEqualSlices(u8, bytes[0..size], encoded[0..encoded_size]);
+		}
+	}
 }

@@ -21,6 +21,7 @@ annotate=[
 	docs/plan_context/build-layout.md = Build layout, publication controls, and qualification limits
 	docs/plan_context/development-history.md = Archived development decisions and measurements; superseded claims remain historical
 	docs/plan_context/encryption-header-crc.md = Plaintext CRC evidence for six formerly unverifiable corruption cases
+	docs/plan_context/integer-and-table-bounds.md = VINT overflow and initial Huffman-repeat regressions
 	docs/plan_context/rar2-truncation.md = Diagnosis and independent controls for incomplete legacy archive headers
 	docs/plan_context/timestamps.md = Timestamp encodings, independent interop controls and metadata API limits
 	docs/plan_context/unknown-blocks.md = Unknown-block flag semantics established against independent reference controls

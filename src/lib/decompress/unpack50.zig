@@ -257,6 +257,7 @@ pub fn readTables(state: *Unpack50State) !void {
             i += 1;
         } else if (sym == 16) {
             // Repeat previous length (short): 3 + readBits(3) = 3-10 times
+            if (i == 0) return error.InvalidData;
             const repeat_count = 3 + try br.readBits(3);
             if (i > 0) {
                 const prev_len = code_lengths[i - 1];
@@ -268,6 +269,7 @@ pub fn readTables(state: *Unpack50State) !void {
             }
         } else if (sym == 17) {
             // Repeat previous length (long): 11 + readBits(7) = 11-138 times
+            if (i == 0) return error.InvalidData;
             const repeat_count = 11 + try br.readBits(7);
             if (i > 0) {
                 const prev_len = code_lengths[i - 1];
@@ -1222,4 +1224,44 @@ test "decompress returns error on truncated data" {
     // This should fail during table reading (truncated)
     const result = decompress(testing.allocator, &data, 4, 50, 15);
     try testing.expect(result == error.EndOfData or result == error.InvalidTable or result == error.InvalidData);
+}
+
+test "readTables rejects a repeat before any code length exists" {
+    for ([_]bool{ false, true }) |rar7| {
+        for ([_]usize{ 16, 17 }) |repeat_symbol| {
+            // Two one-bit codes: literal length 9 is 0, repeat is 1.
+            var data = [_]u8{0} ** 80;
+            data[4] = 0x01;
+            data[repeat_symbol / 2] = if (repeat_symbol % 2 == 0) 0x10 else 0x01;
+            data[10] = 0x80; // First symbol repeats a nonexistent predecessor.
+            var state = try Unpack50State.init(testing.allocator, &data, rar7, 15);
+            defer state.deinit();
+            try testing.expectError(error.InvalidData, readTables(&state));
+            try testing.expect(!state.tables_loaded);
+        }
+    }
+}
+
+test "readTables accepts direct lengths with the same repeat alphabet" {
+    for ([_]bool{ false, true }) |rar7| {
+        for ([_]usize{ 16, 17 }) |repeat_symbol| {
+            for ([_]u8{ 0x00, 0x40 }) |first_symbols| {
+                var data = [_]u8{0} ** 80;
+                data[4] = 0x01;
+                data[repeat_symbol / 2] = if (repeat_symbol % 2 == 0) 0x10 else 0x01;
+                data[10] = first_symbols; // Direct only, or direct then repeat.
+                var state = try Unpack50State.init(testing.allocator, &data, rar7, 15);
+                defer state.deinit();
+                try readTables(&state);
+                try testing.expect(state.tables_loaded);
+                try testing.expect(state.ld.valid and state.dd.valid and state.ldd.valid and state.rd.valid);
+                const symbols: usize = NC + (if (rar7) @as(usize, DC_RAR7) else DC_RAR5) + LDC + RC;
+                var consumed: usize = 80 + symbols;
+                if (first_symbols != 0) {
+                    consumed = if (repeat_symbol == 16) consumed + 1 else consumed - 3;
+                }
+                try testing.expectEqual(consumed, state.br.bit_pos);
+            }
+        }
+    }
 }

@@ -221,6 +221,7 @@
             (luajit.withPackages (ps: [ ps.lua-cjson ]))
             jq
             coreutils
+            gzip
             findutils
             file
             llvmPackages.llvm

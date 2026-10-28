@@ -1,9 +1,9 @@
 # Archive validation evidence index
 
-This indexes existing tests and historical findings for the Mecha Validate
-release milestone. It does not claim a new standalone `corruption-probe`
-campaign or complete coverage of every RAR variant. The decoder baseline is
-`80ec687`; the dependency refresh changes progrez, not decoder behavior.
+This indexes current tests and historical findings for the Mecha Validate
+release milestone. It does not claim complete coverage of every RAR variant.
+The dependency-refresh evidence below used decoder baseline `80ec687`;
+subsequent sections and linked reports identify later changes separately.
 
 The later [October 15 corruption-reader assessment](COVERAGE_20261015.md)
 provides a separate 18-pair statistical campaign, exact candidate identities,
@@ -15,18 +15,25 @@ and meets the same 18-pair precision target. It records 6,929 detections, one
 RAR2 decoded-size miss, and three reference-inconclusive cases. Its historical
 miss remains recorded after the targeted decoder correction.
 
+The [reference-exception adjudication](REFERENCE_EXCEPTION_ADJUDICATION_20261028.md)
+establishes concrete structural damage in all nine reference-inconclusive
+cases from seeds 43 and 44. Their original classifications and statistical
+denominators remain unchanged.
+
 ## Replay
 
-Run `./test` for the complete local entry point. On a shared Linux build host:
+Run `./test` for the complete local entry point:
 
 ```sh
-build-budget --project rarz -- nix develop -c timeout 2400 ./test
+./test
 ```
 
-The script builds ReleaseSafe unit tests and CLI code, then runs every
-`tests/cli/test_*.sh` suite. `./build` produces the ReleaseFast Nix package.
-The committed Mechatron Prime CI manifest selects the package and a separate
-ReleaseSafe unit-test derivation; it does not currently run the CLI suites.
+The script prepares ReleaseSafe products through Nix, then runs every
+`tests/cli/test_*.sh` suite inside private filesystem isolation. On a shared
+Linux host, it admits the prepared runtime through `build-budget` itself.
+`./build` produces the ReleaseFast Nix package. The committed Mechatron Prime
+CI manifest also selects classifier, driver, publication, and Windows
+emulation checks; it does not run every CLI suite or the large v70 corpus.
 Local full-suite evidence therefore has a wider scope than that CI result.
 
 Individual existing CLI cases can be replayed after building the CLI, for
@@ -37,8 +44,10 @@ consistently cap each individual oracle invocation.
 Use the fixtures from the exact tested revision. Their content hashes are in
 [`evidence/rar-fixtures.sha256`](evidence/rar-fixtures.sha256), checked with
 `sha256sum -c docs/evidence/rar-fixtures.sha256` from the repository root.
-Most fixture generators invoke independent RAR producers; their scripts and
-the committed output bytes remain the provenance and replay inputs.
+That manifest covers the original 72-fixture set. Later fixture additions have
+their own provenance documents and regressions. Most fixture generators invoke
+independent RAR producers; their scripts and committed output bytes remain the
+provenance and replay inputs.
 
 ## Dependency-refresh acceptance, October 9, 2026
 
@@ -176,17 +185,16 @@ and mutation definitions; this index does not rename or strengthen them.
 
 - No recorded standalone `corruption-probe` campaign was found during the
   September context recovery. A cross-format campaign remains separate work.
-- The v70 gate skips with exit zero if the local corpus is missing. Such a run
-  is incomplete for v70 acceptance, regardless of the master script's exit.
-  It also mutates the local fixture in place with an EXIT restoration trap.
-  Preserve a verified recoverable copy before running it; a future gate should
-  mutate only a private trial copy and assert restoration explicitly.
+- The v70 gate now fails if the required local corpus is missing and mutates
+  private copies with a read-only source. Its persistent driver controls check
+  missing inputs, source preservation, and misleading validator outcomes.
 - `test_solid.sh` writes `0xA5`; it does not XOR a single bit, and can write an
   unchanged byte. `test_v70_corpus.sh` XORs `0xA5`, changing four bits. Neither
   is the current canonical sniper operation despite legacy wording.
-- The unchanged v70 gate classifies oracle nonzero exit or absence of `VALID`
-  as rejection. Its result still cannot distinguish crashes, timeouts,
-  unsupported results, and resource failures from successful damage detection.
+- The v70 gate now requires explicit damage from both validators for both
+  designated mutations. Crashes, timeouts, unsupported results, and resource
+  failures cannot satisfy that control. More detailed execution categories
+  remain part of the legacy-gate migration.
 - The bounded mutation gates retain their legacy sampling positions and
   fixed-byte overwrites. Explicit outcome classification improves the evidence
   for those trials; it does not prove complete byte or format coverage.
@@ -195,16 +203,19 @@ and mutation definitions; this index does not rename or strengthen them.
   false positives. Each such case needs its fixture, exact mutation position,
   and a format invariant before it can be counted as justified rejection; an
   independently known-valid alternate belongs in a specificity regression.
-- Required-case guards cover the solid, precision-volume, and verify gates.
-  This does not establish fixture-completeness enforcement in every other
-  legacy suite or extend the controls to the unchanged v70 gate.
+- Required-case guards cover the solid, precision-volume, verify, and v70
+  gates. This does not establish fixture-completeness enforcement in every
+  other legacy suite.
 - Independent producer coverage remains absent for RAR 1.4 parsing and v15
   decoding, and incomplete for some VM-filter variants such as RGB/Itanium.
 - Recovery/service/quick-open data payloads are not all hashed. Header checks
-  do not establish every-byte verification. `.rev` recognition remains work.
-- Password support, checksum-less cases, PPM heap admission, and extraction
-  metadata fidelity retain their documented limitations. Do not turn unknown,
-  unsupported, encrypted, or resource-limited outcomes into damage.
+  do not establish every-byte verification. Recovery volumes are now recognized
+  explicitly; recognition does not verify their payloads.
+- Password support, checksum-less cases, and PPM heap admission retain their
+  documented limitations. Extraction now restores supported mode/mtime fields;
+  extended-time fidelity and native platform qualification remain limited.
+  Do not turn unknown, unsupported, encrypted, or resource-limited outcomes
+  into damage.
 
 ## Mutation vocabulary for future work
 

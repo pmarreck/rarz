@@ -48,6 +48,11 @@ These regression results do not alter the campaign counts above.
 
 ## Evidence
 
+[Independent structural adjudication](REFERENCE_EXCEPTION_ADJUDICATION_20261028.md)
+now establishes malformed headers for all three missing-volume cases, alongside
+the six seed-43 execution failures. The original classifications, miss, and
+statistical counts above remain unchanged.
+
 The tested ReleaseSafe implementation and assessment scripts match commit
 `c2cb48d`; their hashes identify the precommit build. This campaign predates
 the subsequent VINT, Huffman, and decoded-size guards. Later regression results

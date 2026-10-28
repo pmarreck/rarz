@@ -181,3 +181,5 @@ Completed PLAN.md items retired by plan-retire, oldest retirement first.
 ## Retired 2026-10-28
 
 - [x] [Recent completions] Trace and fix eager dictionary writes; pass 450 ReleaseSafe units and the full pristine/two-mutation v70 gate at 11.03 GiB peak, preserving source corpus bytes (done 2026-10-27 21:41 EDT; uncommitted, context: docs/plan_context/v70-memory.md).
+- [x] [Recent completions] Publish corruption assessment, v70 memory correction, timestamps, and Nix target publication; exact commit 5e11586 passed Mechatron Prime CI in 87 seconds (done 2026-10-27 23:11 EDT; context: docs/plan_context/build-layout.md).
+- [x] [Recent completions] Implement cross-platform-project-build-arch build/run/test layout, verified five-target publication, native profile checks, and assessment selection; complete ./test passed with native runtime limits documented (done 2026-10-27 23:02 EDT; commit 5e11586, context: docs/plan_context/build-layout.md).

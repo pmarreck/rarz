@@ -117,6 +117,7 @@ local function main()
 		assert(f:close())
 	end end
 	local report={schema='rarz-coverage/v1',status='running',options=options,cells={},inputs={},tools={},
+		reference_args={'t','-p-','-idq','-qo-'},
 		confidence_scope='pointwise per input/profile; no pooled or simultaneous confidence claim',
 		method='fixed reference-damaged sample; Wilson score interval; PRNG draws with replacement',target=target}
 	local function checkpoint() write(dir..'/summary.json',encode(report)..'\n') end
@@ -135,7 +136,10 @@ local function main()
 	local function observe(path)
 		local r=run({options.rarz,'t',path})
 		r.class=r.truncated and 'tool-error' or stats.rarz(r.exit,r.stdout)
-		local u=run({options.reference,'t','-p-','-idq',path})
+		local args={options.reference}
+		for _,value in ipairs(report.reference_args) do args[#args+1]=value end
+		args[#args+1]=path
+		local u=run(args)
 		u.class=u.truncated and 'tool-error' or stats.reference(u.exit,u.stderr)
 		return r,u
 	end

@@ -33,6 +33,13 @@ fi
 capture ./assess-coverage --profile identity --margin 0.49 --max-attempts 4 --output "$scratch/identity" tests/fixtures/rar5_m3.rar
 [[ $rc == 2 ]] || fail 'unchanged identity cases must not establish coverage'
 jq -e '.cells[0].eligible == 0 and (.cells[0].precision_met|not)' "$scratch/identity/summary.json" >/dev/null 2>&1 || fail 'identity incorrectly counted'
+cat > "$scratch/primary-header.json" <<'PROFILE'
+{"profile":1,"name":"primary_header_crc","root":{"zone":{"kind":"range","unit":"bytes","anchor":"start","start":937,"length":1,"count":1},"do":{"op":"flip"}}}
+PROFILE
+capture ./assess-coverage --profile "$scratch/primary-header.json" --margin 0.49 --max-attempts 4 --output "$scratch/primary-header" tests/fixtures/rar5_m3.rar
+[[ $rc == 0 ]] || fail "reference must read damaged primary headers instead of cached quick-open copies (exit $rc): $err"
+jq -e '.cells[0].eligible == 4 and .cells[0].detected == 4 and .cells[0].counts.disagreement == 0' "$scratch/primary-header/summary.json" >/dev/null 2>&1 || fail 'primary-header corruption escaped the reference oracle'
+jq -e '.reference_args == ["t","-p-","-idq","-qo-"]' "$scratch/primary-header/summary.json" >/dev/null 2>&1 || fail 'reference invocation is missing from evidence'
 cat > "$scratch/accept-all" <<'MOCK'
 #!/usr/bin/env bash
 if [[ $1 == --about ]]; then printf 'test validator\n'; else printf 'Validation: VALID\n'; fi

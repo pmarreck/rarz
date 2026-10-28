@@ -1,7 +1,8 @@
 # Corrupt-input detection assessment
 
-The [October 15 campaign](COVERAGE_20261015.md) contains measured results,
-known gaps, and replay records for the first default run.
+The [October 28 campaign](COVERAGE_20261028.md) contains fresh seed-43 results
+and the quick-open reference finding. The [October 15 campaign](COVERAGE_20261015.md)
+preserves the first default run and its original gaps.
 
 `./assess-coverage` measures how often `rarz t` rejects damage confirmed by
 the independent UNRAR implementation. Supply one or more known-good,
@@ -111,6 +112,13 @@ input and executable SHA-256 hashes, tool version output, process limits,
 seed, per-pair counts, rates, intervals, and a final input-integrity check.
 They contain local paths and potentially archive filenames, so review them
 before publication.
+
+The current reference invocation is `unrar t -p- -idq -qo-`. Disabling
+quick-open makes the reference inspect primary headers instead of accepting
+cached copies. The exact argument list is recorded as `reference_args` in
+the summary. Reports without that field used the earlier invocation with
+quick-open enabled. Keep results from these protocols separately identified;
+the historical reports are not recalculated in place.
 
 `summary.json` is checkpointed after each pair. A `running` status after an
 interruption is incomplete evidence. `trials.jsonl` preserves every completed mutation's

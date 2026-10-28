@@ -4,15 +4,12 @@ Completed records: [docs/PLAN_LOG.md](docs/PLAN_LOG.md). Historical decisions an
 
 ## Current milestone
 
-- [ ] Verify exact-commit CI for the latest shipment, including plaintext header CRC checks from f53956e (context: docs/plan_context/encryption-header-crc.md).
-- [ ] Publish the seed-43 campaign: all 18 pairs detected 385/385 damaged inputs within the requested precision; retain four disagreements and six inconclusive reference outcomes.
-- [ ] Disable reference quick-open caching with its red/green regression and run a separately identified campaign; cached headers hid all four seed-43 disagreements.
+- [ ] Publish the accepted uncached reference invocation, seed-43 evidence, and unknown-block controls; complete 465-unit/CLI/v70 acceptance passed (context: docs/COVERAGE_20261028.md).
+- [ ] Finish the seed-44 campaign with quick-open disabled and publish its separately identified results at the agreed 95% pointwise confidence and ±5-point precision.
 - [ ] Qualify the complete macOS CLI/isolation suite and native Linux ARM64/Windows runtime; macOS ARM64 units and package smoke now pass (context: docs/plan_context/build-layout.md).
 
 ## Correctness queue
 
-- [ ] Publish accepted writer bounds and verify CI; complete 465-unit/CLI/v70 acceptance passed (#20; context: docs/plan_context/writer-bounds.md).
-- [ ] Verify unknown-block skip semantics against the format contract and add rejection controls where required (#29).
 - [ ] Recognize recovery-volume signatures without claiming recovery-data verification (#36).
 - [ ] Reject invalid initial Huffman repeat symbols without desynchronizing the stream (#3).
 - [ ] Reject overflowing tenth-byte VINT values (#8).
@@ -30,7 +27,7 @@ Completed records: [docs/PLAN_LOG.md](docs/PLAN_LOG.md). Historical decisions an
 ## Evidence and resource follow-ups
 
 - [ ] Add tested interruption propagation from ./test to its admitted runtime scope; retain the distinction between interrupted parent and still-running child.
-- [ ] Adjudicate the two RAR5 header-CRC disagreements and three RAR4 reference missing-volume outcomes from the statistical campaign without treating generic failures as damage (context: docs/COVERAGE_20261015.md).
+- [ ] Adjudicate reference missing-volume and memory-limit outcomes from both campaigns without treating generic failures as damage; all six header-CRC disagreements resolve with quick-open disabled (context: docs/COVERAGE_20261028.md).
 - [ ] Migrate remaining legacy mutation gates to versioned definitions with distinct crash, timeout, and resource outcomes (context: docs/ARCHIVE_EVIDENCE_INDEX.md).
 - [ ] Adjudicate stricter reference disagreements using exact mutations and format invariants before making stronger coverage claims (context: docs/ARCHIVE_EVIDENCE_INDEX.md).
 - [ ] Coordinate a PPM heap admission contract with the consumer; header dictionary size does not include the stream-declared heap of up to 256 MiB (context: docs/plan_context/development-history.md).
@@ -50,7 +47,7 @@ Completed records: [docs/PLAN_LOG.md](docs/PLAN_LOG.md). Historical decisions an
 
 ## Recent completions
 
+- [x] Correct writer header/caller-buffer bounds and reject impossible volume capacity; full 465-unit/CLI/v70 and native macOS checks passed, then exact-commit CI passed in 103 seconds (done 2026-10-28 00:36 EDT; commit 1251857, context: docs/plan_context/writer-bounds.md).
+- [x] Resolve #29 unknown-block skip semantics: both flag values remain readable in eight RAR4/RAR5 reference controls; eight CRC mutations are rejected, so flag absence alone is not a damage rule (done 2026-10-28 00:22 EDT; context: docs/plan_context/unknown-blocks.md).
 - [x] Propagate FFI parser errors and preserve complete vintage EOF and ENDARC padding; full 457-unit/CLI/v70 and native macOS checks passed, then exact-commit CI passed in 216 seconds (done 2026-10-28 00:01 EDT; commit 67fa938, context: docs/plan_context/archive-collection.md).
 - [x] Reject the three RAR2 partial-header campaign misses and all 18 related cuts while preserving valid vintage EOF; complete ./test passed 452 units and all CLI suites, and exact-commit CI passed in 112 seconds (done 2026-10-27 23:34 EDT; commit 279bb66, context: docs/plan_context/rar2-truncation.md).
-- [x] Publish corruption assessment, v70 memory correction, timestamps, and Nix target publication; exact commit 5e11586 passed Mechatron Prime CI in 87 seconds (done 2026-10-27 23:11 EDT; context: docs/plan_context/build-layout.md).
-- [x] Implement cross-platform-project-build-arch build/run/test layout, verified five-target publication, native profile checks, and assessment selection; complete ./test passed with native runtime limits documented (done 2026-10-27 23:02 EDT; commit 5e11586, context: docs/plan_context/build-layout.md).

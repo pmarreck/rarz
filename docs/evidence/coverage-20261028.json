@@ -1,0 +1,539 @@
+{
+  "schema": "rarz-coverage-evidence/v1",
+  "date": "2026-10-28",
+  "source": {
+    "implementation_commit": "f53956e0a2f76d42c60899d045d67a91877fb7a7",
+    "state": "ReleaseSafe precommit build; see candidate hashes"
+  },
+  "status": "incomplete",
+  "exit_code": 2,
+  "error": null,
+  "confidence_scope": "pointwise per input/profile; no pooled or simultaneous confidence claim",
+  "method": "fixed reference-damaged sample; Wilson score interval; PRNG draws with replacement",
+  "target": 385,
+  "inputs_unchanged": true,
+  "settings": {
+    "confidence": 0.95,
+    "margin": 0.05,
+    "master": "43",
+    "timeout": 10,
+    "memory_mib": 1024,
+    "max_attempts": 1540
+  },
+  "tools": {
+    "rarz": {
+      "sha256": "f380690b52abcdb585ebe84993147558324d1ac7654d47a25a5934b7dd2bf3bb",
+      "about": "rarz 0.1.0 (x86_64-linux, ReleaseSafe) - clean-room RAR archive validator, extractor and writer; PF=linux-amd64 VARIANT=musl"
+    },
+    "reference": {
+      "sha256": "0fad5e80d499aa404370b75f97ac74248249773892894487c9088c45c3262e7f",
+      "about": "UNRAR 7.20 freeware      Copyright (c) 1993-2026 Alexander Roshal"
+    },
+    "mutator": {
+      "sha256": "0818dbca8adedc9e38c58f19dd63aa4247739a9ec502b7608b550d3bd505a5d9",
+      "about": "corruption-reader 0.7.0: deterministic replayable corruption from JSON profiles (linux/x86_64)"
+    }
+  },
+  "inputs": [
+    {
+      "fixture": "rar2_v20_m3.rar",
+      "sha256": "f85da984a74e3880bd63af018047f6b040e01fa31a8d97ca5839258e95879bac",
+      "rarz": {
+        "exit": 0,
+        "class": "valid"
+      },
+      "reference": {
+        "exit": 0,
+        "class": "valid"
+      }
+    },
+    {
+      "fixture": "rar4_m3.rar",
+      "sha256": "363a5472e1c445e8c7ec1f93c48205989b11581445cf8b0f117c94bfd4c52e00",
+      "rarz": {
+        "exit": 0,
+        "class": "valid"
+      },
+      "reference": {
+        "exit": 0,
+        "class": "valid"
+      }
+    },
+    {
+      "fixture": "rar5_m3.rar",
+      "sha256": "01174ff9da49c0c115a488e1a500d9151dc37be28ca696a0a58a2e440989be82",
+      "rarz": {
+        "exit": 0,
+        "class": "valid"
+      },
+      "reference": {
+        "exit": 0,
+        "class": "valid"
+      }
+    }
+  ],
+  "cells": [
+    {
+      "detected": 385,
+      "counts": {
+        "detected": 385,
+        "unchanged": 0,
+        "missed": 0,
+        "disagreement": 0,
+        "survived": 0,
+        "inconclusive": 0,
+        "unverifiable": 0,
+        "noop": 0
+      },
+      "interval": {
+        "lower": 0.9901207581302,
+        "upper": 1
+      },
+      "rate": 1,
+      "precision_met": true,
+      "profile": "sniper",
+      "retained": 0,
+      "input_sha256": "f85da984a74e3880bd63af018047f6b040e01fa31a8d97ca5839258e95879bac",
+      "attempts": 385,
+      "eligible": 385,
+      "fixture": "rar2_v20_m3.rar"
+    },
+    {
+      "detected": 385,
+      "counts": {
+        "detected": 385,
+        "unchanged": 0,
+        "missed": 0,
+        "disagreement": 0,
+        "survived": 0,
+        "inconclusive": 0,
+        "unverifiable": 0,
+        "noop": 0
+      },
+      "interval": {
+        "lower": 0.9901207581302,
+        "upper": 1
+      },
+      "rate": 1,
+      "precision_met": true,
+      "profile": "bolter",
+      "retained": 0,
+      "input_sha256": "f85da984a74e3880bd63af018047f6b040e01fa31a8d97ca5839258e95879bac",
+      "attempts": 385,
+      "eligible": 385,
+      "fixture": "rar2_v20_m3.rar"
+    },
+    {
+      "detected": 385,
+      "counts": {
+        "detected": 385,
+        "unchanged": 0,
+        "missed": 0,
+        "disagreement": 0,
+        "survived": 0,
+        "inconclusive": 0,
+        "unverifiable": 0,
+        "noop": 0
+      },
+      "interval": {
+        "lower": 0.9901207581302,
+        "upper": 1
+      },
+      "rate": 1,
+      "precision_met": true,
+      "profile": "shotgun_variable",
+      "retained": 0,
+      "input_sha256": "f85da984a74e3880bd63af018047f6b040e01fa31a8d97ca5839258e95879bac",
+      "attempts": 385,
+      "eligible": 385,
+      "fixture": "rar2_v20_m3.rar"
+    },
+    {
+      "detected": 385,
+      "counts": {
+        "detected": 385,
+        "unchanged": 0,
+        "missed": 0,
+        "disagreement": 0,
+        "survived": 0,
+        "inconclusive": 1,
+        "unverifiable": 0,
+        "noop": 0
+      },
+      "interval": {
+        "lower": 0.9901207581302,
+        "upper": 1
+      },
+      "rate": 1,
+      "precision_met": true,
+      "profile": "nuke",
+      "retained": 1,
+      "input_sha256": "f85da984a74e3880bd63af018047f6b040e01fa31a8d97ca5839258e95879bac",
+      "attempts": 386,
+      "eligible": 385,
+      "fixture": "rar2_v20_m3.rar"
+    },
+    {
+      "detected": 385,
+      "counts": {
+        "detected": 385,
+        "unchanged": 0,
+        "missed": 0,
+        "disagreement": 0,
+        "survived": 0,
+        "inconclusive": 0,
+        "unverifiable": 0,
+        "noop": 0
+      },
+      "interval": {
+        "lower": 0.9901207581302,
+        "upper": 1
+      },
+      "rate": 1,
+      "precision_met": true,
+      "profile": "robespierre",
+      "retained": 0,
+      "input_sha256": "f85da984a74e3880bd63af018047f6b040e01fa31a8d97ca5839258e95879bac",
+      "attempts": 385,
+      "eligible": 385,
+      "fixture": "rar2_v20_m3.rar"
+    },
+    {
+      "detected": 385,
+      "counts": {
+        "detected": 385,
+        "unchanged": 0,
+        "missed": 0,
+        "disagreement": 0,
+        "survived": 2,
+        "inconclusive": 0,
+        "unverifiable": 0,
+        "noop": 0
+      },
+      "interval": {
+        "lower": 0.9901207581302,
+        "upper": 1
+      },
+      "rate": 1,
+      "precision_met": true,
+      "profile": "badonkachomp",
+      "retained": 0,
+      "input_sha256": "f85da984a74e3880bd63af018047f6b040e01fa31a8d97ca5839258e95879bac",
+      "attempts": 387,
+      "eligible": 385,
+      "fixture": "rar2_v20_m3.rar"
+    },
+    {
+      "detected": 385,
+      "counts": {
+        "detected": 385,
+        "unchanged": 0,
+        "missed": 0,
+        "disagreement": 0,
+        "survived": 0,
+        "inconclusive": 0,
+        "unverifiable": 0,
+        "noop": 0
+      },
+      "interval": {
+        "lower": 0.9901207581302,
+        "upper": 1
+      },
+      "rate": 1,
+      "precision_met": true,
+      "profile": "sniper",
+      "retained": 0,
+      "input_sha256": "363a5472e1c445e8c7ec1f93c48205989b11581445cf8b0f117c94bfd4c52e00",
+      "attempts": 385,
+      "eligible": 385,
+      "fixture": "rar4_m3.rar"
+    },
+    {
+      "detected": 385,
+      "counts": {
+        "detected": 385,
+        "unchanged": 0,
+        "missed": 0,
+        "disagreement": 0,
+        "survived": 0,
+        "inconclusive": 0,
+        "unverifiable": 0,
+        "noop": 0
+      },
+      "interval": {
+        "lower": 0.9901207581302,
+        "upper": 1
+      },
+      "rate": 1,
+      "precision_met": true,
+      "profile": "bolter",
+      "retained": 0,
+      "input_sha256": "363a5472e1c445e8c7ec1f93c48205989b11581445cf8b0f117c94bfd4c52e00",
+      "attempts": 385,
+      "eligible": 385,
+      "fixture": "rar4_m3.rar"
+    },
+    {
+      "detected": 385,
+      "counts": {
+        "detected": 385,
+        "unchanged": 0,
+        "missed": 0,
+        "disagreement": 0,
+        "survived": 0,
+        "inconclusive": 0,
+        "unverifiable": 0,
+        "noop": 0
+      },
+      "interval": {
+        "lower": 0.9901207581302,
+        "upper": 1
+      },
+      "rate": 1,
+      "precision_met": true,
+      "profile": "shotgun_variable",
+      "retained": 0,
+      "input_sha256": "363a5472e1c445e8c7ec1f93c48205989b11581445cf8b0f117c94bfd4c52e00",
+      "attempts": 385,
+      "eligible": 385,
+      "fixture": "rar4_m3.rar"
+    },
+    {
+      "detected": 385,
+      "counts": {
+        "detected": 385,
+        "unchanged": 0,
+        "missed": 0,
+        "disagreement": 0,
+        "survived": 0,
+        "inconclusive": 4,
+        "unverifiable": 0,
+        "noop": 0
+      },
+      "interval": {
+        "lower": 0.9901207581302,
+        "upper": 1
+      },
+      "rate": 1,
+      "precision_met": true,
+      "profile": "nuke",
+      "retained": 4,
+      "input_sha256": "363a5472e1c445e8c7ec1f93c48205989b11581445cf8b0f117c94bfd4c52e00",
+      "attempts": 389,
+      "eligible": 385,
+      "fixture": "rar4_m3.rar"
+    },
+    {
+      "detected": 385,
+      "counts": {
+        "detected": 385,
+        "unchanged": 0,
+        "missed": 0,
+        "disagreement": 0,
+        "survived": 0,
+        "inconclusive": 0,
+        "unverifiable": 0,
+        "noop": 0
+      },
+      "interval": {
+        "lower": 0.9901207581302,
+        "upper": 1
+      },
+      "rate": 1,
+      "precision_met": true,
+      "profile": "robespierre",
+      "retained": 0,
+      "input_sha256": "363a5472e1c445e8c7ec1f93c48205989b11581445cf8b0f117c94bfd4c52e00",
+      "attempts": 385,
+      "eligible": 385,
+      "fixture": "rar4_m3.rar"
+    },
+    {
+      "detected": 385,
+      "counts": {
+        "detected": 385,
+        "unchanged": 0,
+        "missed": 0,
+        "disagreement": 0,
+        "survived": 0,
+        "inconclusive": 0,
+        "unverifiable": 0,
+        "noop": 0
+      },
+      "interval": {
+        "lower": 0.9901207581302,
+        "upper": 1
+      },
+      "rate": 1,
+      "precision_met": true,
+      "profile": "badonkachomp",
+      "retained": 0,
+      "input_sha256": "363a5472e1c445e8c7ec1f93c48205989b11581445cf8b0f117c94bfd4c52e00",
+      "attempts": 385,
+      "eligible": 385,
+      "fixture": "rar4_m3.rar"
+    },
+    {
+      "detected": 385,
+      "counts": {
+        "detected": 385,
+        "unchanged": 0,
+        "missed": 0,
+        "disagreement": 2,
+        "survived": 1,
+        "inconclusive": 0,
+        "unverifiable": 0,
+        "noop": 0
+      },
+      "interval": {
+        "lower": 0.9901207581302,
+        "upper": 1
+      },
+      "rate": 1,
+      "precision_met": true,
+      "profile": "sniper",
+      "retained": 2,
+      "input_sha256": "01174ff9da49c0c115a488e1a500d9151dc37be28ca696a0a58a2e440989be82",
+      "attempts": 388,
+      "eligible": 385,
+      "fixture": "rar5_m3.rar"
+    },
+    {
+      "detected": 385,
+      "counts": {
+        "detected": 385,
+        "unchanged": 0,
+        "missed": 0,
+        "disagreement": 1,
+        "survived": 3,
+        "inconclusive": 1,
+        "unverifiable": 0,
+        "noop": 0
+      },
+      "interval": {
+        "lower": 0.9901207581302,
+        "upper": 1
+      },
+      "rate": 1,
+      "precision_met": true,
+      "profile": "bolter",
+      "retained": 2,
+      "input_sha256": "01174ff9da49c0c115a488e1a500d9151dc37be28ca696a0a58a2e440989be82",
+      "attempts": 390,
+      "eligible": 385,
+      "fixture": "rar5_m3.rar"
+    },
+    {
+      "detected": 385,
+      "counts": {
+        "detected": 385,
+        "unchanged": 0,
+        "missed": 0,
+        "disagreement": 1,
+        "survived": 2,
+        "inconclusive": 0,
+        "unverifiable": 0,
+        "noop": 0
+      },
+      "interval": {
+        "lower": 0.9901207581302,
+        "upper": 1
+      },
+      "rate": 1,
+      "precision_met": true,
+      "profile": "shotgun_variable",
+      "retained": 1,
+      "input_sha256": "01174ff9da49c0c115a488e1a500d9151dc37be28ca696a0a58a2e440989be82",
+      "attempts": 388,
+      "eligible": 385,
+      "fixture": "rar5_m3.rar"
+    },
+    {
+      "detected": 385,
+      "counts": {
+        "detected": 385,
+        "unchanged": 0,
+        "missed": 0,
+        "disagreement": 0,
+        "survived": 0,
+        "inconclusive": 0,
+        "unverifiable": 0,
+        "noop": 0
+      },
+      "interval": {
+        "lower": 0.9901207581302,
+        "upper": 1
+      },
+      "rate": 1,
+      "precision_met": true,
+      "profile": "nuke",
+      "retained": 0,
+      "input_sha256": "01174ff9da49c0c115a488e1a500d9151dc37be28ca696a0a58a2e440989be82",
+      "attempts": 385,
+      "eligible": 385,
+      "fixture": "rar5_m3.rar"
+    },
+    {
+      "detected": 385,
+      "counts": {
+        "detected": 385,
+        "unchanged": 0,
+        "missed": 0,
+        "disagreement": 0,
+        "survived": 0,
+        "inconclusive": 0,
+        "unverifiable": 0,
+        "noop": 0
+      },
+      "interval": {
+        "lower": 0.9901207581302,
+        "upper": 1
+      },
+      "rate": 1,
+      "precision_met": true,
+      "profile": "robespierre",
+      "retained": 0,
+      "input_sha256": "01174ff9da49c0c115a488e1a500d9151dc37be28ca696a0a58a2e440989be82",
+      "attempts": 385,
+      "eligible": 385,
+      "fixture": "rar5_m3.rar"
+    },
+    {
+      "detected": 385,
+      "counts": {
+        "detected": 385,
+        "unchanged": 0,
+        "missed": 0,
+        "disagreement": 0,
+        "survived": 0,
+        "inconclusive": 0,
+        "unverifiable": 0,
+        "noop": 0
+      },
+      "interval": {
+        "lower": 0.9901207581302,
+        "upper": 1
+      },
+      "rate": 1,
+      "precision_met": true,
+      "profile": "badonkachomp",
+      "retained": 0,
+      "input_sha256": "01174ff9da49c0c115a488e1a500d9151dc37be28ca696a0a58a2e440989be82",
+      "attempts": 385,
+      "eligible": 385,
+      "fixture": "rar5_m3.rar"
+    }
+  ],
+  "totals": {
+    "attempts": 6948,
+    "eligible": 6930,
+    "detected": 6930,
+    "missed": 0,
+    "disagreement": 4,
+    "unverifiable": 0,
+    "inconclusive": 6,
+    "survived": 8,
+    "noop": 0,
+    "unchanged": 0
+  }
+}

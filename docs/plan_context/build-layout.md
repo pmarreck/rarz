@@ -55,3 +55,13 @@ complete CLI suite and its OS isolation boundary remain unqualified there.
 Windows AMD64 `--about` also executed successfully under Wine 11.16 with the
 correct compiled identity. Emulation startup is distinct from native Windows
 archive-validation evidence.
+
+A later prospective runtime adapter passed the complete 505-unit/CLI/v70
+suite on Linux. On native macOS 26.7.2 it passed the units, archive CLI,
+v70, and filesystem-isolation controls, including case-insensitive test paths.
+The complete macOS suite still failed its required assessment suite because
+the 1 GiB virtual-memory cap was rejected before tool execution. That adapter
+remains outside the shipped branch pending the
+[assessment memory decision](assessment-tool-probes.md). Existing native Linux
+ARM64 and Windows runner contracts have been requested; cross-build and Wine
+results remain distinct from native qualification.

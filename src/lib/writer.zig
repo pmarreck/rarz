@@ -28,7 +28,7 @@ pub const FileEntry = struct {
 	data: []const u8, // file content
 	mtime: u32, // Unsigned Unix seconds, as required by the RAR5 base header
 	is_directory: bool,
-	host_os: u8 = 0, // 0=Windows, 3=Unix
+	host_os: u8 = 0, // RAR5: 0=Windows, 1=Unix
 	attributes: u32 = 0, // OS-specific (0 = use defaults: 0x10 dir / 0x20 file)
 };
 

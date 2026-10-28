@@ -153,7 +153,7 @@ typedef struct {
 	uint64_t data_len;
 	uint32_t mtime;         /* RAR5 unsigned Unix seconds, including epoch zero */
 	uint8_t is_directory;
-	uint8_t host_os;        /* 0=Windows, 3=Unix */
+	uint8_t host_os;        /* RAR5: 0=Windows, 1=Unix */
 	uint8_t _pad[2];        /* alignment padding */
 	uint32_t attributes;    /* OS-specific (Unix: st_mode, Windows: file attrs) */
 } rarz_create_file_entry;

@@ -9,14 +9,14 @@ Completed records: [docs/PLAN_LOG.md](docs/PLAN_LOG.md). Historical decisions an
 ## Correctness queue
 
 - [ ] Recognize recovery-volume signatures without claiming recovery-data verification (#36).
-- [ ] Verify exact-commit CI for archive-comment checksums and the UNRAR exit-zero diagnostic rule; complete 473-unit/CLI/v70 and native macOS acceptance passed (#21; context: docs/plan_context/rar2-comments.md).
+- [x] Verify exact-commit CI for archive-comment checksums and the UNRAR exit-zero diagnostic rule; complete 473-unit/CLI/v70 and native macOS acceptance passed, followed by exact CI in 56 seconds (done 2026-10-28 02:01 EDT; commit 84cf819; #21; context: docs/plan_context/rar2-comments.md).
 - [ ] Add per-part packed CRC checks to split-volume validation (#26).
 - [ ] Verify binary/decimal volume-size suffix behavior against the producer CLI (#33).
 - [ ] Validate RAR5 UTF-8 filenames without conflating invalid encoding with unsupported decoding (#30).
 - [ ] Parse RAR5 file-version extra records and prevent versioned-name collisions (#32).
 - [ ] Restore extraction metadata, including directory times after children and RAR4 executable permissions (#35).
 - [ ] Define timestamp presence and time basis in a richer metadata API before closing the remaining normalization scope of #31 (context: docs/plan_context/timestamps.md).
-- [ ] Correct RAR5 Unix host-OS metadata from 3 to the specified value 1 and add independent attribute interoperability controls.
+- [ ] Verify exact-commit CI for RAR5 Unix host value 1 and directory ordering; complete 473-unit/CLI/v70 and native macOS acceptance passed (context: docs/plan_context/rar5-unix-metadata.md).
 - [ ] Account for encrypted RAR4 service/comment blocks and parse SALT/EXT_TIME fields (#11, #5).
 - [ ] Test extra-area bounds and forward-compatible record traversal (#4).
 

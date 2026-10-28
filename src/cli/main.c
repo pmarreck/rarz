@@ -371,7 +371,7 @@ static int entry_list_add_file(entry_list *list, const char *archive_name,
 	list->entries[idx].mtime = mtime;
 	list->entries[idx].is_directory = 0;
 #ifndef _WIN32
-	list->entries[idx].host_os = 3; /* Unix */
+	list->entries[idx].host_os = 1; /* RAR5 Unix */
 	list->entries[idx].attributes = (uint32_t)st->st_mode;
 #else
 	list->entries[idx].host_os = 0; /* Windows */
@@ -408,7 +408,7 @@ static int entry_list_add_dir(entry_list *list, const char *archive_name, struct
 	list->entries[idx].mtime = mtime;
 	list->entries[idx].is_directory = 1;
 #ifndef _WIN32
-	list->entries[idx].host_os = 3; /* Unix */
+	list->entries[idx].host_os = 1; /* RAR5 Unix */
 	list->entries[idx].attributes = (uint32_t)st->st_mode;
 #else
 	list->entries[idx].host_os = 0; /* Windows */
@@ -462,11 +462,11 @@ static int walk_directory(entry_list *list, const char *fs_path, const char *arc
 		}
 
 		if (S_ISDIR(st.st_mode)) {
-			/* Add directory entry with trailing slash */
+			/* Emit directory metadata after children, matching the producer order. */
 			char dir_archive[4096];
 			snprintf(dir_archive, sizeof(dir_archive), "%s/", child_archive);
-			if (entry_list_add_dir(list, dir_archive, &st) != 0 ||
-			    walk_directory(list, child_path, dir_archive) != 0) {
+			if (walk_directory(list, child_path, dir_archive) != 0 ||
+			    entry_list_add_dir(list, dir_archive, &st) != 0) {
 				closedir(dir);
 				return -1;
 			}
@@ -1548,11 +1548,11 @@ static int cmd_add(int argc, char **argv) {
 			const char *dir_base = strrchr(clean_path, '/');
 			dir_base = dir_base ? dir_base + 1 : clean_path;
 
-			/* Add the directory entry itself */
+			/* Emit directory metadata after children so extraction restores it last. */
 			char dir_archive[4096];
 			snprintf(dir_archive, sizeof(dir_archive), "%s/", dir_base);
-			if (entry_list_add_dir(&list, dir_archive, &st) != 0 ||
-			    walk_directory(&list, clean_path, dir_archive) != 0) {
+			if (walk_directory(&list, clean_path, dir_archive) != 0 ||
+			    entry_list_add_dir(&list, dir_archive, &st) != 0) {
 				fprintf(stderr, "error: cannot add directory '%s'\n", path);
 				progrez_finish(pctx);
 				progrez_destroy(pctx);

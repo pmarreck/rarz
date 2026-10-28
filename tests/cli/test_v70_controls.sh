@@ -7,7 +7,7 @@ scratch=$(mktemp -d) || exit 1
 trap 'rm -rf "$scratch"' EXIT
 mkdir -p "$scratch/project/tests/cli" "$scratch/project/tests/support" "$scratch/project/tests/fixtures_large" "$scratch/bin" || exit 1
 cp tests/cli/test_v70_corpus.sh "$scratch/project/tests/cli/" || exit 1
-cp tests/support/capture.bash tests/support/validation-outcome.bash "$scratch/project/tests/support/" || exit 1
+cp tests/support/capture.bash tests/support/validation-outcome.bash tests/support/legacy-mutation.bash "$scratch/project/tests/support/" || exit 1
 printf 'abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789' > "$scratch/original"
 export V70_ORIGINAL="$scratch/original" V70_SOURCE="$scratch/project/tests/fixtures_large/v70_longrange.rar" V70_TOUCHED="$scratch/touched"
 printf '#!%s\n' "$(command -v bash)" > "$scratch/bin/rarz"

@@ -117,12 +117,8 @@ for f in "$FIXTURES"/rar5_store.rar "$FIXTURES"/single_file.rar; do
 		# Deterministic offset from seed
 		offset=$(( (seed * 31 + i * 17) % (filesize - safe_start) + safe_start ))
 
-		# Create corrupted copy
 		corrupt_file="$work/corrupt_${name}_${i}.rar"
-		cp "$f" "$corrupt_file"
-
-		# Flip a byte at the computed offset
-		printf '\xFF' | dd of="$corrupt_file" bs=1 seek="$offset" count=1 conv=notrunc 2>/dev/null
+		legacy_mutate "$f" "$corrupt_file" overwrite-byte-v1 "$offset" 255 || exit 1
 
 		observe_unrar_test "$corrupt_file"
 		observe_rarz_test "$RARZ" "$corrupt_file"
@@ -130,7 +126,7 @@ for f in "$FIXTURES"/rar5_store.rar "$FIXTURES"/single_file.rar; do
 			detected) detected=$((detected + 1)) ;;
 			benign) benign=$((benign + 1)) ;;
 			stricter) stricter=$((stricter + 1)) ;;
-			*) fail "$name mutation $i: unrar=$unrar_t_class/$unrar_t_status rarz=$rarz_t_class/$rarz_t_status" ;;
+			*) fail "$name mutation $i: unrar=$unrar_t_class/$unrar_t_execution/$unrar_t_status rarz=$rarz_t_class/$rarz_t_execution/$rarz_t_status" ;;
 		esac
 
 		rm -f "$corrupt_file"

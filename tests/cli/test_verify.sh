@@ -137,13 +137,16 @@ rc=$?
 dmg="$work/dmg.rar"
 cp "$FIXTURES/rar5_m3.rar" "$dmg"
 dsz=$(stat -c%s "$dmg" 2>/dev/null || stat -f%z "$dmg")
-printf '\xA5' | dd of="$dmg" bs=1 seek=$((dsz * 2 / 3)) count=1 conv=notrunc 2>/dev/null
-if unrar t "$dmg" >/dev/null 2>&1; then
+legacy_mutate "$FIXTURES/rar5_m3.rar" "$dmg" overwrite-byte-v1 "$((dsz * 2 / 3))" 165 || exit 1
+observe_unrar_test "$dmg"
+if [[ $unrar_t_class == valid ]]; then
 	echo "  (skip: mutation did not damage the archive)"
-else
+elif [[ $unrar_t_class == damaged ]]; then
 	"$RARZ" verify "$dmg" >/dev/null 2>&1
 	rc=$?
 	[ "$rc" -eq 1 ] && ok "checksum mismatch exits 1" || fail "checksum mismatch should exit 1, got $rc"
+else
+	fail "checksum control reference $unrar_t_class/$unrar_t_execution (exit $unrar_t_status)"
 fi
 
 # Could-not-decode must be DISTINCT from confirmed damage. This is the whole
@@ -152,7 +155,7 @@ fi
 # Fixture+offset chosen because it reproducibly lands on that path.
 cnv="$work/cannot_verify.rar"
 cp "$FIXTURES/rar4_v29_lines.rar" "$cnv"
-printf '\xA5' | dd of="$cnv" bs=1 seek=91 count=1 conv=notrunc 2>/dev/null
+legacy_mutate "$FIXTURES/rar4_v29_lines.rar" "$cnv" overwrite-byte-v1 91 165 || exit 1
 "$RARZ" verify "$cnv" >/dev/null 2>&1
 rc=$?
 [ "$rc" -eq 69 ] && ok "undecodable entry exits 69 (EX_UNAVAILABLE), not 1" \
@@ -234,8 +237,7 @@ for name in rar5_m3 rar4_m3 rar5_solid; do
 		off=$(( sz / 3 + (i * 613) % (sz / 2) ))
 		[ "$off" -lt "$sz" ] || continue
 		c="$work/c.rar"
-		cp "$f" "$c"
-		printf '\xA5' | dd of="$c" bs=1 seek="$off" count=1 conv=notrunc 2>/dev/null
+		legacy_mutate "$f" "$c" overwrite-byte-v1 "$off" 165 || exit 1
 
 		exercised=$((exercised + 1))
 		observe_unrar_test "$c"

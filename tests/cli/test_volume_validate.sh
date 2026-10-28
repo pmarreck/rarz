@@ -63,7 +63,7 @@ if [ -f "$part2" ]; then
 	# Corrupt near the middle of the volume (likely data area)
 	part2_size=$(wc -c < "$part2" | tr -d ' ')
 	corrupt_pos=$((part2_size / 2))
-	printf '\xFF' | dd of="$part2" bs=1 seek="$corrupt_pos" conv=notrunc 2>/dev/null
+	legacy_mutate "$tmpdir/store.part2.rar" "$part2" overwrite-byte-v1 "$corrupt_pos" 255 || exit 1
 	observe_rarz_test "$RARZ" "$tmpdir/corrupt_store/store.part1.rar"
 	output=$rarz_t_stdout
 	if [[ $rarz_t_class == damaged ]]; then

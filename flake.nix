@@ -177,7 +177,7 @@
           package-smoke = checks-package;
           classifiers = checks-classifiers;
           v70-controls = pkgs.runCommand "rarz-v70-controls" {
-            nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.diffutils pkgs.gnugrep ];
+            nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.diffutils pkgs.gnugrep pkgs.jq corruption-reader.packages.${system}.default ];
           } ''
             cp -R ${self} source
             chmod -R u+w source

@@ -197,9 +197,7 @@ for f in $SOLID_FIXTURES; do
 	for i in $(seq 1 $total); do
 		offset=$(( safe_start + (i * 7919) % span ))
 		corrupt="$(mktemp)"
-		cp "$f" "$corrupt"
-		# Fixed-byte overwrite; the reference decides whether it caused damage.
-		printf '\xA5' | dd of="$corrupt" bs=1 seek="$offset" count=1 conv=notrunc 2>/dev/null
+		legacy_mutate "$f" "$corrupt" overwrite-byte-v1 "$offset" 165 || exit 1
 
 		observe_unrar_test "$corrupt"
 		observe_rarz_test "$RARZ" "$corrupt"
@@ -214,7 +212,7 @@ for f in $SOLID_FIXTURES; do
 			stricter) stricter=$((stricter + 1)) ;;
 			*)
 				failed=$((failed + 1))
-				fail "$name mutation $i: unrar=$unrar_t_class/$unrar_t_status rarz=$rarz_t_class/$rarz_t_status"
+				fail "$name mutation $i: unrar=$unrar_t_class/$unrar_t_execution/$unrar_t_status rarz=$rarz_t_class/$rarz_t_execution/$rarz_t_status"
 				;;
 		esac
 

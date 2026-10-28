@@ -36,6 +36,12 @@ CI manifest also selects classifier, driver, publication, and Windows
 emulation checks; it does not run every CLI suite or the large v70 corpus.
 Local full-suite evidence therefore has a wider scope than that CI result.
 
+The [legacy mutation migration](plan_context/legacy-mutation-records.md) now
+records versioned corruption-reader cases and input/mutant hashes for the
+older fixed-position loops. Their byte transformations and historical sample
+counts remain unchanged. Execution categories remain separate from archive
+verdicts.
+
 Individual existing CLI cases can be replayed after building the CLI, for
 example `nix develop -c bash tests/cli/test_solid.sh`. Apply a process timeout
 and memory budget when running corruption cases. Existing scripts do not
@@ -193,8 +199,8 @@ and mutation definitions; this index does not rename or strengthen them.
   is the current canonical sniper operation despite legacy wording.
 - The v70 gate now requires explicit damage from both validators for both
   designated mutations. Crashes, timeouts, unsupported results, and resource
-  failures cannot satisfy that control. More detailed execution categories
-  remain part of the legacy-gate migration.
+  failures cannot satisfy that control. The legacy adapters retain separate
+  execution categories; a killed process alone does not establish OOM.
 - The bounded mutation gates retain their legacy sampling positions and
   fixed-byte overwrites. Explicit outcome classification improves the evidence
   for those trials; it does not prove complete byte or format coverage.

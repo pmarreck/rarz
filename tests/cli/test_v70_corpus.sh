@@ -24,11 +24,11 @@ echo "=== v70: intact corpus validates (8 GiB window, >4 GiB distances) ==="
 out='' err='' rc=0
 capture timeout 600 "$RARZ" t "$CORPUS"
 [[ $(classify_rarz_test "$rc" "$out") == valid ]] || { fail "pristine corpus not VALID (exit $rc)"; exit 1; }
-capture timeout 600 unrar t -mdx8g "$CORPUS"
+capture timeout 600 unrar t -p- -qo- -mdx8g "$CORPUS"
 [[ $(classify_unrar_test "$rc" "$out"$'\n'"$err") == valid ]] || { fail "reference pristine check incomplete (exit $rc)"; exit 1; }
 ok "corpus VALID in both validators"
 
-echo "=== v70: damage is refused (sniper, 2 deterministic positions) ==="
+echo "=== v70: damage is refused (xor-byte-v1, 2 deterministic positions) ==="
 # Mutations belong to private copies. A trap cannot make source mutations safe
 # against SIGKILL or concurrent readers. Large scratch must be disk-backed so
 # its bytes do not consume the decoder's memory budget a second time.
@@ -42,20 +42,18 @@ fi
 detected=0
 for frac in 41 83; do
 	mutant="$scratch/mutant.rar"
-	cp --reflink=auto "$CORPUS" "$mutant" || exit 1
-	chmod u+w "$mutant" || exit 1
 	off=$((sz * frac / 100))
-	orig=$(dd if="$CORPUS" bs=1 skip=$off count=1 2>/dev/null | od -An -tu1 | tr -d ' ')
-	flip=$(( (orig ^ 165) ))
-	printf "\\$(printf %03o $flip)" | dd of="$mutant" bs=1 seek=$off count=1 conv=notrunc 2>/dev/null || exit 1
-	capture timeout 600 unrar t -mdx8g "$mutant"
+	legacy_mutate "$CORPUS" "$mutant" xor-byte-v1 "$off" 165 || exit 1
+	capture timeout 600 unrar t -p- -qo- -mdx8g "$mutant"
 	reference=$(classify_unrar_test "$rc" "$out"$'\n'"$err")
+	reference_execution=$(classify_execution_status unrar "$rc")
 	capture timeout 600 "$RARZ" t "$mutant"
 	actual=$(classify_rarz_test "$rc" "$out")
+	actual_execution=$(classify_execution_status rarz "$rc")
 	if [[ $reference == damaged && $actual == damaged ]]; then
 		detected=$((detected+1)); ok "damage detected @$frac%"
 	else
-		fail "mutation @$frac%: reference=$reference rarz=$actual"
+		fail "mutation @$frac%: reference=$reference/$reference_execution rarz=$actual/$actual_execution"
 	fi
 done
 [[ $detected == 2 ]] || fail "both designated mutations must be confirmed damage and detected"

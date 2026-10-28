@@ -7,6 +7,27 @@ errors=0
 cases=0
 fail() { printf 'FAIL: %s\n' "$1"; errors=$((errors + 1)); }
 
+# Execution failures stay separate from archive verdicts. Exit 137 cannot prove
+# an OOM kill: an external SIGKILL has the same shell status.
+expected_signals='129 130 131 132 133 138 140 141 142 143 144 145 146 147 148 149 150 151 152 153 154 155 156 157 158 159 160 161 162 163 164 165 166 167 168 169 170 171 172 173 174 175 176 177 178 179 180 181 182 183 184 185 186 187 188 189 190 191 192 '
+for tool in rarz unrar; do
+	declare -A observed=()
+	for ((status=0; status<=255; status++)); do
+		actual=$(classify_execution_status "$tool" "$status")
+		case $actual in
+			completed|timeout|crash|killed|launch-error|signaled|memory-error) observed[$actual]="${observed[$actual]-}$status " ;;
+			*) fail "$tool status $status: unknown execution '$actual'" ;;
+		esac
+	done
+	[[ ${observed[timeout]-} == '124 ' ]] || fail "$tool timeout set differs"
+	[[ ${observed[crash]-} == '134 135 136 139 ' ]] || fail "$tool crash set differs"
+	[[ ${observed[killed]-} == '137 ' ]] || fail "$tool killed set differs"
+	[[ ${observed[launch-error]-} == '125 126 127 ' ]] || fail "$tool launch-error set differs"
+	[[ ${observed[signaled]-} == "$expected_signals" ]] || fail "$tool signal set differs"
+	want_memory=''; [[ $tool != unrar ]] || want_memory='8 '
+	[[ ${observed[memory-error]-} == "$want_memory" ]] || fail "$tool memory-error set differs"
+done
+
 # Each row declares the complete set of exit codes accepted in each category.
 # Sweep every shell exit code, including signal and timeout outcomes, against
 # every output shape. A misleading line cannot override process failure.
@@ -117,6 +138,22 @@ head -c "$((size - 24))" "$tail_volume" > "$tail_volume.cut" || exit 1
 mv "$tail_volume.cut" "$tail_volume" || exit 1
 observe_unrar_test "$scratch/rar5_vol_store.part1.rar"
 [[ $unrar_t_status == 1 && $unrar_t_class == damaged ]] || fail "reference service-block truncation: $unrar_t_class (exit $unrar_t_status)"
+
+# Inspect the real adapter's arguments with a test-owned executable. Its
+# runtime record must retain the failure category even with misleading output.
+mkdir "$scratch/bin" || exit 1
+printf '#!%s\n' "$(command -v bash)" > "$scratch/bin/unrar"
+cat >> "$scratch/bin/unrar" <<'ADAPTER'
+printf '%s\n' "$@" > "$ORACLE_ARGUMENTS"
+printf 'All OK\n'
+exit 8
+ADAPTER
+chmod +x "$scratch/bin/unrar" || exit 1
+export ORACLE_ARGUMENTS="$scratch/arguments"
+PATH="$scratch/bin:$PATH" observe_unrar_test 'fixture with spaces.rar'
+printf 't\n-p-\n-qo-\nfixture with spaces.rar\n' > "$scratch/expected"
+cmp -s "$scratch/arguments" "$scratch/expected" || fail 'reference adapter must disable passwords and quick-open'
+[[ $unrar_t_class == tool-error && ${unrar_t_execution-} == memory-error ]] || fail 'reference adapter lost memory-failure evidence'
 
 [[ $errors == 0 ]] || exit 1
 printf 'PASS: validation outcome sets (%s rarz + %s reference records), 12 mutation pairs, and seven real controls\n' "$cases" "$reference_cases"

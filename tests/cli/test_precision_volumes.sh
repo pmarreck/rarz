@@ -71,7 +71,7 @@ for set_name in $SETS; do
 	if [[ $unrar_t_class == valid && $rarz_t_class == valid ]]; then
 		ok "$set_name: intact set VALID, agrees with unrar"
 	else
-		fail "$set_name: intact set unrar=$unrar_t_class/$unrar_t_status rarz=$rarz_t_class/$rarz_t_status"
+		fail "$set_name: intact set unrar=$unrar_t_class/$unrar_t_execution/$unrar_t_status rarz=$rarz_t_class/$rarz_t_execution/$rarz_t_status"
 	fi
 done
 
@@ -113,8 +113,7 @@ for set_name in $SETS; do
 			sz=$(stat -c%s "$target" 2>/dev/null || stat -f%z "$target")
 			[ "$sz" -gt "$amount" ] || continue
 
-			# Truncation
-			head -c $((sz - amount)) "$target" > "$target.t" && mv "$target.t" "$target"
+			legacy_mutate "$FIXTURES/$volname" "$target" drop-suffix-v1 "$amount" || exit 1
 
 			total=$((total + 1))
 			observe_unrar_test "$d/$base"
@@ -131,7 +130,7 @@ for set_name in $SETS; do
 				stricter) stricter=$((stricter + 1)) ;;
 				*)
 					failed=$((failed + 1))
-					fail "$volname truncated by $amount: unrar=$unrar_t_class/$unrar_t_status rarz=$rarz_t_class/$rarz_t_status"
+					fail "$volname truncated by $amount: unrar=$unrar_t_class/$unrar_t_execution/$unrar_t_status rarz=$rarz_t_class/$rarz_t_execution/$rarz_t_status"
 					;;
 			esac
 		done

@@ -48,7 +48,7 @@ for name in rar4_vol_store rar4_vol_m3; do
 	if [[ $unrar_t_class == valid && $rarz_t_class == valid ]]; then
 		ok "$name: VALID, agrees with unrar"
 	else
-		fail "$name: unrar=$unrar_t_class/$unrar_t_status rarz=$rarz_t_class/$rarz_t_status"
+		fail "$name: unrar=$unrar_t_class/$unrar_t_execution/$unrar_t_status rarz=$rarz_t_class/$rarz_t_execution/$rarz_t_status"
 	fi
 
 	# verify must reach the same conclusion as t.
@@ -72,7 +72,7 @@ for name in rar4_vol_store rar4_vol_m3; do
 		target="$work/set/$(basename "$vol")"
 		sz=$(stat -c%s "$target" 2>/dev/null || stat -f%z "$target")
 		# Two-thirds in: past the headers, inside the payload.
-		printf '\xA5' | dd of="$target" bs=1 seek=$((sz * 2 / 3)) count=1 conv=notrunc 2>/dev/null
+		legacy_mutate "$vol" "$target" overwrite-byte-v1 "$((sz * 2 / 3))" 165 || exit 1
 		total=$((total + 1))
 
 		mfirst=$(ls "$work/set/$name".part*.rar | sort | head -1)
@@ -87,7 +87,7 @@ for name in rar4_vol_store rar4_vol_m3; do
 		if [[ $(classify_mutation_pair "$unrar_t_class" "$rarz_t_class") == detected ]]; then
 			caught=$((caught + 1))
 		else
-			fail "$name $(basename "$vol"): unrar=$unrar_t_class/$unrar_t_status rarz=$rarz_t_class/$rarz_t_status"
+			fail "$name $(basename "$vol"): unrar=$unrar_t_class/$unrar_t_execution/$unrar_t_status rarz=$rarz_t_class/$rarz_t_execution/$rarz_t_status"
 		fi
 	done
 	if [[ $total -gt 0 && $caught -eq $total ]]; then

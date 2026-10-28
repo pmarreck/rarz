@@ -1,6 +1,24 @@
 #!/usr/bin/env bash
 # Test-only classification of the existing `rarz t` process contract.
 source "$(dirname "${BASH_SOURCE[0]}")/capture.bash" || return 1
+source "$(dirname "${BASH_SOURCE[0]}")/legacy-mutation.bash" || return 1
+
+# Pure execution evidence, orthogonal to archive validity. These are shell
+# status conventions, not proof of which actor sent a signal. In particular,
+# SIGKILL does not identify an OOM event without an external resource receipt.
+classify_execution_status() {
+	local tool=$1 status=$2
+	if [[ $tool == unrar && $status == 8 ]]; then printf 'memory-error\n'; return; fi
+	case $status in
+		124) printf 'timeout\n' ;;
+		134|135|136|139) printf 'crash\n' ;;
+		137) printf 'killed\n' ;;
+		125|126|127) printf 'launch-error\n' ;;
+		*)
+			if ((status>128 && status<=192)); then printf 'signaled\n'
+			else printf 'completed\n'; fi ;;
+	esac
+}
 
 # Pure: a complete recorded exit status and stdout produce one classification.
 # `valid` is the command's archive verdict, not a claim to decrypt its entries.
@@ -63,16 +81,18 @@ observe_rarz_test() {
 	rarz_t_stdout=$out
 	rarz_t_stderr=$err
 	rarz_t_status=$rc
+	rarz_t_execution=$(classify_execution_status rarz "$rc")
 	rarz_t_class=$(classify_rarz_test "$rc" "$out")
 }
 
 observe_unrar_test() {
 	local archive=$1 out='' err='' rc=125
-	capture timeout 60 unrar t "$archive"
+	capture timeout 60 unrar t -p- -qo- "$archive"
 	unrar_t_stdout=$out
 	unrar_t_stderr=$err
 	unrar_t_status=$rc
-	unrar_t_class=$(classify_unrar_test "$rc" "$err")
+	unrar_t_execution=$(classify_execution_status unrar "$rc")
+	unrar_t_class=$(classify_unrar_test "$rc" "$out"$'\n'"$err")
 }
 
 # Pure set check over newline-delimited fixture identities. Extra available

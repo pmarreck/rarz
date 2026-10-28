@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -u
+root=$(cd "$(dirname "$0")" && pwd) || exit 2
+if [[ -z ${IN_NIX_SHELL:-} ]]; then
+	exec nix develop "$root" -c "$root/assess-coverage" "$@"
+fi
+export LC_ALL=C
+exec luajit "$root/tests/support/assess-coverage.lua" "$@"

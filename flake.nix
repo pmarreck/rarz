@@ -4,14 +4,15 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    corruption-reader.url = "git+ssh://git@github.com/pmarreck/corruption_reader.git?rev=21ee639537644c81ada3e780c19608817dda92ca";
     zig-overlay = {
       url = "github:mitchellh/zig-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
 
-  outputs = { self, nixpkgs, flake-utils, zig-overlay }:
-    flake-utils.lib.eachDefaultSystem (system:
+  outputs = { self, nixpkgs, flake-utils, zig-overlay, corruption-reader }:
+    flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ] (system:
       let
         pkgs = import nixpkgs {
           inherit system;
@@ -50,7 +51,9 @@
           dontFixup = true;
         };
 
-        rarz = pkgs.stdenv.mkDerivation {
+        nativeTarget = if pkgs.stdenv.isLinux then "${pkgs.stdenv.hostPlatform.parsed.cpu.name}-linux-musl"
+          else "${pkgs.stdenv.hostPlatform.parsed.cpu.name}-macos";
+        mkRarz = { optimize, target ? nativeTarget, testArtifacts ? false }: pkgs.stdenv.mkDerivation {
           inherit pname version;
           src = self;
 
@@ -69,15 +72,28 @@
             mkdir -p $ZIG_GLOBAL_CACHE_DIR
             cp -r ${zigDeps}/* $ZIG_GLOBAL_CACHE_DIR/
             chmod -R u+w $ZIG_GLOBAL_CACHE_DIR
-            zig build --prefix $out -Doptimize=ReleaseFast ${pkgs.lib.optionalString pkgs.stdenv.isLinux "-Dtarget=${pkgs.stdenv.hostPlatform.parsed.cpu.name}-linux-musl"}
+            zig build ${pkgs.lib.optionalString testArtifacts "test-artifacts"} --prefix $out -Doptimize=${optimize} -Dtarget=${target}
           '';
 
           installPhase = ''
-            mkdir -p $out/lib $out/include
-            cp zig-out/lib/librarz.a $out/lib/ || true
-            cp include/rarz.h $out/include/ || true
+            mkdir -p $out/include
+            cp include/rarz.h $out/include/rarz.h
           '';
         };
+
+        rarz = mkRarz { optimize = "ReleaseFast"; };
+        targetPackages = builtins.listToAttrs (pkgs.lib.concatMap (target:
+          map (profile: {
+            name = "${target.pf}${if target ? variant then "-${target.variant}" else ""}-${profile}";
+            value = mkRarz { optimize = profile; target = target.triple; };
+          }) [ "ReleaseFast" "ReleaseSafe" "Debug" ]
+        ) (builtins.fromJSON (builtins.readFile ./scripts/targets.json)));
+
+        publicationProducts = pkgs.writeText "rarz-build-products.json" (builtins.toJSON
+          (builtins.listToAttrs (map (target: {
+            name = target.pf;
+            value = targetPackages."${target.pf}${if target ? variant then "-${target.variant}" else ""}-ReleaseFast";
+          }) (builtins.fromJSON (builtins.readFile ./scripts/targets.json)))));
 
         checks-package = pkgs.runCommand "${pname}-package-smoke" {
           nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep ]
@@ -140,17 +156,57 @@
           '';
         };
       in {
-        packages.default = rarz;
+        packages = targetPackages // {
+          default = rarz;
+          test = mkRarz { optimize = "ReleaseSafe"; };
+          test-artifacts = mkRarz { optimize = "ReleaseSafe"; testArtifacts = true; };
+        };
 
         checks.default = checks-test;
         checks.package-smoke = checks-package;
         checks.classifiers = checks-classifiers;
+        checks.v70-controls = pkgs.runCommand "rarz-v70-controls" {
+          nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.diffutils pkgs.gnugrep ];
+        } ''
+          cp -R ${self} source
+          chmod -R u+w source
+          cd source
+          patchShebangs tests
+          bash tests/cli/test_v70_controls.sh
+          mkdir -p $out
+        '';
+        checks.test-driver = pkgs.runCommand "rarz-test-driver" {
+          nativeBuildInputs = [ pkgs.bash pkgs.coreutils ];
+        } ''
+          cd ${self}
+          bash tests/cli/test_test_driver.sh
+          mkdir -p $out
+        '';
+        checks.build-publication = pkgs.runCommand "rarz-build-publication" {
+          nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.jq pkgs.llvmPackages.llvm
+            (pkgs.luajit.withPackages (ps: [ ps.lua-cjson ])) ];
+        } ''
+          cp -R ${self} source
+          chmod -R u+w source
+          cd source
+          bash tests/integration/build-matrix ${publicationProducts} ${mkRarz { optimize = "ReleaseSafe"; }} ${mkRarz { optimize = "Debug"; }}
+          mkdir -p $out
+        '';
 
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [
             zig
             unrar
             hyperfine
+            (luajit.withPackages (ps: [ ps.lua-cjson ]))
+            jq
+            coreutils
+            findutils
+            file
+            llvmPackages.llvm
+          ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.bubblewrap ]
+          ++ pkgs.lib.optionals (builtins.hasAttr system corruption-reader.packages) [
+            corruption-reader.packages.${system}.default
           ] ++ pkgs.lib.optionals (builtins.elem system [ "x86_64-linux" "x86_64-darwin" "aarch64-darwin" ]) [
             rar
           ];

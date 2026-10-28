@@ -90,6 +90,12 @@ static void format_bytes(char *buf, size_t buflen, uint64_t bytes) {
 #define RARZ_OPTIMIZE "Debug"
 #endif
 #endif
+#ifndef RARZ_PF
+#define RARZ_PF "unknown-unknown"
+#endif
+#ifndef RARZ_VARIANT
+#define RARZ_VARIANT ""
+#endif
 #ifndef RARZ_DEBUG_BUILD
 #ifdef NDEBUG
 #define RARZ_DEBUG_BUILD 0
@@ -160,8 +166,8 @@ static void print_usage(void) {
  * The build mode is part of it deliberately — it is what lets a bug report say
  * which binary produced a result, and it is what the banner test keys off. */
 static void print_about(void) {
-	printf("rarz %s (%s, %s) - clean-room RAR archive validator, extractor and writer\n",
-	       RARZ_VERSION, RARZ_TARGET, RARZ_OPTIMIZE);
+	printf("rarz %s (%s, %s) - clean-room RAR archive validator, extractor and writer; PF=%s%s\n",
+	       RARZ_VERSION, RARZ_TARGET, RARZ_OPTIMIZE, RARZ_PF, RARZ_VARIANT);
 }
 
 /* ========================================================================== */
@@ -257,24 +263,23 @@ static int ensure_parent_dir(const char *filepath) {
 }
 
 /* ========================================================================== */
-/* DOS timestamp conversion                                                   */
+/* Timestamp representation                                                   */
 /* ========================================================================== */
 
-/**
- * Convert Unix time_t to DOS timestamp format.
- * DOS format: bits 25-31=year-1980, 21-24=month, 16-20=day, 11-15=hour, 5-10=min, 0-4=sec/2
- */
-static uint32_t unix_to_dos_time(time_t t) {
-	struct tm *tm = localtime(&t);
-	if (!tm) return 0;
-	uint32_t dos = 0;
-	dos |= (uint32_t)((tm->tm_year + 1900 - 1980) & 0x7F) << 25;
-	dos |= (uint32_t)((tm->tm_mon + 1) & 0x0F) << 21;
-	dos |= (uint32_t)(tm->tm_mday & 0x1F) << 16;
-	dos |= (uint32_t)(tm->tm_hour & 0x1F) << 11;
-	dos |= (uint32_t)(tm->tm_min & 0x3F) << 5;
-	dos |= (uint32_t)((tm->tm_sec / 2) & 0x1F);
-	return dos;
+/* RAR5's base header stores unsigned Unix seconds. Do not wrap dates that
+ * require the optional extended-time record, which this writer lacks. */
+static int rar5_mtime(time_t t, uint32_t *value) {
+	if (t < 0 || (uintmax_t)t > UINT32_MAX) return -1;
+	*value = (uint32_t)t;
+	return 0;
+}
+
+/* Pure rendering; the caller resolves the timestamp's time basis first. */
+static void format_calendar_date(char *buf, size_t size, const struct tm *date) {
+	if (date)
+		snprintf(buf, size, "%04d-%02d-%02d", date->tm_year + 1900, date->tm_mon + 1, date->tm_mday);
+	else
+		snprintf(buf, size, "          ");
 }
 
 /* ========================================================================== */
@@ -344,6 +349,11 @@ static void entry_list_free(entry_list *list) {
  */
 static int entry_list_add_file(entry_list *list, const char *archive_name,
                                 uint8_t *fdata, size_t fsize, struct stat *st) {
+	uint32_t mtime;
+	if (rar5_mtime(st->st_mtime, &mtime) != 0) {
+		fprintf(stderr, "error: mtime outside RAR5 base-header range for '%s'\n", archive_name);
+		return -1;
+	}
 	if (list->count >= list->capacity) {
 		if (entry_list_grow(list) != 0) return -1;
 	}
@@ -358,7 +368,7 @@ static int entry_list_add_file(entry_list *list, const char *archive_name,
 	list->entries[idx].name_len = (uint32_t)strlen(name_copy);
 	list->entries[idx].data = fdata;
 	list->entries[idx].data_len = fsize;
-	list->entries[idx].mtime = unix_to_dos_time(st->st_mtime);
+	list->entries[idx].mtime = mtime;
 	list->entries[idx].is_directory = 0;
 #ifndef _WIN32
 	list->entries[idx].host_os = 3; /* Unix */
@@ -376,6 +386,11 @@ static int entry_list_add_file(entry_list *list, const char *archive_name,
  * archive_name should include trailing '/'.
  */
 static int entry_list_add_dir(entry_list *list, const char *archive_name, struct stat *st) {
+	uint32_t mtime;
+	if (rar5_mtime(st->st_mtime, &mtime) != 0) {
+		fprintf(stderr, "error: mtime outside RAR5 base-header range for '%s'\n", archive_name);
+		return -1;
+	}
 	if (list->count >= list->capacity) {
 		if (entry_list_grow(list) != 0) return -1;
 	}
@@ -390,7 +405,7 @@ static int entry_list_add_dir(entry_list *list, const char *archive_name, struct
 	list->entries[idx].name_len = (uint32_t)strlen(name_copy);
 	list->entries[idx].data = NULL;
 	list->entries[idx].data_len = 0;
-	list->entries[idx].mtime = unix_to_dos_time(st->st_mtime);
+	list->entries[idx].mtime = mtime;
 	list->entries[idx].is_directory = 1;
 #ifndef _WIN32
 	list->entries[idx].host_os = 3; /* Unix */
@@ -450,9 +465,11 @@ static int walk_directory(entry_list *list, const char *fs_path, const char *arc
 			/* Add directory entry with trailing slash */
 			char dir_archive[4096];
 			snprintf(dir_archive, sizeof(dir_archive), "%s/", child_archive);
-			entry_list_add_dir(list, dir_archive, &st);
-			/* Recurse into subdirectory */
-			walk_directory(list, child_path, dir_archive);
+			if (entry_list_add_dir(list, dir_archive, &st) != 0 ||
+			    walk_directory(list, child_path, dir_archive) != 0) {
+				closedir(dir);
+				return -1;
+			}
 		} else if (S_ISREG(st.st_mode)) {
 			/* Read file and add to list */
 			size_t fsize = 0;
@@ -460,7 +477,9 @@ static int walk_directory(entry_list *list, const char *fs_path, const char *arc
 			if (!fdata) continue;
 			if (entry_list_add_file(list, child_archive, fdata, fsize, &st) != 0) {
 				free(fdata);
-				fprintf(stderr, "warning: cannot add '%s': out of memory\n", child_path);
+				fprintf(stderr, "error: cannot add '%s'\n", child_path);
+				closedir(dir);
+				return -1;
 			}
 		}
 		/* Skip other file types (devices, sockets, etc.) */
@@ -1122,16 +1141,23 @@ static int cmd_list(const char *path) {
 			ratio = (int)((entry.packed_size * 100) / entry.unpacked_size);
 		}
 
-		/* Decode mtime (DOS format: bits 25-31=year+1980, 21-24=month, 16-20=day) */
+		/* The FFI retains the header's encoding. RAR4 is a local DOS date;
+		 * RAR5 is Unix seconds, rendered in the reader's local time zone. */
 		char date_buf[16];
+		struct tm dos_date = {0};
+		const struct tm *date = NULL;
 		if (entry.mtime != 0) {
-			int year = ((entry.mtime >> 25) & 0x7F) + 1980;
-			int month = (entry.mtime >> 21) & 0x0F;
-			int day = (entry.mtime >> 16) & 0x1F;
-			snprintf(date_buf, sizeof(date_buf), "%04d-%02d-%02d", year, month, day);
-		} else {
-			snprintf(date_buf, sizeof(date_buf), "          ");
+			if (rarz_archive_format(archive) == 50) {
+				time_t seconds = (time_t)entry.mtime;
+				date = localtime(&seconds);
+			} else {
+				dos_date.tm_year = (int)((entry.mtime >> 25) & 0x7F) + 80;
+				dos_date.tm_mon = (int)((entry.mtime >> 21) & 0x0F) - 1;
+				dos_date.tm_mday = (int)((entry.mtime >> 16) & 0x1F);
+				date = &dos_date;
+			}
 		}
+		format_calendar_date(date_buf, sizeof(date_buf), date);
 
 		printf(" %8llu  %8llu  %3d%%  %08X  %s  %-6s  %s%s\n",
 		       (unsigned long long)entry.unpacked_size,
@@ -1525,10 +1551,14 @@ static int cmd_add(int argc, char **argv) {
 			/* Add the directory entry itself */
 			char dir_archive[4096];
 			snprintf(dir_archive, sizeof(dir_archive), "%s/", dir_base);
-			entry_list_add_dir(&list, dir_archive, &st);
-
-			/* Recursively walk */
-			walk_directory(&list, clean_path, dir_archive);
+			if (entry_list_add_dir(&list, dir_archive, &st) != 0 ||
+			    walk_directory(&list, clean_path, dir_archive) != 0) {
+				fprintf(stderr, "error: cannot add directory '%s'\n", path);
+				progrez_finish(pctx);
+				progrez_destroy(pctx);
+				entry_list_free(&list);
+				return 1;
+			}
 #else
 			fprintf(stderr, "error: directory archiving not supported on Windows yet\n");
 			progrez_finish(pctx);
@@ -1551,7 +1581,7 @@ static int cmd_add(int argc, char **argv) {
 			}
 			if (entry_list_add_file(&list, name, fdata, fsize, &st) != 0) {
 				free(fdata);
-				fprintf(stderr, "error: out of memory\n");
+				fprintf(stderr, "error: cannot add file '%s'\n", path);
 				progrez_finish(pctx);
 				progrez_destroy(pctx);
 				entry_list_free(&list);

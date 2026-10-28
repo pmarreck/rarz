@@ -1,5 +1,8 @@
-# Release artifact, ReleaseSafe unit tests, and installed-package execution.
+# Native release, safety tests, classifiers, and five-target publication controls.
 packages.x86_64-linux.default
 checks.x86_64-linux.default
 checks.x86_64-linux.package-smoke
 checks.x86_64-linux.classifiers
+checks.x86_64-linux.v70-controls
+checks.x86_64-linux.test-driver
+checks.x86_64-linux.build-publication

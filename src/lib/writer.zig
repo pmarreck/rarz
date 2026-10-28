@@ -21,7 +21,7 @@ pub const vint_size = reader_mod.vint_size;
 pub const FileEntry = struct {
 	name: []const u8, // UTF-8 filename
 	data: []const u8, // file content
-	mtime: u32, // Unix timestamp (DOS format)
+	mtime: u32, // Unsigned Unix seconds, as required by the RAR5 base header
 	is_directory: bool,
 	host_os: u8 = 0, // 0=Windows, 3=Unix
 	attributes: u32 = 0, // OS-specific (0 = use defaults: 0x10 dir / 0x20 file)

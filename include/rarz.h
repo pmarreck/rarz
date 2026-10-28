@@ -87,7 +87,8 @@ typedef struct {
 	uint64_t unpacked_size;
 	uint64_t packed_size;
 	uint32_t crc32;
-	uint32_t mtime;
+	uint32_t mtime;         /* Raw header time: DOS for RAR4, Unix seconds for RAR5.
+	                        * Query rarz_archive_format(); zero is absent or epoch. */
 	uint8_t method;         /* 0=store, 1-5=compressed */
 	uint8_t is_directory;
 	uint8_t is_encrypted;
@@ -150,7 +151,7 @@ typedef struct {
 	uint32_t name_len;
 	const uint8_t *data;    /* file content */
 	uint64_t data_len;
-	uint32_t mtime;         /* DOS timestamp */
+	uint32_t mtime;         /* RAR5 unsigned Unix seconds, including epoch zero */
 	uint8_t is_directory;
 	uint8_t host_os;        /* 0=Windows, 3=Unix */
 	uint8_t _pad[2];        /* alignment padding */

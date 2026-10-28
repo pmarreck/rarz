@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Exercise the publisher with independently built products, inside Nix isolation.
+set -u
+source tests/support/capture.bash || exit 1
+manifest=$1
+scratch=$(mktemp -d) || exit 1
+trap 'rm -rf "$scratch"' EXIT
+mkdir -p "$scratch/project/scripts" "$scratch/bin" || exit 1
+cp build "$scratch/project/" || exit 1
+cp -R scripts/. "$scratch/project/scripts/" || exit 1
+printf '#!%s\n' "$(command -v bash)" > "$scratch/bin/nix"
+cat >> "$scratch/bin/nix" <<'STUB'
+if [[ $1 == develop ]]; then shift 2; exec "$@"; fi
+[[ $1 == build && $2 == --out-link ]] || exit 74
+ln -s "$BUILD_PRODUCT" "$3"
+STUB
+chmod +x "$scratch/bin/nix"
+export PATH="$scratch/bin:$PATH"
+project="$scratch/project"
+errors=0
+out='' err='' rc=0
+fail() { printf 'FAIL: %s\n' "$1"; errors=$((errors+1)); }
+host=$(luajit -e 'package.path="scripts/?.lua;"..package.path; local c=require("build-core"); local function r(s) local f=assert(io.popen(s)); local v=f:read("*l"); f:close(); return v end; print(assert(c.platform(r("uname -s"),r("uname -m"))))')
+export BUILD_PRODUCT=$(jq -r --arg pf "$host" '.[$pf]' "$manifest")
+capture bash -c 'cd "$1" && bash build' child "$project"
+[[ $rc == 0 ]] || fail "host product: $err"
+host_before=$(readlink "$project/bin/$host/rarz")
+while IFS=$'\t' read -r pf product; do
+	export BUILD_PRODUCT="$product"
+	capture bash -c 'cd "$1" && bash build --platform "$2"' child "$project" "$pf"
+	[[ $rc == 0 ]] || { fail "$pf: $err"; continue; }
+	[[ $(readlink "$project/bin/$host/rarz") == "$host_before" ]] || fail "$pf retargeted host"
+	if [[ $pf == mswin-* ]]; then
+		entry="$project/bin/$pf/rarz.exe"
+		[[ -f $entry && ! -L $entry ]] || fail "$pf requires symlink privileges"
+		cmp "$entry" "$product/bin/rarz.exe" || fail "$pf copy differs"
+		before=$(readlink "$project/zig-out/$pf/ReleaseFast")
+		inode=$(stat -c %i "$entry")
+		capture bash -c 'cd "$1" && bash build --platform "$2"' child "$project" "$pf"
+		[[ $rc == 0 && $(readlink "$project/zig-out/$pf/ReleaseFast") == "$before" && $(stat -c %i "$entry") == "$inode" ]] || fail "$pf identical retry was not a no-op"
+		printf 'user modification' >> "$entry"
+		capture bash -c 'cd "$1" && bash build --platform "$2"' child "$project" "$pf"
+		[[ $rc != 0 ]] || fail "$pf overwrote a modified executable"
+	fi
+done < <(jq -r 'to_entries[] | [.key,.value] | @tsv' "$manifest")
+if [[ $# == 3 ]]; then
+	for mode in test debug; do
+		if [[ $mode == test ]]; then export BUILD_PRODUCT=$2; profile=ReleaseSafe; else export BUILD_PRODUCT=$3; profile=Debug; fi
+		capture bash -c 'cd "$1" && bash build "$2"' child "$project" "$mode"
+		[[ $rc == 0 ]] || fail "$profile publication: $err"
+		capture env RARZ="$BUILD_PRODUCT/bin/rarz" bash tests/cli/test_build_banner.sh
+		[[ $rc == 0 ]] || fail "$profile identity/banner: $out $err"
+		variant=''; [[ $host == linux-* ]] && variant=musl/
+		[[ -d $project/zig-out/$host/${variant}ReleaseFast && -d $project/zig-out/$host/$variant$profile ]] || fail 'profiles do not coexist'
+	done
+fi
+[[ $errors == 0 ]] || exit 1
+echo 'PASS: five real target products, host preservation, Windows copies and retries'

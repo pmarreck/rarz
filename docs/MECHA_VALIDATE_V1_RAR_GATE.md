@@ -16,7 +16,7 @@ A differential sweep on 2026-08-05 over content the corpus never contained
 (executables, files past the RAR4 dictionary, RAR4 volume sets, encrypted RAR4
 entries) found FOUR classes where rarz claimed damage on archives UnRAR tests
 clean — the worst error an integrity tool can make. All are fixed;
-see PLAN.md for the isolation evidence. Post-fix measurements over a
+see [historical development context](plan_context/development-history.md) for the isolation evidence. Post-fix measurements over a
 6-content-type x method x solid x recovery x quick-open x volume matrix in both
 families:
 
@@ -130,7 +130,7 @@ survivors without classifying them and is not release evidence by itself.
 - Add independent producer fixtures for RAR3 E8E9, RGB, and Itanium filters, or
   leave those variants incomplete in launch claims.
 - Header encryption (`-hp`) remains out of scope; it is blocked on the password
-  API whose contract is settled in PLAN.md. RAR4 split volumes are now IN and
+  API whose contract is preserved in [historical development context](plan_context/development-history.md). RAR4 split volumes are now IN and
   gated.
 - Hash or explicitly exclude RAR5 service payload areas before claiming every
   archive byte was checked.

@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Build the current host product, then execute that exact result.
+set -u
+project=$(cd "$(dirname "$0")" && pwd) || exit 1
+product=$("$project/build") || exit $?
+[[ -n $product && $product != *$'\n'* ]] || { echo 'build did not return one product' >&2; exit 1; }
+exec "$product/bin/rarz" "$@"

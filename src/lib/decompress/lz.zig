@@ -12,8 +12,12 @@ pub const Window = struct {
     pub fn init(allocator: std.mem.Allocator, dict_size: usize) !Window {
         // Ensure power of 2
         std.debug.assert(dict_size > 0 and (dict_size & (dict_size - 1)) == 0);
-        const buffer = try allocator.alloc(u8, dict_size);
-        @memset(buffer, 0);
+		// Reserve the dictionary without touching unused pages. alloc/free also
+		// poison the entire region in safety builds, so pair rawAlloc/rawFree.
+		// Every read is bounded by initialized history; literals and matches
+		// initialize bytes before advancing total_written.
+		const ptr = allocator.rawAlloc(dict_size, .of(u8), @returnAddress()) orelse return error.OutOfMemory;
+		const buffer = ptr[0..dict_size];
         return .{
             .buffer = buffer,
             .mask = dict_size - 1,
@@ -42,7 +46,7 @@ pub const Window = struct {
     }
 
     pub fn deinit(self: *Window, allocator: std.mem.Allocator) void {
-        allocator.free(self.buffer);
+		if (self.buffer.len != 0) allocator.rawFree(self.buffer, .of(u8), @returnAddress());
         self.buffer = &.{};
     }
 
@@ -191,7 +195,7 @@ pub const Window = struct {
     /// rather than a refusal. `copyToOutput` predates this check and masks the
     /// index instead, which is why new callers should prefer this.
     pub fn emitTo(self: *const Window, out: Sink, start_offset: usize, count: usize) bool {
-        if (start_offset > self.buffer.len) return false;
+        if (start_offset > self.buffer.len or start_offset > self.total_written) return false;
         if (count > start_offset) return false;
         if (count == 0) return true;
 
@@ -209,6 +213,7 @@ pub const Window = struct {
     /// Returns the number of bytes actually copied.
     pub fn copyToOutput(self: *const Window, output: []u8, start_offset: usize, count: usize) usize {
         const actual_count = @min(count, output.len);
+		if (start_offset > self.total_written or actual_count > start_offset) return 0;
         var src = self.write_pos -% start_offset;
         for (0..actual_count) |i| {
             output[i] = self.buffer[src & self.mask];
@@ -223,6 +228,48 @@ pub const Window = struct {
 // ============================================================================
 
 const testing = std.testing;
+
+test "window lifecycle leaves unused backing bytes untouched" {
+	var backing = [_]u8{0xa5} ** 64;
+	var arena = std.heap.FixedBufferAllocator.init(&backing);
+	var win = try Window.init(arena.allocator(), backing.len);
+	try testing.expectEqualSlices(u8, &([_]u8{0xa5} ** 64), &backing);
+	win.putByte('X');
+	win.deinit(arena.allocator());
+	try testing.expectEqual(@as(u8, 'X'), backing[0]);
+	try testing.expectEqualSlices(u8, &([_]u8{0xa5} ** 63), backing[1..]);
+	try testing.expectEqual(@as(usize, 0), arena.end_index);
+}
+
+test "window output refuses history that was never written" {
+	var win = try Window.init(testing.allocator, 16);
+	defer win.deinit(testing.allocator);
+	for (0..2) |_| {
+		win.reset();
+		win.putByte('A');
+		for (2..17) |offset| {
+			var output = [_]u8{0xcc} ** 16;
+			var sink = BufferSink.init(&output);
+			try testing.expect(!win.emitTo(sink.sink(), offset, 1));
+			try testing.expectEqual(@as(usize, 0), sink.len);
+			try testing.expectEqual(@as(usize, 0), win.copyToOutput(&output, offset, 1));
+			try testing.expectEqual(@as(u8, 0xcc), output[0]);
+		}
+	}
+}
+
+test "legacy output copy preserves circular indexing for written history" {
+	var win = try Window.init(testing.allocator, 4);
+	defer win.deinit(testing.allocator);
+	for ("ABCDEFGH") |byte| win.putByte(byte);
+	var output: [8]u8 = undefined;
+	try testing.expectEqual(@as(usize, 8), win.copyToOutput(&output, 8, 8));
+	try testing.expectEqualStrings("EFGHEFGH", &output);
+	// The newer streaming interface deliberately refuses overwritten history.
+	var sink = BufferSink.init(&output);
+	try testing.expect(!win.emitTo(sink.sink(), 8, 8));
+	try testing.expectEqual(@as(usize, 0), sink.len);
+}
 
 test "putByte writes and advances" {
     var win = try Window.init(testing.allocator, 16); // 16-byte window

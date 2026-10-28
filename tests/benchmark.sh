@@ -13,14 +13,15 @@ set -euo pipefail
 # =============================================================================
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-RARZ="$PROJECT_ROOT/zig-out/bin/rarz"
+product=$("$PROJECT_ROOT/build") || exit 1
+RARZ="$product/bin/rarz"
 WARMUP=${BENCHMARK_WARMUP:-1}
 RUNS=${BENCHMARK_RUNS:-5}
 
 # Ensure tools exist
 if [ ! -x "$RARZ" ]; then
 	echo "ERROR: rarz binary not found at $RARZ"
-	echo "Run: nix develop -c zig build -Doptimize=ReleaseFast"
+	echo "Run: ./build"
 	exit 1
 fi
 

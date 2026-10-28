@@ -1,61 +1,30 @@
 #!/usr/bin/env bash
-# Master test runner. Runs the ENTIRE suite (zig unit tests + CLI tests) and
-# accumulates a nonzero exit code from any failing sub-suite.
-#
-# NOTE: CLI suites are run *inside the nix devshell* (`nix develop -c`) because
-# interop tests invoke `unrar`/`rar`, which exist only in the devshell. Running
-# them bare silently fails every interop assertion on a clean machine.
-#
-# Per Peter's test rules: `set -u` only — NEVER `set -e`/pipefail. errexit
-# aborts on the first error-path command, defeating error-path testing, and
-# masks accumulated failures. The pass/fail accounting below is explicit.
+# Prepare exact safety-checked products with Nix, then run the complete suite.
 set -u
-
-# FLEET FLOOR — unit and CLI suites use ReleaseSafe (fleet finding
-# 2026-07-01), matching flake.nix/CI. ReleaseFast compiles OUT the runtime
-# safety checks, so a green ReleaseFast suite cannot observe UB; it passes
-# *because* the check that would have failed it is gone.
-#
-# This applies to the CLI binary too, not just the Zig unit tests. The
-# C-hosted binary is where the FFI boundary actually runs, and it is exactly
-# where UB hid: a `std.Thread.spawn` failure left compression results null,
-# which ReleaseFast turned into a silent null-unwrap emitting corrupt archives
-# (packed_size == 0), while ReleaseSafe panics loudly at the real fault.
-# The separate installed-package smoke executes the shipped ReleaseFast
-# artifact too; it catches loader and linkage failures in the actual product.
-OPT="-Doptimize=ReleaseSafe"
-
-errors=0
-
-echo "=== Installed ReleaseFast package smoke ==="
-if ! nix build --no-link .#checks."$(nix eval --impure --raw --expr builtins.currentSystem)".package-smoke; then
-    errors=$((errors + 1))
+project=$(cd "$(dirname "$0")" && pwd -P) || exit 1
+cd "$project" || exit 1
+command -v nix >/dev/null || { echo 'Nix is required to prepare tests' >&2; exit 69; }
+scratch=$(mktemp -d "${RARZ_TEST_TMPDIR:-/var/tmp}/rarz-tests.XXXXXXXX") || exit 1
+status=1
+finish() {
+	if [[ -f $scratch/memory-peak.bytes ]]; then printf 'Runtime cgroup peak bytes: %s\n' "$(cat "$scratch/memory-peak.bytes")"; fi
+	printf 'Test evidence retained at %s\n' "$scratch" >&2
+}
+trap finish EXIT
+printf 'Preparing ReleaseSafe test products through Nix\n'
+nix build .#test-artifacts --out-link "$scratch/product" || exit 1
+product=$(readlink -f "$scratch/product") || exit 1
+system=$(nix eval --impure --raw --expr builtins.currentSystem) || exit 1
+smoke_failed=0
+nix build --no-link ".#checks.$system.package-smoke" || smoke_failed=1
+nix build --no-link ".#checks.$system.build-publication" || smoke_failed=1
+runtime=(nix develop -c bash tests/support/run-suite "$product" "$project" "$scratch")
+if command -v build-budget >/dev/null && ! [[ $(cat /proc/self/cgroup 2>/dev/null) == *agentbuilds.slice* ]]; then
+	build-budget --project rarz -- "${runtime[@]}"
+	status=$?
+else
+	"${runtime[@]}"
+	status=$?
 fi
-
-echo "=== Zig unit tests (ReleaseSafe) ==="
-if ! nix develop -c zig build test "$OPT"; then
-    errors=$((errors + 1))
-fi
-
-if [ -d tests/cli ]; then
-    echo "=== Build CLI for CLI tests (ReleaseSafe) ==="
-    if ! nix develop -c zig build "$OPT"; then
-        errors=$((errors + 1))
-    fi
-
-    echo "=== CLI tests (in nix devshell — provides unrar/rar) ==="
-    for t in tests/cli/test_*.sh; do
-        [ -f "$t" ] || continue
-        echo "  running $t"
-        if ! nix develop -c bash "$t"; then
-            errors=$((errors + 1))
-        fi
-    done
-fi
-
-if [ "$errors" -gt 0 ]; then
-    echo "FAILED: $errors test suite(s)"
-    exit "$errors"
-fi
-
-echo "ALL TESTS PASSED"
+if [[ $status == 0 && $smoke_failed == 1 ]]; then status=1; fi
+exit "$status"

@@ -74,12 +74,12 @@ pub const CompressionInfo = struct {
 pub const FileBlock = struct {
 	header: BlockHeader,
 	is_directory: bool,
-	has_mtime: bool,
+	has_mtime: bool, // resolved base-header or extra-record time
 	has_crc32: bool,
 	unpacked_unknown: bool,
 	unpacked_size: u64,
 	attributes: u64,
-	mtime: ?u32,
+	mtime: ?u32, // whole Unix seconds representable by the current metadata API
 	data_crc32: ?u32,
 	compression: CompressionInfo,
 	host_os: u64,
@@ -266,10 +266,12 @@ pub fn parse_file_block(r: *reader_mod.Reader, header: BlockHeader) ParseError!F
 		}
 	}
 
+	mtime = extra_modification_time(extra_data) orelse mtime;
+
 	return .{
 		.header = header,
 		.is_directory = is_directory,
-		.has_mtime = has_mtime,
+		.has_mtime = mtime != null,
 		.has_crc32 = has_crc32,
 		.unpacked_unknown = unpacked_unknown,
 		.unpacked_size = unpacked_size,
@@ -281,6 +283,33 @@ pub fn parse_file_block(r: *reader_mod.Reader, header: BlockHeader) ParseError!F
 		.name = name,
 		.extra_data = extra_data,
 	};
+}
+
+// Read only within each declared record. Unavailable or unrepresentable extra
+// metadata leaves the base-header value intact; integrity policy is unchanged.
+fn extra_modification_time(extra_data: ?[]const u8) ?u32 {
+	var records = reader_mod.Reader.init(extra_data orelse return null);
+	while (records.remaining() > 0) {
+		const size = records.read_vint() catch return null;
+		if (size == 0 or size > records.remaining()) return null;
+		const bytes = records.read_bytes(@intCast(size)) catch return null;
+		var record = reader_mod.Reader.init(bytes);
+		const kind = record.read_vint() catch return null;
+		if (kind != 3) continue;
+		const flags = record.read_vint() catch return null;
+		if (flags & 2 == 0) continue;
+		if (flags & 1 != 0) return record.read_u32_le() catch null;
+
+		const windows_bytes = record.read_bytes(8) catch return null;
+		const windows_ticks = std.mem.readInt(u64, windows_bytes[0..8], .little);
+		const unix_epoch_ticks = 116444736000000000;
+		const ticks_per_second = 10000000;
+		if (windows_ticks < unix_epoch_ticks) return null;
+		const seconds = (windows_ticks - unix_epoch_ticks) / ticks_per_second;
+		if (seconds > std.math.maxInt(u32)) return null;
+		return @intCast(seconds);
+	}
+	return null;
 }
 
 /// Parse the body of an END_ARCHIVE block.
@@ -697,6 +726,45 @@ test "parse_file_block reads all fields" {
 	try testing.expectEqualSlices(u8, "test.txt", fb.name);
 	try testing.expectEqual(@as(?u32, null), fb.mtime);
 	try testing.expectEqual(@as(?u32, null), fb.data_crc32);
+}
+
+test "parse_file_block reads modification time from bounded extra records" {
+	const Case = struct { extra: []const u8, expected: ?u32 };
+	// FILETIME is 100-nanosecond ticks since 1601; these are fixed format vectors.
+	var windows_second: [11]u8 = .{ 10, 3, 2 } ++ .{0} ** 8;
+	std.mem.writeInt(u64, windows_second[3..11], 116444736010000000, .little);
+	var windows_before_epoch = windows_second;
+	std.mem.writeInt(u64, windows_before_epoch[3..11], 116444735990000000, .little);
+	var windows_overflow = windows_second;
+	std.mem.writeInt(u64, windows_overflow[3..11], 159394408960000000, .little);
+	const cases = [_]Case{
+		.{ .extra = &.{ 6, 3, 3, 0x78, 0x56, 0x34, 0x12 }, .expected = 0x12345678 },
+		.{ .extra = &.{ 6, 3, 3, 0, 0, 0, 0 }, .expected = 0 },
+		.{ .extra = &.{ 10, 3, 0x13, 0x78, 0x56, 0x34, 0x12, 1, 0, 0, 0 }, .expected = 0x12345678 },
+		// A preceding unknown record does not hide the following time record.
+		.{ .extra = &.{ 2, 99, 0, 6, 3, 3, 0x78, 0x56, 0x34, 0x12 }, .expected = 0x12345678 },
+		// Creation time alone is not a modification time.
+		.{ .extra = &.{ 6, 3, 5, 0x78, 0x56, 0x34, 0x12 }, .expected = null },
+		// Never borrow the next record's bytes to complete a short timestamp.
+		.{ .extra = &.{ 3, 3, 3, 0x78, 4, 99, 0, 0, 0 }, .expected = null },
+		.{ .extra = &.{ 6, 3, 3, 0x78 }, .expected = null },
+		.{ .extra = &windows_second, .expected = 1 },
+		.{ .extra = &windows_before_epoch, .expected = null },
+		.{ .extra = &windows_overflow, .expected = null },
+	};
+	for (cases) |case| {
+		var buf: [128]u8 = undefined;
+		var body: [64]u8 = undefined;
+		const prefix = [_]u8{ 0, 0, 0x20, 0, 1, 1, 'a' };
+		@memcpy(body[0..prefix.len], &prefix);
+		@memcpy(body[prefix.len..][0..case.extra.len], case.extra);
+		const len = build_test_header(&buf, 2, 1, case.extra.len, null, body[0 .. prefix.len + case.extra.len]);
+		var r = reader_mod.Reader.init(buf[0..len]);
+		const hdr = try parse_block_header(&r);
+		const fb = try parse_file_block(&r, hdr);
+		try testing.expectEqual(case.expected, fb.mtime);
+		try testing.expectEqual(case.expected != null, fb.has_mtime);
+	}
 }
 
 test "parse_file_block with mtime and CRC32" {

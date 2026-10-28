@@ -13,6 +13,13 @@ zig-cache/
 .zig-cache/
 zig-pkg/
 result
+/.nix-out/
+/.build-work/
+/bin/linux-amd64/
+/bin/linux-arm64/
+/bin/macos-arm64/
+/bin/mswin-amd64/
+/bin/mswin-arm64/
 .DS_Store
 inbox/
 .direnv/

@@ -81,6 +81,23 @@ pub fn build(b: *std.Build) void {
 	}));
 	exe.root_module.addCMacro("RARZ_OPTIMIZE", b.fmt("\"{s}\"", .{@tagName(optimize)}));
 	exe.root_module.addCMacro("RARZ_DEBUG_BUILD", if (optimize == .Debug) "1" else "0");
+	const pf_os = switch (target.result.os.tag) {
+		.linux => "linux",
+		.macos => "macos",
+		.windows => "mswin",
+		else => @panic("unsupported operating system"),
+	};
+	const pf_arch = switch (target.result.cpu.arch) {
+		.x86_64 => "amd64",
+		.aarch64 => "arm64",
+		else => @panic("unsupported architecture"),
+	};
+	exe.root_module.addCMacro("RARZ_PF", b.fmt("\"{s}-{s}\"", .{ pf_os, pf_arch }));
+	exe.root_module.addCMacro("RARZ_VARIANT", b.fmt("\"{s}\"", .{
+		if (target.result.os.tag == .linux)
+			(if (target.result.abi.isMusl()) " VARIANT=musl" else " VARIANT=gnu")
+		else "",
+	}));
 
 	// Link progrez library for progress indication
 	const progrez_dep = b.dependency("progrez", .{
@@ -183,6 +200,9 @@ pub fn build(b: *std.Build) void {
 	const run_unit_tests = b.addRunArtifact(unit_tests);
 	const test_step = b.step("test", "Run unit tests");
 	test_step.dependOn(&run_unit_tests.step);
+	const test_artifacts = b.step("test-artifacts", "Install the safety-checked test runner and CLI");
+	test_artifacts.dependOn(&b.addInstallArtifact(unit_tests, .{ .dest_sub_path = "rarz-tests" }).step);
+	test_artifacts.dependOn(&b.addInstallArtifact(exe, .{}).step);
 
 	// Microbenchmark executable
 	const microbench = b.addExecutable(.{
@@ -223,4 +243,5 @@ pub fn build(b: *std.Build) void {
 	// Compile (not install) the diagnostic as part of `zig build test` so CI
 	// enforces its Zig 0.16 compatibility and it can't silently rot again.
 	test_step.dependOn(&diag.step);
+	test_artifacts.dependOn(&diag.step);
 }

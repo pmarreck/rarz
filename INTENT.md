@@ -48,6 +48,7 @@ evidence and limitations, not a substitute for these desired outcomes.
 ## Sources
 
 Recovered from `PROJECT_OVERVIEW.md` at commit `80ec687`, the coverage report, and
-the accepted July/August 2026 validation decisions recorded in `PLAN.md`.
+the accepted July/August 2026 validation decisions archived in
+[development context](docs/plan_context/development-history.md).
 The overview's glossary and format-family definitions are preserved in
 [TERMINOLOGY.md](TERMINOLOGY.md).

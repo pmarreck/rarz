@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Runs prepared products in a private project with a read-only host view.
+set -u
+# Exported interactive helpers can hide pinned tools or depend on the old HOME.
+# Drop them before any adapter command or child shell runs.
+while read -r declaration flags function_name; do
+	export -n -f "$function_name"
+	unset -f "$function_name"
+done < <(declare -F)
+product=$1
+project=$2
+scratch=$3
+[[ $(uname -s) == Linux ]] || { echo 'INCOMPLETE: test isolation requires a qualified native runner on this OS' >&2; exit 69; }
+command -v bwrap >/dev/null || { echo 'INCOMPLETE: bubblewrap is required' >&2; exit 69; }
+mkdir -p "$scratch/project/tests" "$scratch/project/zig-out/bin" "$scratch/tmp" "$scratch/home" "$scratch/config" "$scratch/cache" "$scratch/data" "$scratch/state" "$scratch/runtime" || exit 1
+chmod 700 "$scratch/runtime" || exit 1
+for directory in cli support unit fixtures; do
+	cp -R "$project/tests/$directory" "$scratch/project/tests/" || exit 1
+done
+cp "$project/assess-coverage" "$scratch/project/" || exit 1
+cp "$project/test" "$scratch/project/" || exit 1
+for entry in build run scripts; do
+	if [[ -e $project/$entry ]]; then cp -R "$project/$entry" "$scratch/project/" || exit 1; fi
+done
+ln -s "$product/bin/rarz" "$scratch/project/zig-out/bin/rarz" || exit 1
+ln -s "$project/tests/fixtures_large" "$scratch/project/tests/fixtures_large" || exit 1
+IFS=: read -r cgroup_id cgroup_controllers cgroup_path < /proc/self/cgroup
+memory_counter="/sys/fs/cgroup$cgroup_path/memory.peak"
+exec bwrap --ro-bind / / --unshare-all --cap-drop ALL --die-with-parent --new-session \
+	--proc /proc --dev /dev --tmpfs /tmp --tmpfs /run --ro-bind-try /run/current-system /run/current-system \
+	--bind "$scratch" "$scratch" --chdir "$scratch/project" \
+	--unsetenv BASH_ENV --unsetenv ENV \
+	--setenv HOME "$scratch/home" --setenv TMPDIR "$scratch/tmp" \
+	--setenv XDG_CONFIG_HOME "$scratch/config" --setenv XDG_CACHE_HOME "$scratch/cache" \
+	--setenv XDG_DATA_HOME "$scratch/data" --setenv XDG_STATE_HOME "$scratch/state" \
+	--setenv XDG_RUNTIME_DIR "$scratch/runtime" --setenv RARZ "$product/bin/rarz" \
+	--setenv RARZ_CORPUS_TMPDIR "$scratch/tmp" \
+	-- bash -c '
+		trap '\''if [[ -r $3 ]]; then cat "$3" > "$2/memory-peak.bytes"; fi'\'' EXIT
+		errors=0
+		if ! "$1/bin/rarz-tests" > "$2/unit.log" 2>&1; then cat "$2/unit.log"; errors=$((errors+1)); fi
+		for suite in tests/cli/test_*.sh; do
+			printf "Running %s\n" "$suite"
+			if ! bash "$suite" > "$2/$(basename "$suite").log" 2>&1; then
+				cat "$2/$(basename "$suite").log"
+				errors=$((errors+1))
+			fi
+		done
+		[[ $errors == 0 ]] || { printf "FAILED: %s suites\n" "$errors"; exit 1; }
+		printf "ALL TESTS PASSED\n"
+	' suite "$product" "$scratch" "$memory_counter"

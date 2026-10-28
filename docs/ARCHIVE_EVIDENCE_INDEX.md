@@ -5,6 +5,11 @@ release milestone. It does not claim a new standalone `corruption-probe`
 campaign or complete coverage of every RAR variant. The decoder baseline is
 `80ec687`; the dependency refresh changes progrez, not decoder behavior.
 
+The later [October 15 corruption-reader assessment](COVERAGE_20261015.md)
+provides a separate 18-pair statistical campaign, exact candidate identities,
+and replayable findings. It does not replace the historical acceptance
+evidence below.
+
 ## Replay
 
 Run `./test` for the complete local entry point. On a shared Linux build host:

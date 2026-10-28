@@ -29,7 +29,7 @@ fi
 # Ensure rarz binary exists
 if [ ! -x "$RARZ" ]; then
 	echo "ERROR: rarz binary not found at $RARZ"
-	echo "Run: nix develop -c zig build"
+	echo "Run the complete suite with ./test to prepare its exact binary"
 	exit 1
 fi
 

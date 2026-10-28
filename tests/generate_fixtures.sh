@@ -67,9 +67,9 @@ rar a -v500k -m0 "$project_root/$FIXTURES/rar5_vol_large.rar" "$tmpdir/tree/larg
 
 # Archive created by rarz itself (for round-trip testing)
 cd "$project_root"
-nix develop -c zig build >/dev/null 2>&1
+product=$(./build) || exit 1
 echo "rarz created this" > "$tmpdir/rarz_file.txt"
-zig-out/bin/rarz a "$FIXTURES/rarz_created.rar" "$tmpdir/rarz_file.txt"
+"$product/bin/rarz" a "$FIXTURES/rarz_created.rar" "$tmpdir/rarz_file.txt"
 
 echo "Generated $(ls "$FIXTURES"/*.rar | wc -l | tr -d ' ') fixture archives in $FIXTURES/"
 ls -la "$FIXTURES"/*.rar

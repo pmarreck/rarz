@@ -29,27 +29,46 @@ Any CLI / consumer ──> C FFI boundary ──> Zig core (pure logic, no I/O)
 
 ## Building
 
-### With Zig (0.15+)
+Nix is required for development builds; `flake.lock` pins the compiler and
+dependencies. Language compilation runs inside Nix derivations.
 
 ```sh
-zig build              # build library + CLI
-zig build test         # run unit tests
-zig build run -- help  # run CLI
+./build                         # current platform, ReleaseFast
+./build test                    # ReleaseSafe
+./build debug                   # Debug
+./build --all-platforms         # all five targets
+./build --platform mswin-arm64  # one cross target
+./run help                      # build current source, execute that exact product
+./test                          # complete required acceptance suite
 ```
 
-### With Nix
+The single Zig/C implementation supports `linux-amd64`, `linux-arm64`,
+`macos-arm64`, `mswin-amd64`, and `mswin-arm64`. `--all-impls` selects that
+implementation; combining it with `--all-plats` is equivalent to `--all`.
+Linux uses static musl, including pthread support for C-hosted Zig threads.
+Windows uses the GNU compiler ABI and system DLLs; macOS links system libraries.
+Nix builders run on Linux or macOS. Windows products can be built from WSL or
+a cross builder; end users do not need Nix to execute the distributed CLI.
 
-```sh
-nix develop            # enter dev shell with zig + reference RAR tools
-zig build
-```
+Complete products appear under `zig-out/PF/[musl/]PROFILE/`, backed by retained
+Nix output roots. `bin/PF/rarz` directly selects a verified executable; Windows
+gets a real `rarz.exe` copy. Only the current platform's directory belongs on
+PATH. Publication preserves other platforms, unknown files, and the previous
+selection on build or verification failure. Existing flat `zig-out` products
+are preserved. See [build qualification](docs/plan_context/build-layout.md)
+for checks, rollback, and native runtime limits.
 
-`./build` installs the optimized Nix package into `zig-out/bin`. Linux packages
-use static musl linkage, including libc/pthread support for C-hosted Zig threads.
-macOS keeps its native linkage. `./test` runs the ReleaseSafe suites and a
-separate smoke check of the installed ReleaseFast package: executable startup,
-help, pristine and damaged payloads, and a threaded compression round trip.
-Mechatron Prime CI runs the same package smoke through `checks.package-smoke`.
+`./test` prepares ReleaseSafe products through Nix, checks the installed
+ReleaseFast package and all five target publications, then runs every unit and
+CLI suite in a disposable Linux filesystem boundary. The large-corpus gate
+requires the separately provisioned fixtures and disk-backed scratch; missing
+fixtures or an unavailable isolation boundary fail explicitly. macOS and
+Windows runtime acceptance still require qualified native test runners.
+
+`./assess-coverage [RAR ...]` measures corrupt-input detection using replayable
+mutations and independent UNRAR checks, with 95% confidence intervals and a
+default precision of ±5 percentage points per archive/profile pair. See
+[the assessment guide](docs/ASSESS_COVERAGE.md) for inputs, replay, and limits.
 
 ## Usage
 

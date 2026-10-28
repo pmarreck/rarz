@@ -73,8 +73,8 @@ fi
 # Architecture and OS. Compare against the host, since the suite runs natively.
 host_arch=$(uname -m)
 case "$host_arch" in
-	arm64) host_arch="aarch64" ;;
-	amd64) host_arch="x86_64" ;;
+	arm64|aarch64) host_arch="arm64" ;;
+	amd64|x86_64|AMD64) host_arch="amd64" ;;
 esac
 if printf '%s' "$about_out" | grep -qi "$host_arch"; then
 	ok "--about reports the architecture ($host_arch)"
@@ -85,12 +85,28 @@ fi
 host_os=$(uname -s | tr '[:upper:]' '[:lower:]')
 case "$host_os" in
 	darwin) host_os="macos" ;;
+	mingw*|msys*|cygwin*) host_os="mswin" ;;
 esac
 if printf '%s' "$about_out" | grep -qi "$host_os"; then
 	ok "--about reports the OS ($host_os)"
 else
 	fail "--about missing OS '$host_os': '$about_out'"
 fi
+
+case " $about_out " in
+	*" PF=$host_os-$host_arch "*) ok "--about reports canonical PF" ;;
+	*) fail "--about missing canonical PF=$host_os-$host_arch" ;;
+esac
+case "$host_os" in
+	linux)
+		case " $about_out " in
+			*' VARIANT=musl '*|*' VARIANT=gnu '*) ok "Linux ABI is explicit" ;;
+			*) fail "Linux --about must report VARIANT=musl or VARIANT=gnu" ;;
+		esac ;;
+	*) [[ $about_out != *VARIANT=* ]] || fail "non-Linux target must omit VARIANT" ;;
+esac
+conflicting=$(PF=mswin-arm64 OS=wrong ARCH=wrong PLATFORM=wrong VARIANT=wrong "$RARZ" --about 2>/dev/null)
+[[ $conflicting == "$about_out" ]] || fail "runtime environment changed the compiled target identity"
 
 echo ""
 echo "=== DEBUG BUILD banner is gated on the ACTUAL optimize mode ==="

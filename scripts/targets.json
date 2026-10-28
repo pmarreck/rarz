@@ -1,0 +1,7 @@
+[
+	{"pf":"linux-amd64","triple":"x86_64-linux-musl","variant":"musl"},
+	{"pf":"linux-arm64","triple":"aarch64-linux-musl","variant":"musl"},
+	{"pf":"macos-arm64","triple":"aarch64-macos"},
+	{"pf":"mswin-amd64","triple":"x86_64-windows-gnu"},
+	{"pf":"mswin-arm64","triple":"aarch64-windows-gnu"}
+]

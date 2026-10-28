@@ -160,6 +160,7 @@ pub fn build(b: *std.Build) void {
 	// files larger than the 4 MB dictionary. unrar tests all four clean.
 	unit_tests.root_module.addAnonymousImport("rar5_x86_filter", .{ .root_source_file = b.path("tests/fixtures/rar5_x86_filter.rar") });
 	unit_tests.root_module.addAnonymousImport("rar4_x86_filter", .{ .root_source_file = b.path("tests/fixtures/rar4_x86_filter.rar") });
+	unit_tests.root_module.addAnonymousImport("rar4_extended_times", .{ .root_source_file = b.path("tests/fixtures/rar4_extended_times.rar") });
 	unit_tests.root_module.addAnonymousImport("rar4_large_window", .{ .root_source_file = b.path("tests/fixtures/rar4_large_window.rar") });
 	unit_tests.root_module.addAnonymousImport("rar5_large_window", .{ .root_source_file = b.path("tests/fixtures/rar5_large_window.rar") });
 	// RAR 2.90-produced entries LARGER than the sliding window. v20 windows are

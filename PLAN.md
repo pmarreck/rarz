@@ -8,14 +8,15 @@ Completed records: [docs/PLAN_LOG.md](docs/PLAN_LOG.md). Historical decisions an
 
 ## Correctness queue
 
-- [x] Recognize recovery volumes without integrity claims and normalize directory names; complete 475-unit/CLI/v70 and native macOS acceptance passed, followed by exact CI in 71 seconds (done 2026-10-28 03:06 EDT; commit c6a8b25; #36; context: docs/plan_context/recovery-volumes.md).
 - [x] Verify exact-commit CI for packed-part CRC validation and writer correction; complete 477-unit/CLI/v70 and native macOS acceptance passed, followed by exact CI in 76 seconds (done 2026-10-28 03:20 EDT; commit e4904a7; #26; context: docs/plan_context/packed-crc.md).
 - [x] Match producer integer volume units and reject overflow; complete 479-unit/CLI/v70, native macOS checks, and optimized build passed, then exact CI passed in 57 seconds (done 2026-10-28 03:46 EDT; commit 0945c7a; #33; context: docs/plan_context/volume-size-units.md).
 - [x] Validate RAR5 UTF-8 names independently of decoder support; complete 479-unit/CLI/v70, native macOS checks, and optimized build passed, then exact CI passed in 57 seconds (done 2026-10-28 03:46 EDT; commit 0945c7a; #30; context: docs/plan_context/utf8-names.md).
 - [x] Bound RAR5 headers and extra-record traversal; complete 486-unit/CLI/v70, native macOS checks, and optimized build passed, then exact CI passed in 51 seconds (done 2026-10-28 04:00 EDT; commit d20bcd4; #4; context: docs/plan_context/extra-record-bounds.md).
 - [x] Preserve RAR5 version records, distinct historical names, and extraction collision checks; complete 489-unit/CLI/v70, native macOS checks, optimized build, and exact CI passed in 85 seconds (done 2026-10-28 04:23 EDT; commit bd04561; #32; context: docs/plan_context/file-versions.md).
-- [ ] Verify exact-commit CI for extraction metadata and the additive timestamp API; complete 492-unit/CLI/v70 suite, native macOS checks, Windows emulation gate, and optimized build passed (#35, #31; context: docs/plan_context/extraction-metadata.md).
-- [ ] Account for encrypted RAR4 service/comment blocks and parse SALT/EXT_TIME fields (#11, #5).
+- [x] Verify exact-commit CI for extraction metadata and the additive timestamp API; complete 492-unit/CLI/v70 suite, native macOS checks, Windows emulation gate, and optimized build passed, followed by exact CI in 101 seconds (done 2026-10-28 04:45 EDT; commit 7cbf9c6; #35, #31; context: docs/plan_context/extraction-metadata.md).
+- [ ] Verify exact-commit CI for bounded RAR4 records and SALT/EXT_TIME parsing; complete 501-unit/CLI/v70 suite, native macOS checks, and optimized build passed (#11, #5; context: docs/plan_context/rar4-optional-fields.md).
+- [ ] Account for encrypted RAR4 service/comment blocks without overstating file-only verification (#11).
+- [ ] Complete integrated acceptance for the reproduced RAR5 multi-volume encryption shortcut; focused tests now reject damaged plaintext in either volume order while preserving encrypted-entry accounting.
 
 ## Evidence and resource follow-ups
 

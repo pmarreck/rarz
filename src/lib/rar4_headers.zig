@@ -70,6 +70,15 @@ pub const FileHeader = struct {
 	method: u8,
 	attributes: u32,
 	file_name: []const u8,
+	salt: ?[8]u8 = null,
+	/// Modification, creation, access, and archival times, in that order.
+	extended_times: [4]?ExtendedTime = .{null} ** 4,
+};
+
+pub const ExtendedTime = struct {
+	dos_time: u32,
+	add_second: bool,
+	fraction_100ns: u32,
 };
 
 pub const ArchiveBlock = union(enum) {
@@ -219,6 +228,24 @@ pub fn parse_file_header(r: *Reader, block: BlockHeader) ParseError!FileHeader {
 	}
 
 	const file_name = r.read_bytes(name_size) catch return error.EndOfData;
+	const salt: ?[8]u8 = if (block.flags & 0x0400 != 0)
+		(r.read_bytes(8) catch return error.EndOfData)[0..8].*
+	else null;
+	var extended_times: [4]?ExtendedTime = .{null} ** 4;
+	if (block.flags & 0x1000 != 0) {
+		const time_flags = r.read_u16_le() catch return error.EndOfData;
+		for (&extended_times, 0..) |*time, i| {
+			const mode: u4 = @truncate(time_flags >> @as(u4, @intCast(12 - 4 * i)));
+			if (mode & 8 == 0) continue;
+			const dos_time = if (i == 0) mtime else r.read_u32_le() catch return error.EndOfData;
+			const count: usize = mode & 3;
+			const fraction_bytes = r.read_bytes(count) catch return error.EndOfData;
+			var fraction: u32 = 0;
+			for (fraction_bytes, 0..) |byte, j|
+				fraction |= @as(u32, byte) << @as(u5, @intCast(8 * (3 - count + j)));
+			time.* = .{ .dos_time = dos_time, .add_second = mode & 4 != 0, .fraction_100ns = fraction };
+		}
+	}
 
 	// Normalize method: subtract 0x30
 	const method = method_raw -% 0x30;
@@ -242,6 +269,8 @@ pub fn parse_file_header(r: *Reader, block: BlockHeader) ParseError!FileHeader {
 		.method = method,
 		.attributes = attributes,
 		.file_name = file_name,
+		.salt = salt,
+		.extended_times = extended_times,
 	};
 }
 
@@ -277,6 +306,19 @@ pub const BlockIterator = struct {
 
 		var r = Reader.init(self.data[self.pos..]);
 		var block = try parse_block_header(&r);
+		if (r.position() > block.head_size) return error.EndOfData;
+		if (block.head_size > r.data.len) {
+			// File enumeration tolerates an incomplete optional ENDARC body,
+			// as the reference does. Preserve its declared size so whole-header
+			// CRC validation still reports the missing bytes.
+			if (block.header_type == .end_archive and (block.data_size orelse 0) == 0) {
+				block.header_offset = self.pos;
+				self.pos = self.data.len;
+				return .{ .end_archive = block };
+			}
+			return error.EndOfData;
+		}
+		r.data = r.data[0..block.head_size];
 		// parse_block_header records r.position(), and this Reader starts AT the
 		// block, so that offset is always 0 — it is relative to the block, not to
 		// the archive. Every consumer treats header_offset as an archive offset:
@@ -313,6 +355,7 @@ pub const BlockIterator = struct {
 		};
 		const header_size: usize = effective_block.head_size;
 		const data_size: u64 = effective_block.data_size orelse 0;
+		if (data_size > self.data.len - self.pos - header_size) return error.EndOfData;
 		self.pos += header_size + @as(usize, @intCast(data_size));
 
 		return result;
@@ -758,21 +801,9 @@ test "walk_blocks refuses every incomplete base header" {
 	try testing.expectEqual(@as(?ArchiveBlock, null), try complete.next());
 }
 
-test "block iterator advances correctly for >4GB file (large flag)" {
-	// Construct a synthetic RAR4 archive with a file block that has the large flag set,
-	// claiming a packed_size > 4GB. After the file block + its data, there's an end_archive
-	// block. The iterator must use the full 64-bit data_size to skip correctly.
-	//
-	// We can't allocate 4GB of data in a test, so we construct the scenario differently:
-	// We build a file block header with packed_size = 0x1_0000_0100 (just over 4GB).
-	// The data_size in the base block header (LONG_BLOCK) will be the low 32 bits: 0x0000_0100.
-	// If the iterator only uses the 32-bit data_size, it would skip only 0x100 bytes of data.
-	// If it uses the full 64-bit value, it would skip 0x1_0000_0100 bytes.
-	//
-	// Since we can't have that much data, we instead verify the parsed BlockHeader.data_size
-	// is the full 64-bit value by checking what the iterator computes for the file block.
-	//
-	// Strategy: build a file block with large flag, parse it, and verify data_size is 64-bit.
+test "large file headers retain 64-bit sizes and refuse missing payload" {
+	// Header parsing retains both size halves without allocating a large payload.
+	// The iterator must reject the missing payload before advancing its position.
 
 	const filename = "huge.bin";
 	// File block header layout for a large file:
@@ -827,12 +858,12 @@ test "block iterator advances correctly for >4GB file (large flag)" {
 	@memcpy(data[off..][0..filename.len], filename);
 	off += filename.len;
 
-	// Parse through the block iterator
+	// Parse the header independently; traversal requires the declared payload.
+	var reader = Reader.init(data[0..off]);
+	const header = try parse_block_header(&reader);
+	const file_block = try parse_file_header(&reader, header);
 	var iter = walk_blocks(data[0..off]);
-	const result = try iter.next();
-	try testing.expect(result != null);
-
-	const file_block = result.?.file;
+	try testing.expectError(error.EndOfData, iter.next());
 
 	// Verify the file header has full 64-bit packed_size
 	try testing.expectEqual(@as(u64, 0x1_0000_0100), file_block.packed_size);
@@ -956,4 +987,168 @@ test "parse_main_flags: PROTECT (recovery record) is not PASSWORD" {
 	try testing.expect(parse_main_flags(0x0001).volume);
 	try testing.expect(parse_main_flags(0x0008).solid);
 	try testing.expect(parse_main_flags(0x0100).first_volume);
+}
+
+test "RAR4 file fields cannot borrow bytes beyond the declared header" {
+	var bytes = [_]u8{0} ** 64;
+	bytes[2] = 0x74;
+	write_u16_le(&bytes, 3, 0x8000);
+	write_u16_le(&bytes, 5, 32);
+	write_u16_le(&bytes, 26, 1);
+	bytes[32] = 'a';
+	var truncated = walk_blocks(&bytes);
+	try testing.expectError(error.EndOfData, truncated.next());
+	write_u16_le(&bytes, 5, 33);
+	var complete = walk_blocks(&bytes);
+	const file = (try complete.next()).?.file;
+	try testing.expectEqualSlices(u8, "a", file.file_name);
+}
+
+test "RAR4 declared header and payload sizes stay within the input" {
+	// Unknown records still have bounded framing, independent of their contents.
+	var bytes = [_]u8{0} ** 16;
+	bytes[2] = 0x7c;
+	write_u16_le(&bytes, 5, 17);
+	var oversized_header = walk_blocks(&bytes);
+	try testing.expectError(error.EndOfData, oversized_header.next());
+	write_u16_le(&bytes, 3, 0x8000);
+	write_u16_le(&bytes, 5, 11);
+	for ([_]u32{ 0, 5, 6, 0xffffffff }) |size| {
+		write_u32_le(&bytes, 7, size);
+		var iter = walk_blocks(&bytes);
+		if (size <= 5) {
+			try testing.expect((try iter.next()) != null);
+			try testing.expectEqual(@as(usize, 11) + size, iter.pos);
+		} else try testing.expectError(error.EndOfData, iter.next());
+	}
+}
+
+test "RAR4 LONG_BLOCK field must fit inside its declared header" {
+	var bytes = [_]u8{0} ** 11;
+	bytes[2] = 0x7c;
+	write_u16_le(&bytes, 3, 0x8000);
+	for (7..11) |size| {
+		write_u16_le(&bytes, 5, @intCast(size));
+		var iter = walk_blocks(&bytes);
+		try testing.expectError(error.EndOfData, iter.next());
+	}
+	write_u16_le(&bytes, 5, 11);
+	var complete = walk_blocks(&bytes);
+	try testing.expect((try complete.next()) != null);
+}
+
+test "RAR4 salt cannot borrow payload bytes after the file name" {
+	var bytes = [_]u8{0} ** 48;
+	bytes[2] = 0x74;
+	write_u16_le(&bytes, 3, 0x8404);
+	write_u16_le(&bytes, 26, 1);
+	bytes[32] = 'a';
+	for (33..41) |size| {
+		write_u16_le(&bytes, 5, @intCast(size));
+		var iter = walk_blocks(&bytes);
+		try testing.expectError(error.EndOfData, iter.next());
+	}
+	write_u16_le(&bytes, 5, 41);
+	var complete = walk_blocks(&bytes);
+	try testing.expect((try complete.next()) != null);
+}
+
+test "RAR4 extended times cannot borrow payload bytes in an independent fixture" {
+	const original = @embedFile("rar4_x86_filter");
+	const bytes = try testing.allocator.dupe(u8, original);
+	defer testing.allocator.free(bytes);
+	// The producer has a 36-byte file prefix followed by five extended-time bytes.
+	for (36..41) |size| {
+		write_u16_le(bytes, 25, @intCast(size));
+		var iter = walk_blocks(bytes);
+		_ = try iter.next();
+		_ = try iter.next();
+		try testing.expectError(error.EndOfData, iter.next());
+	}
+}
+
+test "RAR4 extended times match independent producer and reference listings" {
+	var iter = walk_blocks(@embedFile("rar4_extended_times"));
+	_ = try iter.next();
+	_ = try iter.next();
+	const file = (try iter.next()).?.file;
+	// RAR 6.21 input and UNRAR 7.20 agree: 2000-02-29 00:00:01.1234567
+	// and access time 00:00:03.7654321, in the producer's local calendar.
+	try testing.expectEqual(@as(?[8]u8, null), file.salt);
+	try testing.expectEqualDeep(ExtendedTime{ .dos_time = 0x285d0000, .add_second = true, .fraction_100ns = 1234567 }, file.extended_times[0].?);
+	try testing.expectEqualDeep(ExtendedTime{ .dos_time = 0x285d0001, .add_second = true, .fraction_100ns = 7654321 }, file.extended_times[2].?);
+	try testing.expectEqual(@as(?ExtendedTime, null), file.extended_times[1]);
+	try testing.expectEqual(@as(?ExtendedTime, null), file.extended_times[3]);
+}
+
+test "RAR4 time flag nibbles preserve all positions and fractional widths" {
+	const fractions = [_]u32{ 0, 1179648, 1234432, 1234567 };
+	for (0..4) |which| {
+		for (0..16) |mode| {
+			var bytes = [_]u8{0} ** 48;
+			bytes[2] = 0x74;
+			write_u16_le(&bytes, 3, 0x9000);
+			write_u32_le(&bytes, 20, 0x285d0000);
+			write_u16_le(&bytes, 32, @as(u16, @intCast(mode)) << @as(u4, @intCast(12 - 4 * which)));
+			var length: usize = 34;
+			const present = mode & 8 != 0;
+			if (present) {
+				if (which != 0) {
+					write_u32_le(&bytes, length, 0x285d0000);
+					length += 4;
+				}
+				const count = mode & 3;
+				const full = [_]u8{ 0x87, 0xd6, 0x12 };
+				@memcpy(bytes[length..][0..count], full[3-count..]);
+				length += count;
+			}
+			write_u16_le(&bytes, 5, @intCast(length));
+			var iter = walk_blocks(bytes[0..length]);
+			const file = (try iter.next()).?.file;
+			for (file.extended_times, 0..) |time, index| {
+				try testing.expectEqual(present and index == which, time != null);
+				if (time) |value| {
+					try testing.expectEqual(@as(u32, 0x285d0000), value.dos_time);
+					try testing.expectEqual(mode & 4 != 0, value.add_second);
+					try testing.expectEqual(fractions[mode & 3], value.fraction_100ns);
+				}
+			}
+			// The same record cannot consume any missing byte from its successor.
+			for (32..length) |short_length| {
+				write_u16_le(&bytes, 5, @intCast(short_length));
+				var truncated = walk_blocks(&bytes);
+				try testing.expectError(error.EndOfData, truncated.next());
+			}
+		}
+	}
+}
+
+test "RAR4 independent encrypted entries retain distinct salt bytes" {
+	var iter = walk_blocks(@embedFile("rar4_encrypted_all"));
+	_ = try iter.next();
+	_ = try iter.next();
+	const first = (try iter.next()).?.file;
+	const second = (try iter.next()).?.file;
+	try testing.expectEqualSlices(u8, &.{ 0xf2, 0xab, 0x08, 0x73, 0xb0, 0x47, 0x1a, 0x99 }, &first.salt.?);
+	try testing.expectEqualSlices(u8, &.{ 0x6b, 0xd1, 0x1a, 0x9b, 0x66, 0x35, 0xfe, 0xd7 }, &second.salt.?);
+	try testing.expectEqual(@as(u32, 9996338), first.extended_times[0].?.fraction_100ns);
+	try testing.expect(!first.extended_times[0].?.add_second);
+	try testing.expectEqual(@as(u32, 46339), second.extended_times[0].?.fraction_100ns);
+	try testing.expect(second.extended_times[0].?.add_second);
+}
+
+test "RAR4 optional end-record bodies do not prevent file enumeration" {
+	var bytes = [_]u8{0} ** 13;
+	bytes[2] = 0x7b;
+	write_u16_le(&bytes, 3, 0x4000);
+	write_u16_le(&bytes, 5, 13);
+	for (7..14) |length| {
+		var iter = walk_blocks(bytes[0..length]);
+		const block = (try iter.next()).?.end_archive;
+		try testing.expectEqual(@as(u16, 13), block.head_size);
+		try testing.expectEqual(length, iter.pos);
+		try testing.expectEqual(@as(?ArchiveBlock, null), try iter.next());
+		// Whole-header integrity remains unavailable when declared bytes are absent.
+		if (length < 13) try testing.expect(!validate_header_crc(bytes[0..length], block));
+	}
 }

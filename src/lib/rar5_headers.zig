@@ -231,6 +231,12 @@ pub fn parse_main_block(r: *reader_mod.Reader, header: BlockHeader) ParseError!M
 
 /// Parse the body of a FILE or SERVICE block.
 pub fn parse_file_block(r: *reader_mod.Reader, header: BlockHeader) ParseError!FileBlock {
+	// Extra records occupy the tail of the header, after any future body fields.
+	const extra_size = header.extra_size orelse 0;
+	if (extra_size > r.remaining()) return error.EndOfData;
+	const extra_start = r.data.len - @as(usize, @intCast(extra_size));
+	const extra_data: ?[]const u8 = if (header.flags.extra) r.data[extra_start..] else null;
+	r.data = r.data[0..extra_start];
 	const file_flags = r.read_vint() catch return error.EndOfData;
 
 	const is_directory = (file_flags & 0x0001) != 0;
@@ -257,16 +263,9 @@ pub fn parse_file_block(r: *reader_mod.Reader, header: BlockHeader) ParseError!F
 	const host_os = r.read_vint() catch return error.EndOfData;
 
 	const name_length = r.read_vint() catch return error.EndOfData;
+	if (name_length > r.remaining()) return error.EndOfData;
 	const name = r.read_bytes(@intCast(name_length)) catch return error.EndOfData;
 	if (!std.unicode.utf8ValidateSlice(name)) return error.InvalidUtf8;
-
-	// Read extra area if present
-	var extra_data: ?[]const u8 = null;
-	if (header.flags.extra) {
-		if (header.extra_size) |es| {
-			extra_data = r.read_bytes(@intCast(es)) catch return error.EndOfData;
-		}
-	}
 
 	mtime = extra_modification_time(extra_data) orelse mtime;
 
@@ -332,27 +331,20 @@ pub fn parse_extra_records(data: []const u8, allocator: std.mem.Allocator) ![]Ex
 
 	var r = reader_mod.Reader.init(data);
 
-	while (r.remaining() > 0) {
-		const field_size = r.read_vint() catch break;
-		if (field_size == 0) break;
-
-		// Remember position before reading field_type to compute how many
-		// bytes the field_type vint consumed.
-		const before_type = r.position();
-		const field_type = r.read_vint() catch break;
-		const type_vint_len = r.position() - before_type;
-
-		// field_data is the remaining bytes within this record
-		const data_len = field_size - type_vint_len;
-		const field_data = r.read_bytes(@intCast(data_len)) catch break;
-
-		try records.append(allocator, .{
-			.field_type = field_type,
-			.data = field_data,
-		});
+	while (try next_extra_record(&r)) |record| {
+		try records.append(allocator, record);
 	}
 
 	return records.toOwnedSlice(allocator);
+}
+
+fn next_extra_record(r: *reader_mod.Reader) reader_mod.Reader.Error!?ExtraRecord {
+	if (r.remaining() == 0) return null;
+	const size = try r.read_vint();
+	if (size == 0 or size > r.remaining()) return error.EndOfData;
+	var record = reader_mod.Reader.init(try r.read_bytes(@intCast(size)));
+	const kind = try record.read_vint();
+	return .{ .field_type = kind, .data = record.data[record.pos..] };
 }
 
 /// Extract BLAKE2sp hash from extra records, if present.
@@ -379,15 +371,8 @@ pub fn extract_blake2sp_hash(extra_records: []const ExtraRecord) ?[32]u8 {
 pub fn extra_has_encryption(extra_data: ?[]const u8) bool {
 	const data = extra_data orelse return false;
 	var r = reader_mod.Reader.init(data);
-	while (r.remaining() > 0) {
-		const field_size = r.read_vint() catch break;
-		if (field_size == 0) break;
-		const before_type = r.position();
-		const field_type = r.read_vint() catch break;
-		const type_vint_len = r.position() - before_type;
-		if (field_type == EXTRA_FILE_ENCRYPTION) return true;
-		const data_len = field_size - type_vint_len;
-		_ = r.read_bytes(@intCast(data_len)) catch break;
+	while (next_extra_record(&r) catch return false) |record| {
+		if (record.field_type == EXTRA_FILE_ENCRYPTION) return true;
 	}
 	return false;
 }
@@ -398,31 +383,9 @@ pub fn extra_has_encryption(extra_data: ?[]const u8) bool {
 pub fn extract_blake2sp_hash_raw(extra_data: ?[]const u8) ?[32]u8 {
 	const data = extra_data orelse return null;
 	var r = reader_mod.Reader.init(data);
-	while (r.remaining() > 0) {
-		const field_size = r.read_vint() catch break;
-		if (field_size == 0) break;
-		const before_type = r.position();
-		const field_type = r.read_vint() catch break;
-		const type_vint_len = r.position() - before_type;
-		const data_len = field_size - type_vint_len;
-		if (field_type == EXTRA_FILE_HASH) {
-			// HASH record body: hash_type vint + 32-byte hash
-			const rec_start = r.position();
-			const hash_type = r.read_vint() catch break;
-			if (hash_type == HASH_TYPE_BLAKE2SP) {
-				const hash_bytes = r.read_bytes(32) catch break;
-				var result: [32]u8 = undefined;
-				@memcpy(&result, hash_bytes);
-				return result;
-			}
-			// Not BLAKE2sp — skip the rest of this record's data.
-			const consumed = r.position() - rec_start;
-			if (data_len > consumed) {
-				_ = r.read_bytes(@intCast(data_len - consumed)) catch break;
-			}
-		} else {
-			_ = r.read_bytes(@intCast(data_len)) catch break;
-		}
+	while (next_extra_record(&r) catch return null) |record| {
+		if (record.field_type != EXTRA_FILE_HASH) continue;
+		if (extract_blake2sp_hash(&.{record})) |hash| return hash;
 	}
 	return null;
 }
@@ -458,8 +421,19 @@ pub const BlockIterator = struct {
 
 		// Compute total block size: 4 (CRC32) + crc_data_len + data_size
 		const total_header = 4 + header.crc_data_len;
-		const total_data = if (header.data_size) |ds| @as(usize, @intCast(ds)) else 0;
+		if (total_header > r.data.len or r.pos > total_header) return error.EndOfData;
+		const data_size = header.data_size orelse 0;
+		if (data_size > r.data.len - total_header) return error.EndOfData;
+		r.data = r.data[0..total_header];
+		const total_data: usize = @intCast(data_size);
 		const total_block = total_header + total_data;
+		const extra_size = header.extra_size orelse 0;
+		if (extra_size > r.remaining()) return error.EndOfData;
+		const extra_start = total_header - @as(usize, @intCast(extra_size));
+		var extras = reader_mod.Reader.init(r.data[extra_start..]);
+		while (try next_extra_record(&extras)) |_| {}
+		var body = r;
+		body.data = body.data[0..extra_start];
 
 		// Adjust header offsets to be relative to archive start
 		var adjusted_header = header;
@@ -468,7 +442,7 @@ pub const BlockIterator = struct {
 
 		const block: ArchiveBlock = switch (header.block_type) {
 			.main => blk: {
-				var main_block = try parse_main_block(&r, adjusted_header);
+				var main_block = try parse_main_block(&body, adjusted_header);
 				main_block.header = adjusted_header;
 				break :blk .{ .main = main_block };
 			},
@@ -484,7 +458,7 @@ pub const BlockIterator = struct {
 			},
 			.crypt => .{ .crypt = adjusted_header },
 			.end_archive => blk: {
-				var end_block = try parse_end_block(&r, adjusted_header);
+				var end_block = try parse_end_block(&body, adjusted_header);
 				end_block.header = adjusted_header;
 				break :blk .{ .end_archive = end_block };
 			},
@@ -507,6 +481,112 @@ pub fn walk_blocks(data: []const u8) BlockIterator {
 // ============================================================================
 
 const encode_vint = reader_mod.encode_vint;
+
+test "block bodies cannot consume bytes beyond their declared header" {
+	const cases = .{
+		.{ @as(u7, 1), &[_]u8{ 2, 0 } },
+		.{ @as(u7, 2), &[_]u8{ 0, 0, 0, 0, 1, 1, 'a' } },
+		.{ @as(u7, 3), &[_]u8{ 0, 0, 0, 0, 1, 1, 'a' } },
+		.{ @as(u7, 5), &[_]u8{0} },
+	};
+	inline for (cases) |case| {
+		const body = case[1];
+		for (0..body.len) |cut| {
+			var bytes: [128]u8 = undefined;
+			const n = build_test_header(&bytes, case[0], 0, null, null, body[0..cut]);
+			@memcpy(bytes[n..][0 .. body.len - cut], body[cut..]);
+			var blocks = walk_blocks(bytes[0 .. n + body.len - cut]);
+			try testing.expectError(error.EndOfData, blocks.next());
+		}
+		var bytes: [128]u8 = undefined;
+		const n = build_test_header(&bytes, case[0], 0, null, null, body);
+		var blocks = walk_blocks(bytes[0..n]);
+		try testing.expect((try blocks.next()) != null);
+		try testing.expect((try blocks.next()) == null);
+	}
+}
+
+test "hash extra records cannot borrow hash bytes from a later record" {
+	var extra: [37]u8 = undefined;
+	extra[0..5].* = .{ 2, 2, 0, 33, 99 };
+	@memset(extra[5..], 0x42);
+	try testing.expect(extract_blake2sp_hash_raw(&extra) == null);
+	const parsed = try parse_extra_records(&extra, testing.allocator);
+	defer testing.allocator.free(parsed);
+	try testing.expect(extract_blake2sp_hash(parsed) == null);
+}
+
+test "extra record framing rejects incomplete records instead of returning a prefix" {
+	const cases = [_][]const u8{
+		&.{0}, &.{0x80}, &.{ 2, 99 }, &.{ 1, 0x80, 0 },
+		&.{ 1, 99, 2, 99 },
+	};
+	for (cases) |bytes| {
+		const result = parse_extra_records(bytes, testing.allocator);
+		if (result) |records| testing.allocator.free(records) else |_| {}
+		try testing.expectError(error.EndOfData, result);
+	}
+}
+
+test "extra areas are anchored at the header end and skip unknown records" {
+	// An unrecognized future body byte precedes a type-only unknown extra record.
+	const body = [_]u8{ 0, 0, 0, 0, 1, 1, 'a', 0x7e, 1, 99 };
+	var bytes: [128]u8 = undefined;
+	const n = build_test_header(&bytes, 2, 1, 2, null, &body);
+	var blocks = walk_blocks(bytes[0..n]);
+	const file = (try blocks.next()).?.file;
+	try testing.expectEqualSlices(u8, "a", file.name);
+	try testing.expectEqualSlices(u8, &.{ 1, 99 }, file.extra_data.?);
+}
+
+test "block iteration rejects malformed extra framing across block types" {
+	const cases = .{
+		.{ @as(u7, 1), &[_]u8{0} },
+		.{ @as(u7, 2), &[_]u8{ 0, 0, 0, 0, 1, 1, 'a' } },
+		.{ @as(u7, 3), &[_]u8{ 0, 0, 0, 0, 1, 1, 'a' } },
+		.{ @as(u7, 5), &[_]u8{0} },
+		.{ @as(u7, 99), &[_]u8{} },
+	};
+	inline for (cases) |case| {
+		var body: [32]u8 = undefined;
+		@memcpy(body[0..case[1].len], case[1]);
+		body[case[1].len..][0..2].* = .{ 2, 99 };
+		var bytes: [128]u8 = undefined;
+		const n = build_test_header(&bytes, case[0], 1, 2, null, body[0 .. case[1].len + 2]);
+		var blocks = walk_blocks(bytes[0..n]);
+		try testing.expectError(error.EndOfData, blocks.next());
+	}
+}
+
+test "block payload bounds reject impossible sizes before arithmetic" {
+	for ([_]u64{ 1, std.math.maxInt(u64) }) |size| {
+		var bytes: [128]u8 = undefined;
+		const n = build_test_header(&bytes, 99, 2, null, size, &.{});
+		var blocks = walk_blocks(bytes[0..n]);
+		try testing.expectError(error.EndOfData, blocks.next());
+	}
+}
+
+test "extra traversal handles multibyte unknown kinds and every hash truncation" {
+	var bytes: [64]u8 = undefined;
+	// Unknown kind 128, then a complete BLAKE2sp record.
+	bytes[0..6].* = .{ 2, 0x80, 1, 34, 2, 0 };
+	@memset(bytes[6..38], 0x42);
+	for (0..35) |length| {
+		const hash = extract_blake2sp_hash_raw(bytes[3..][0..length]);
+		try testing.expect(hash == null);
+	}
+	const records = try parse_extra_records(bytes[0..38], testing.allocator);
+	defer testing.allocator.free(records);
+	try testing.expectEqual(@as(usize, 2), records.len);
+	try testing.expectEqual(@as(u64, 128), records[0].field_type);
+	const hash = extract_blake2sp_hash_raw(bytes[0..38]).?;
+	try testing.expectEqualSlices(u8, &([_]u8{0x42} ** 32), &hash);
+	for ([_][]const u8{ &.{ 2, 1 }, &.{ 1, 0x80, 0 }, &.{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1 } }) |invalid| {
+		try testing.expect(!extra_has_encryption(invalid));
+		try testing.expect(extract_blake2sp_hash_raw(invalid) == null);
+	}
+}
 
 /// Build a complete header byte slice for testing. Returns the number of
 /// bytes written into `out`. The CRC32 is computed and placed at bytes 0..3.

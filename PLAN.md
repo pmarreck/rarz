@@ -11,9 +11,9 @@ Completed records: [docs/PLAN_LOG.md](docs/PLAN_LOG.md). Historical decisions an
 - [x] Recognize recovery volumes without integrity claims and normalize directory names; complete 475-unit/CLI/v70 and native macOS acceptance passed, followed by exact CI in 71 seconds (done 2026-10-28 03:06 EDT; commit c6a8b25; #36; context: docs/plan_context/recovery-volumes.md).
 - [x] Verify exact-commit CI for archive-comment checksums and the UNRAR exit-zero diagnostic rule; complete 473-unit/CLI/v70 and native macOS acceptance passed, followed by exact CI in 56 seconds (done 2026-10-28 02:01 EDT; commit 84cf819; #21; context: docs/plan_context/rar2-comments.md).
 - [x] Verify exact-commit CI for packed-part CRC validation and writer correction; complete 477-unit/CLI/v70 and native macOS acceptance passed, followed by exact CI in 76 seconds (done 2026-10-28 03:20 EDT; commit e4904a7; #26; context: docs/plan_context/packed-crc.md).
-- [ ] Verify exact-commit CI for producer-compatible integer volume units and overflow rejection; complete 479-unit/CLI/v70, native macOS checks, and optimized build passed (#33; context: docs/plan_context/volume-size-units.md).
-- [ ] Verify exact-commit CI for RAR5 UTF-8 names independently of decoder support; complete 479-unit/CLI/v70, native macOS checks, and optimized build passed (#30; context: docs/plan_context/utf8-names.md).
-- [ ] Complete acceptance of bounded RAR5 headers and extra-record traversal before file-version handling; six reproduced failures and truncation controls now pass in focused checks (#4).
+- [x] Match producer integer volume units and reject overflow; complete 479-unit/CLI/v70, native macOS checks, and optimized build passed, then exact CI passed in 57 seconds (done 2026-10-28 03:46 EDT; commit 0945c7a; #33; context: docs/plan_context/volume-size-units.md).
+- [x] Validate RAR5 UTF-8 names independently of decoder support; complete 479-unit/CLI/v70, native macOS checks, and optimized build passed, then exact CI passed in 57 seconds (done 2026-10-28 03:46 EDT; commit 0945c7a; #30; context: docs/plan_context/utf8-names.md).
+- [ ] Verify exact-commit CI for bounded RAR5 headers and extra-record traversal; complete 486-unit/CLI/v70, native macOS checks, and optimized build passed (#4; context: docs/plan_context/extra-record-bounds.md).
 - [ ] Parse RAR5 file-version extra records and prevent versioned-name collisions (#32).
 - [ ] Restore extraction metadata, including directory times after children and RAR4 executable permissions (#35).
 - [ ] Define timestamp presence and time basis in a richer metadata API before closing the remaining normalization scope of #31 (context: docs/plan_context/timestamps.md).
@@ -22,7 +22,7 @@ Completed records: [docs/PLAN_LOG.md](docs/PLAN_LOG.md). Historical decisions an
 
 ## Evidence and resource follow-ups
 
-- [ ] Add tested interruption propagation from ./test to its admitted runtime scope; retain the distinction between interrupted parent and still-running child.
+- [ ] Add tested interruption propagation from ./test to its admitted runtime scope; awaiting the shared wrapper's owning-scope cancellation contract before integration.
 - [ ] Adjudicate reference missing-volume and memory-limit outcomes from both campaigns without treating generic failures as damage; all six header-CRC disagreements resolve with quick-open disabled (context: docs/COVERAGE_20261028.md).
 - [ ] Migrate remaining legacy mutation gates to versioned definitions with distinct crash, timeout, and resource outcomes (context: docs/ARCHIVE_EVIDENCE_INDEX.md).
 - [ ] Adjudicate stricter reference disagreements using exact mutations and format invariants before making stronger coverage claims (context: docs/ARCHIVE_EVIDENCE_INDEX.md).
@@ -47,5 +47,3 @@ Completed records: [docs/PLAN_LOG.md](docs/PLAN_LOG.md). Historical decisions an
 - [x] Bound Nix compilation inputs and verify documentation reuse plus source invalidation; full 469-unit/CLI/v70 and native macOS checks passed, then exact CI passed in 69 seconds (done 2026-10-28 01:38 EDT; commit e80ea1e, context: docs/plan_context/compilation-source.md).
 - [x] Reject initial Huffman repeats and overflowing tenth-byte VINT values; full 469-unit/CLI/v70 acceptance and exact CI passed in 147 seconds (done 2026-10-28 01:12 EDT; commit 752511b, context: docs/plan_context/integer-and-table-bounds.md).
 - [x] Verify exact-commit CI for uncached reference and seed-43 evidence commit c2cb48d; passed in 95 seconds (done 2026-10-28 00:58 EDT; context: docs/COVERAGE_20261028.md).
-- [x] Correct writer header/caller-buffer bounds and reject impossible volume capacity; full 465-unit/CLI/v70 and native macOS checks passed, then exact-commit CI passed in 103 seconds (done 2026-10-28 00:36 EDT; commit 1251857, context: docs/plan_context/writer-bounds.md).
-- [x] Resolve #29 unknown-block skip semantics: both flag values remain readable in eight RAR4/RAR5 reference controls; eight CRC mutations are rejected, so flag absence alone is not a damage rule (done 2026-10-28 00:22 EDT; context: docs/plan_context/unknown-blocks.md).

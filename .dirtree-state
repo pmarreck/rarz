@@ -26,6 +26,7 @@ annotate=[
 	docs/plan_context/compilation-source.md = Compilation dependencies and source-boundary reuse evidence
 	docs/plan_context/development-history.md = Archived development decisions and measurements; superseded claims remain historical
 	docs/plan_context/encryption-header-crc.md = Plaintext CRC evidence for six formerly unverifiable corruption cases
+	docs/plan_context/extra-record-bounds.md = RAR5 header boundaries, extra framing, and forward-compatible traversal
 	docs/plan_context/integer-and-table-bounds.md = VINT overflow and initial Huffman-repeat regressions
 	docs/plan_context/packed-crc.md = Packed-part checksum rules and reference verification limits
 	docs/plan_context/rar2-comments.md = Producer provenance and separate legacy comment checksums

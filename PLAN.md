@@ -10,15 +10,15 @@ Completed records: [docs/PLAN_LOG.md](docs/PLAN_LOG.md). Historical decisions an
 
 - [x] Recognize recovery volumes without integrity claims and normalize directory names; complete 475-unit/CLI/v70 and native macOS acceptance passed, followed by exact CI in 71 seconds (done 2026-10-28 03:06 EDT; commit c6a8b25; #36; context: docs/plan_context/recovery-volumes.md).
 - [x] Verify exact-commit CI for archive-comment checksums and the UNRAR exit-zero diagnostic rule; complete 473-unit/CLI/v70 and native macOS acceptance passed, followed by exact CI in 56 seconds (done 2026-10-28 02:01 EDT; commit 84cf819; #21; context: docs/plan_context/rar2-comments.md).
-- [ ] Verify exact-commit CI for packed-part CRC validation and writer correction; complete 477-unit/CLI/v70 and native macOS acceptance passed (#26; context: docs/plan_context/packed-crc.md).
-- [ ] Verify binary/decimal volume-size suffix behavior against the producer CLI (#33).
-- [ ] Validate RAR5 UTF-8 filenames without conflating invalid encoding with unsupported decoding (#30).
+- [x] Verify exact-commit CI for packed-part CRC validation and writer correction; complete 477-unit/CLI/v70 and native macOS acceptance passed, followed by exact CI in 76 seconds (done 2026-10-28 03:20 EDT; commit e4904a7; #26; context: docs/plan_context/packed-crc.md).
+- [ ] Verify exact-commit CI for producer-compatible integer volume units and overflow rejection; complete 479-unit/CLI/v70, native macOS checks, and optimized build passed (#33; context: docs/plan_context/volume-size-units.md).
+- [ ] Verify exact-commit CI for RAR5 UTF-8 names independently of decoder support; complete 479-unit/CLI/v70, native macOS checks, and optimized build passed (#30; context: docs/plan_context/utf8-names.md).
+- [ ] Complete acceptance of bounded RAR5 headers and extra-record traversal before file-version handling; six reproduced failures and truncation controls now pass in focused checks (#4).
 - [ ] Parse RAR5 file-version extra records and prevent versioned-name collisions (#32).
 - [ ] Restore extraction metadata, including directory times after children and RAR4 executable permissions (#35).
 - [ ] Define timestamp presence and time basis in a richer metadata API before closing the remaining normalization scope of #31 (context: docs/plan_context/timestamps.md).
 - [x] Correct RAR5 Unix host value and directory ordering; complete 473-unit/CLI/v70 and native macOS acceptance passed, followed by exact CI in 51 seconds (done 2026-10-28 02:45 EDT; commit c1e0dae; context: docs/plan_context/rar5-unix-metadata.md).
 - [ ] Account for encrypted RAR4 service/comment blocks and parse SALT/EXT_TIME fields (#11, #5).
-- [ ] Test extra-area bounds and forward-compatible record traversal (#4).
 
 ## Evidence and resource follow-ups
 
@@ -49,4 +49,3 @@ Completed records: [docs/PLAN_LOG.md](docs/PLAN_LOG.md). Historical decisions an
 - [x] Verify exact-commit CI for uncached reference and seed-43 evidence commit c2cb48d; passed in 95 seconds (done 2026-10-28 00:58 EDT; context: docs/COVERAGE_20261028.md).
 - [x] Correct writer header/caller-buffer bounds and reject impossible volume capacity; full 465-unit/CLI/v70 and native macOS checks passed, then exact-commit CI passed in 103 seconds (done 2026-10-28 00:36 EDT; commit 1251857, context: docs/plan_context/writer-bounds.md).
 - [x] Resolve #29 unknown-block skip semantics: both flag values remain readable in eight RAR4/RAR5 reference controls; eight CRC mutations are rejected, so flag absence alone is not a damage rule (done 2026-10-28 00:22 EDT; context: docs/plan_context/unknown-blocks.md).
-- [x] Propagate FFI parser errors and preserve complete vintage EOF and ENDARC padding; full 457-unit/CLI/v70 and native macOS checks passed, then exact-commit CI passed in 216 seconds (done 2026-10-28 00:01 EDT; commit 67fa938, context: docs/plan_context/archive-collection.md).

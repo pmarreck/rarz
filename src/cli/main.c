@@ -149,6 +149,7 @@ static void print_usage(void) {
 	printf("    -m0..-m5                       Compression (default -m3, -m0=store)\n");
 	printf("    -o|--output <path>             Output path (dir: auto-name, file: use as-is)\n");
 	printf("    -v<size>                       Split into volumes (e.g. -v10m, -v700k, -v1g)\n");
+	printf("                                   b/B: bytes; k/m/g/t: binary; K/M/G/T: decimal; no suffix: KB\n");
 	printf("  rarz --help                      Show this help\n");
 	printf("  rarz --about                     Show version, platform and build mode\n");
 	printf("\n");
@@ -1353,24 +1354,34 @@ static int cmd_extract(const char *archive_path, const char *dest_dir) {
 /* ========================================================================== */
 
 /**
- * Parse a size string with optional k/m/g suffix.
+ * Parse producer-compatible volume units: lowercase binary, uppercase decimal.
+ * b/B means bytes; an absent suffix means decimal kilobytes.
  * Returns the size in bytes, or 0 on error.
- * Examples: "10k" -> 10240, "10m" -> 10485760, "1g" -> 1073741824, "4096" -> 4096
  */
 static uint64_t parse_size_suffix(const char *str) {
+	if (*str < '0' || *str > '9') return 0;
 	char *endptr = NULL;
+	errno = 0;
 	unsigned long long val = strtoull(str, &endptr, 10);
-	if (endptr == str || val == 0) return 0;
-
-	if (*endptr == '\0') return (uint64_t)val;
-	if (endptr[1] != '\0') return 0; /* trailing garbage */
+	if (errno == ERANGE || val == 0 || val > UINT64_MAX) return 0;
+	uint64_t multiplier = 1000;
+	if (*endptr != '\0' && endptr[1] != '\0') return 0;
 
 	switch (*endptr) {
-	case 'k': case 'K': return (uint64_t)val * 1024ULL;
-	case 'm': case 'M': return (uint64_t)val * 1048576ULL;
-	case 'g': case 'G': return (uint64_t)val * 1073741824ULL;
+	case '\0': break;
+	case 'b': case 'B': multiplier = 1; break;
+	case 'k': multiplier = 1024ULL; break;
+	case 'K': multiplier = 1000ULL; break;
+	case 'm': multiplier = 1048576ULL; break;
+	case 'M': multiplier = 1000000ULL; break;
+	case 'g': multiplier = 1073741824ULL; break;
+	case 'G': multiplier = 1000000000ULL; break;
+	case 't': multiplier = 1099511627776ULL; break;
+	case 'T': multiplier = 1000000000000ULL; break;
 	default: return 0;
 	}
+	if (val > UINT64_MAX / multiplier) return 0;
+	return (uint64_t)val * multiplier;
 }
 
 /**

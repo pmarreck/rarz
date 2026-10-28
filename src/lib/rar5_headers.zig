@@ -109,6 +109,7 @@ pub const ArchiveBlock = union(enum) {
 pub const ParseError = error{
 	EndOfData,
 	HeaderTooLarge,
+	InvalidUtf8,
 };
 
 // Extra record type constants
@@ -257,6 +258,7 @@ pub fn parse_file_block(r: *reader_mod.Reader, header: BlockHeader) ParseError!F
 
 	const name_length = r.read_vint() catch return error.EndOfData;
 	const name = r.read_bytes(@intCast(name_length)) catch return error.EndOfData;
+	if (!std.unicode.utf8ValidateSlice(name)) return error.InvalidUtf8;
 
 	// Read extra area if present
 	var extra_data: ?[]const u8 = null;
@@ -726,6 +728,48 @@ test "parse_file_block reads all fields" {
 	try testing.expectEqualSlices(u8, "test.txt", fb.name);
 	try testing.expectEqual(@as(?u32, null), fb.mtime);
 	try testing.expectEqual(@as(?u32, null), fb.data_crc32);
+}
+
+fn expectNameEncoding(name: []const u8, algorithm: u8, valid: bool) !void {
+	var body: [128]u8 = undefined;
+	var pos: usize = 0;
+	for ([_]u64{ 0, 0, 0, algorithm, 1, name.len }) |value|
+		pos += encode_vint(value, body[pos..]);
+	@memcpy(body[pos..][0..name.len], name);
+	pos += name.len;
+	var bytes: [256]u8 = undefined;
+	const length = build_test_header(&bytes, 2, 0, null, null, body[0..pos]);
+	var input = reader_mod.Reader.init(bytes[0..length]);
+	const header = try parse_block_header(&input);
+	const result = parse_file_block(&input, header);
+	if (valid) {
+		const file = try result;
+		try testing.expectEqualSlices(u8, name, file.name);
+		if (algorithm == 2) try testing.expectEqual(@as(u8, 2), file.compression.algo_version);
+	} else {
+		try testing.expectError(error.InvalidUtf8, result);
+	}
+}
+
+test "RAR5 names classify every nonzero one-byte and two-byte UTF-8 sequence" {
+	var name: [2]u8 = undefined;
+	for (1..256) |first| {
+		name[0] = @intCast(first);
+		try expectNameEncoding(name[0..1], 0, first < 128);
+		for (1..256) |second| {
+			name[1] = @intCast(second);
+			const valid = (first < 128 and second < 128) or
+				(first >= 0xc2 and first <= 0xdf and second >= 0x80 and second <= 0xbf);
+			try expectNameEncoding(&name, 0, valid);
+		}
+	}
+}
+
+test "RAR5 name encoding remains separate from decoder support" {
+	for ([_][]const u8{ "name.txt", "e\xcc\x81.txt", "\xe0\xa0\x80", "\xed\x9f\xbf", "\xef\xbf\xbe", "\xf0\x90\x80\x80", "\xf4\x8f\xbf\xbf" }) |name|
+		try expectNameEncoding(name, 2, true);
+	for ([_][]const u8{ "\xc0\x80", "\xc1\xbf", "\xe0\x9f\xbf", "\xed\xa0\x80", "\xf0\x8f\xbf\xbf", "\xf4\x90\x80\x80", "\xf5\x80\x80\x80", "\xe2\x82", "\xf0\x90\x80", "a\x80" }) |name|
+		try expectNameEncoding(name, 2, false);
 }
 
 test "parse_file_block reads modification time from bounded extra records" {

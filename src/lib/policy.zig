@@ -728,6 +728,7 @@ const VolumeFileChunk = struct {
 	compression: rar5_headers.CompressionInfo,
 	data_crc32: ?u32,
 	has_crc32: bool,
+	is_encrypted: bool,
 	split_before: bool,
 	split_after: bool,
 };
@@ -950,6 +951,7 @@ pub fn validate_volumes(volumes: []const []const u8) ValidationResult {
 
 	// Step 1: Structural validation of each volume, all must be RAR5
 	var total_block_count: u32 = 0;
+	var has_encrypted = false;
 	for (volumes) |vol_data| {
 		const fmt = detect_mod.detect_format(vol_data, MAX_SFX_SCAN);
 		const family = fmt.family orelse {
@@ -969,7 +971,7 @@ pub fn validate_volumes(volumes: []const []const u8) ValidationResult {
 		// Structural validation
 		const structural = validate_rar5_structural(vol_data, fmt.signature_offset, fmt.signature_len);
 		if (!structural.is_valid) return structural;
-		if (structural.has_encrypted_content) return structural;
+		has_encrypted = has_encrypted or structural.has_encrypted_content;
 		total_block_count += structural.block_count;
 	}
 
@@ -1027,6 +1029,7 @@ pub fn validate_volumes(volumes: []const []const u8) ValidationResult {
 							.compression = f.compression,
 							.data_crc32 = f.data_crc32,
 							.has_crc32 = f.has_crc32,
+							.is_encrypted = rar5_headers.extra_has_encryption(f.extra_data),
 							.split_before = f.header.flags.split_before,
 							.split_after = f.header.flags.split_after,
 						}) catch {
@@ -1042,6 +1045,7 @@ pub fn validate_volumes(volumes: []const []const u8) ValidationResult {
 
 	// Step 3: Walk chunks, merge split files, verify CRCs
 	var file_count: u32 = 0;
+	var unverified: u32 = 0;
 	var i: usize = 0;
 	while (i < chunks.items.len) {
 		const first = chunks.items[i];
@@ -1053,6 +1057,13 @@ pub fn validate_volumes(volumes: []const []const u8) ValidationResult {
 		}
 
 		file_count += 1;
+		// Ciphertext cannot be verified without a password. Other entries remain
+		// eligible even when encryption appears in an earlier or later volume.
+		if (first.is_encrypted) {
+			unverified += 1;
+			i += 1;
+			continue;
+		}
 
 		if (!first.split_after) {
 			// Complete file in single volume — validate inline
@@ -1066,7 +1077,7 @@ pub fn validate_volumes(volumes: []const []const u8) ValidationResult {
 						return .{
 							.is_valid = false,
 							.family = .rar50,
-							.has_encrypted_content = false,
+							.has_encrypted_content = has_encrypted,
 							.error_message = "payload CRC32 mismatch",
 							.block_count = total_block_count,
 							.file_count = file_count,
@@ -1086,7 +1097,7 @@ pub fn validate_volumes(volumes: []const []const u8) ValidationResult {
 						return .{
 							.is_valid = false,
 							.family = .rar50,
-							.has_encrypted_content = false,
+							.has_encrypted_content = has_encrypted,
 							.error_message = "decompression failed during validation",
 							.block_count = total_block_count,
 							.file_count = file_count,
@@ -1098,7 +1109,7 @@ pub fn validate_volumes(volumes: []const []const u8) ValidationResult {
 						return .{
 							.is_valid = false,
 							.family = .rar50,
-							.has_encrypted_content = false,
+							.has_encrypted_content = has_encrypted,
 							.error_message = "payload CRC32 mismatch",
 							.block_count = total_block_count,
 							.file_count = file_count,
@@ -1159,7 +1170,7 @@ pub fn validate_volumes(volumes: []const []const u8) ValidationResult {
 					return .{
 						.is_valid = false,
 						.family = .rar50,
-						.has_encrypted_content = false,
+						.has_encrypted_content = has_encrypted,
 						.error_message = "payload CRC32 mismatch",
 						.block_count = total_block_count,
 						.file_count = file_count,
@@ -1180,7 +1191,7 @@ pub fn validate_volumes(volumes: []const []const u8) ValidationResult {
 					return .{
 						.is_valid = false,
 						.family = .rar50,
-						.has_encrypted_content = false,
+						.has_encrypted_content = has_encrypted,
 						.error_message = "decompression failed during validation",
 						.block_count = total_block_count,
 						.file_count = file_count,
@@ -1192,7 +1203,7 @@ pub fn validate_volumes(volumes: []const []const u8) ValidationResult {
 					return .{
 						.is_valid = false,
 						.family = .rar50,
-						.has_encrypted_content = false,
+						.has_encrypted_content = has_encrypted,
 						.error_message = "payload CRC32 mismatch",
 						.block_count = total_block_count,
 						.file_count = file_count,
@@ -1208,10 +1219,11 @@ pub fn validate_volumes(volumes: []const []const u8) ValidationResult {
 	return .{
 		.is_valid = true,
 		.family = .rar50,
-		.has_encrypted_content = false,
+		.has_encrypted_content = has_encrypted,
 		.error_message = null,
 		.block_count = total_block_count,
 		.file_count = file_count,
+		.unverified_entry_count = unverified,
 	};
 }
 
@@ -2813,4 +2825,40 @@ test "a forged RAR4 password flag with an invalid CRC is damage" {
 	const result = validate(bytes);
 	try testing.expect(!result.is_valid and !result.has_encrypted_content);
 	try testing.expectEqualStrings("header CRC mismatch", result.error_message.?);
+}
+
+test "RAR5 mixed volumes account for all files regardless of encryption order" {
+	const cases = [_][2][]const u8{
+		.{ @embedFile("rar5_mixed_plain_first_1"), @embedFile("rar5_mixed_plain_first_2") },
+		.{ @embedFile("rar5_mixed_encrypted_first_1"), @embedFile("rar5_mixed_encrypted_first_2") },
+	};
+	for (cases) |volumes| {
+		const result = validate_volumes(&volumes);
+		try testing.expect(result.is_valid);
+		try testing.expect(result.has_encrypted_content);
+		try testing.expectEqual(@as(u32, 2), result.file_count);
+		try testing.expectEqual(@as(u32, 1), result.unverified_entry_count);
+	}
+}
+
+test "RAR5 encrypted volumes do not hide damage in another readable volume" {
+	const cases = [_][2][]const u8{
+		.{ @embedFile("rar5_mixed_plain_first_1"), @embedFile("rar5_mixed_plain_first_2") },
+		.{ @embedFile("rar5_mixed_encrypted_first_1"), @embedFile("rar5_mixed_encrypted_first_2") },
+	};
+	for (cases, 0..) |original, which| {
+		var volumes = original;
+		const plain_index: usize = which;
+		const damaged = try testing.allocator.dupe(u8, volumes[plain_index]);
+		defer testing.allocator.free(damaged);
+		var iter = rar5_headers.walk_blocks(damaged[8..]);
+		_ = try iter.next();
+		const file = (try iter.next()).?.file;
+		const payload_start = 8 + file.header.header_start + 4 + file.header.crc_data_len;
+		damaged[payload_start] ^= 0xa5;
+		volumes[plain_index] = damaged;
+		const result = validate_volumes(&volumes);
+		try testing.expect(!result.is_valid);
+		try testing.expect(result.has_encrypted_content);
+	}
 }

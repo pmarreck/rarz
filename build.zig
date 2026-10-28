@@ -150,6 +150,10 @@ pub fn build(b: *std.Build) void {
 	// archives, so it is tested over the whole set — none/mixed/all in both
 	// families — not against one lucky example that a stuck answer would pass.
 	unit_tests.root_module.addAnonymousImport("rar5_encrypted_mixed", .{ .root_source_file = b.path("tests/fixtures/rar5_encrypted_mixed.rar") });
+	unit_tests.root_module.addAnonymousImport("rar5_mixed_plain_first_1", .{ .root_source_file = b.path("tests/fixtures/rar5_mixed_plain-first.part1.rar") });
+	unit_tests.root_module.addAnonymousImport("rar5_mixed_plain_first_2", .{ .root_source_file = b.path("tests/fixtures/rar5_mixed_plain-first.part2.rar") });
+	unit_tests.root_module.addAnonymousImport("rar5_mixed_encrypted_first_1", .{ .root_source_file = b.path("tests/fixtures/rar5_mixed_encrypted-first.part1.rar") });
+	unit_tests.root_module.addAnonymousImport("rar5_mixed_encrypted_first_2", .{ .root_source_file = b.path("tests/fixtures/rar5_mixed_encrypted-first.part2.rar") });
 	unit_tests.root_module.addAnonymousImport("rar4_encrypted_none", .{ .root_source_file = b.path("tests/fixtures/rar4_encrypted_none.rar") });
 	unit_tests.root_module.addAnonymousImport("rar4_encrypted_mixed", .{ .root_source_file = b.path("tests/fixtures/rar4_encrypted_mixed.rar") });
 	unit_tests.root_module.addAnonymousImport("rar4_encrypted_all", .{ .root_source_file = b.path("tests/fixtures/rar4_encrypted_all.rar") });

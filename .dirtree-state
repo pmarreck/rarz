@@ -16,6 +16,7 @@ annotate=[
 	docs/plan_context/archive-collection.md = FFI parser-error propagation, independent controls, and reference limits
 	docs/plan_context/build-layout.md = Build layout, publication controls, and qualification limits
 	docs/plan_context/development-history.md = Archived development decisions and measurements; superseded claims remain historical
+	docs/plan_context/encryption-header-crc.md = Plaintext CRC evidence for six formerly unverifiable corruption cases
 	docs/plan_context/rar2-truncation.md = Diagnosis and independent controls for incomplete legacy archive headers
 	docs/plan_context/timestamps.md = Timestamp encodings, independent interop controls and metadata API limits
 	docs/plan_context/v70-memory.md = Dictionary allocation trace, lazy history initialization, and v70 gate evidence
@@ -28,6 +29,7 @@ annotate=[
 	tests/cli/test_assess_coverage.sh = Real mutation API, replay, and faulty-validator controls
 	tests/cli/test_build.sh = Isolated build publication and exact-product execution tests
 	tests/cli/test_build_banner.sh = --about surface + invariant 'DEBUG BUILD banner present <=> --about reports Debug'
+	tests/cli/test_encryption_header_crc.sh = Exact corruption replay and genuine header-encryption controls
 	tests/cli/test_mtime.sh = Verify RAR timestamps against independent extraction, range guards and format-aware listings
 	tests/cli/test_packet_status.sh = Exercise real signal exits, incomplete packets and historical receipt protection
 	tests/cli/test_precision_volumes.sh = Multi-volume precision: unrar-damaged => rarz must never report VALID (differential truncation sweep)

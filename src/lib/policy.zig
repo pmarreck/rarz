@@ -2625,6 +2625,17 @@ pub fn headers_encrypted(data: []const u8, fmt: detect_mod.FormatResult, family:
 			// means the same thing, so scan rather than peek.
 			var iter = rar5_headers.walk_blocks(data[block_start..]);
 			while (iter.next() catch return false) |block| {
+				const header = switch (block) {
+					.main => |m| m.header,
+					.file => |f| f.header,
+					.service => |s| s.header,
+					.crypt => |h| h,
+					.end_archive => |e| e.header,
+					.unknown => |h| h,
+				};
+				// These headers are plaintext. Proven damage takes precedence
+				// over a flag that would otherwise make the remaining bytes opaque.
+				if (!rar5_headers.validate_header_crc(data[block_start..], header)) return false;
 				if (block == .crypt) return true;
 				if (block == .end_archive) break;
 			}
@@ -2634,8 +2645,49 @@ pub fn headers_encrypted(data: []const u8, fmt: detect_mod.FormatResult, family:
 			var r = reader_mod.Reader.init(data[fmt.signature_offset + fmt.signature_len ..]);
 			const block = rar4_headers.parse_block_header(&r) catch return false;
 			if (block.header_type != .main) return false;
+			if (!rar4_headers.validate_header_crc(data[fmt.signature_offset + fmt.signature_len ..], block)) return false;
 			return rar4_headers.parse_main_flags(block.flags).password;
 		},
 		.rar14 => return false,
 	}
+}
+
+fn expectEncryptedHeaderCrc(data: []const u8, crc_offset: usize, crc_bytes: usize) !void {
+	for ([_]usize{ 0, 31 }) |prefix| {
+		const bytes = try testing.allocator.alloc(u8, prefix + data.len);
+		defer testing.allocator.free(bytes);
+		@memset(bytes[0..prefix], 0x5a);
+		@memcpy(bytes[prefix..], data);
+		const pristine = validate(bytes);
+		try testing.expect(!pristine.is_valid and pristine.has_encrypted_content);
+		for (0..crc_bytes) |offset| {
+			for (0..8) |bit| {
+				const mask = @as(u8, 1) << @as(u3, @intCast(bit));
+				bytes[prefix + crc_offset + offset] ^= mask;
+				const result = validate(bytes);
+				try testing.expect(!result.is_valid);
+				try testing.expect(!result.has_encrypted_content);
+				try testing.expect(std.mem.indexOf(u8, result.error_message orelse "", "CRC") != null);
+				bytes[prefix + crc_offset + offset] ^= mask;
+			}
+		}
+	}
+}
+
+test "RAR4 header encryption cannot hide a corrupt plaintext header CRC" {
+	try expectEncryptedHeaderCrc(@embedFile("rar4_hp"), 7, 2);
+}
+
+test "RAR5 header encryption cannot hide a corrupt plaintext header CRC" {
+	try expectEncryptedHeaderCrc(@embedFile("rar5_hp"), 8, 4);
+}
+
+test "a forged RAR4 password flag with an invalid CRC is damage" {
+	const source: []const u8 = @embedFile("rar2_v20_store");
+	const bytes = try testing.allocator.dupe(u8, source);
+	defer testing.allocator.free(bytes);
+	bytes[10] ^= 0x80;
+	const result = validate(bytes);
+	try testing.expect(!result.is_valid and !result.has_encrypted_content);
+	try testing.expectEqualStrings("header CRC mismatch", result.error_message.?);
 }

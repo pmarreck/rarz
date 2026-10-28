@@ -177,3 +177,7 @@ Completed PLAN.md items retired by plan-retire, oldest retirement first.
 - [x] [Recent completions] Fix static-musl package execution and add installed CLI smoke coverage (done 2026-10-10 00:25 EDT; 2ba2300).
 - [x] [Recent completions] Publish explicit outcome classification and required-case controls after complete acceptance and exact CI (done 2026-10-10 02:20 EDT; 7ddc241).
 - [x] [Recent completions] Reconcile stale issue/implementation checkboxes and archive the legacy plan with a recoverable original (done 2026-10-14 EDT; documentation migration pending acceptance).
+
+## Retired 2026-10-28
+
+- [x] [Recent completions] Trace and fix eager dictionary writes; pass 450 ReleaseSafe units and the full pristine/two-mutation v70 gate at 11.03 GiB peak, preserving source corpus bytes (done 2026-10-27 21:41 EDT; uncommitted, context: docs/plan_context/v70-memory.md).

@@ -19,6 +19,8 @@ for directory in cli support unit fixtures; do
 done
 cp "$project/assess-coverage" "$scratch/project/" || exit 1
 cp "$project/test" "$scratch/project/" || exit 1
+mkdir -p "$scratch/project/docs" || exit 1
+if [[ -d $project/docs/evidence ]]; then cp -R "$project/docs/evidence" "$scratch/project/docs/" || exit 1; fi
 for entry in build run scripts; do
 	if [[ -e $project/$entry ]]; then cp -R "$project/$entry" "$scratch/project/" || exit 1; fi
 done

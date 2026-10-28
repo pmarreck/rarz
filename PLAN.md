@@ -8,17 +8,16 @@ Completed records: [docs/PLAN_LOG.md](docs/PLAN_LOG.md). Historical decisions an
 
 ## Correctness queue
 
-- [x] Verify exact-commit CI for bounded RAR4 records and SALT/EXT_TIME parsing; complete 501-unit/CLI/v70 suite, native macOS checks, and optimized build passed, followed by exact CI in 82 seconds (done 2026-10-28 05:16 EDT; commit f3c3afd; #11, #5; context: docs/plan_context/rar4-optional-fields.md).
 - [ ] Account for encrypted RAR4 service/comment blocks without overstating file-only verification; awaiting a valid producer fixture after the guessed CMT conversion failed reference validation (#11).
 - [x] Verify exact-commit CI for the RAR5 multi-volume encryption fix; complete 503-unit/CLI/v70 suite, native macOS checks, and optimized build passed, followed by exact CI in 81 seconds (done 2026-10-28 05:23 EDT; commit 343ad30; context: docs/plan_context/mixed-encryption-volumes.md).
-- [ ] Verify exact-commit CI for encrypted-entry evidence in the multi-volume C API; complete 505-unit/CLI/v70 suite, native macOS checks, and optimized build pass (context: docs/plan_context/volume-verification-encryption.md).
+- [x] Verify exact-commit CI for encrypted-entry evidence in the multi-volume C API; complete 505-unit/CLI/v70 suite, native macOS checks, and optimized build passed, followed by exact CI in 58 seconds (done 2026-10-28 06:13 EDT; commit c2212c9; context: docs/plan_context/volume-verification-encryption.md).
 
 ## Evidence and resource follow-ups
 
 - [ ] Add tested interruption propagation from ./test to its admitted runtime scope; awaiting the shared wrapper's owning-scope cancellation contract before integration.
 - [x] Verify exact-commit CI for independent adjudication of all nine reference exceptions; full 503-unit/CLI/v70 suite and optimized build passed, followed by exact CI in 46 seconds, with historical classifications and confidence intervals preserved (done 2026-10-28 05:33 EDT; commit d0cbdea; context: docs/REFERENCE_EXCEPTION_ADJUDICATION_20261028.md).
 - [x] Verify exact-commit CI for versioned legacy mutation gates and distinct execution outcomes; full 503-unit/CLI/v70 suite, optimized build, and native macOS classifier/driver checks passed, followed by exact CI in 53 seconds (done 2026-10-28 05:51 EDT; commit d79d607; context: docs/plan_context/legacy-mutation-records.md).
-- [ ] Adjudicate stricter reference disagreements using exact mutations and format invariants before making stronger coverage claims (context: docs/ARCHIVE_EVIDENCE_INDEX.md).
+- [ ] Verify exact-commit CI for the 17 stricter volume cases; full 505-unit/CLI/v70 suite and optimized build pass, and exact replay proves partial declared quick-open payloads while reference file validation succeeds (context: docs/QUICKOPEN_TRUNCATION_ADJUDICATION_20261028.md).
 - [ ] Coordinate a PPM heap admission contract with the consumer; requested its authoritative contract, since header dictionary size omits the stream-declared heap of up to 256 MiB (context: docs/plan_context/development-history.md).
 - [x] Audit current no-checksum, unsupported-filter, and service-payload reporting against the published consumer contract; the adapter preserves incomplete counts but file verification does not cover ancillary payloads, and PPM/packed-input admission remains open (done 2026-10-28 06:11 EDT; context: docs/plan_context/consumer-contract-audit.md).
 - [ ] Reconcile the existing flake lock with the current nixpkgs freshness policy in a separate toolchain milestone.

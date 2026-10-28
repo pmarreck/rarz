@@ -20,6 +20,11 @@ establishes concrete structural damage in all nine reference-inconclusive
 cases from seeds 43 and 44. Their original classifications and statistical
 denominators remain unchanged.
 
+The [quick-open truncation adjudication](QUICKOPEN_TRUNCATION_ADJUDICATION_20261028.md)
+explains all 17 stricter volume cases with intact headers declaring service
+payload bytes beyond the cut. File validation can still succeed. The generic
+`stricter` category and historical counts remain unchanged.
+
 ## Replay
 
 Run `./test` for the complete local entry point:
@@ -204,11 +209,13 @@ and mutation definitions; this index does not rename or strengthen them.
 - The bounded mutation gates retain their legacy sampling positions and
   fixed-byte overwrites. Explicit outcome classification improves the evidence
   for those trials; it does not prove complete byte or format coverage.
-- A `stricter` result is an unadjudicated reference-valid/rarz-damaged
-  disagreement. It does not establish stronger correctness or the absence of
-  false positives. Each such case needs its fixture, exact mutation position,
+- A `stricter` result records a reference-valid/rarz-damaged
+  disagreement. By itself it does not establish stronger correctness or the
+  absence of false positives. Each case needs its fixture, exact mutation position,
   and a format invariant before it can be counted as justified rejection; an
   independently known-valid alternate belongs in a specificity regression.
+  The 17 exact volume cases now have the separate quick-open boundary evidence
+  linked above; that evidence does not adjudicate unrelated disagreements.
 - Required-case guards cover the solid, precision-volume, verify, and v70
   gates. This does not establish fixture-completeness enforcement in every
   other legacy suite.

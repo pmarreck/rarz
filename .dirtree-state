@@ -12,6 +12,7 @@ annotate=[
 	docs/MECHA_VALIDATE_V1_RAR_GATE.md = Measured Mecha Validate v1 support matrix, consumer summary contract, classifier evidence, and blockers
 	docs/PLAN_LOG.md = Retired completion records with historical evidence qualifications
 	docs/PROVENANCE_REVIEW_20261028.md = Repository evidence contradicting the unconditional specification-only implementation claim
+	docs/QUICKOPEN_TRUNCATION_ADJUDICATION_20261028.md = Exact quick-open payload shortfalls behind stricter reference results
 	docs/REFERENCE_EXCEPTION_ADJUDICATION_20261028.md = Independent adjudication of historical reference failures without changing sample counts
 	docs/evidence/coverage-20261015-candidate.sha256 = Frozen source, dependency, and binary identities
 	docs/evidence/coverage-20261015-cases.jsonl = Replay records for all 14 observed anomalies
@@ -67,6 +68,7 @@ annotate=[
 	tests/cli/test_packed_crc.sh = Independent split-volume checksum and writer interoperability controls
 	tests/cli/test_packet_status.sh = Exercise real signal exits, incomplete packets and historical receipt protection
 	tests/cli/test_precision_volumes.sh = Multi-volume precision: unrar-damaged => rarz must never report VALID (differential truncation sweep)
+	tests/cli/test_quickopen_truncation.sh = Independent byte-boundary controls for 17 ancillary truncation disagreements
 	tests/cli/test_rar2_comments.sh = Independent comment-header and payload corruption controls
 	tests/cli/test_rar2_decoded_size.sh = Independent replay of the seed-44 RAR2 trailing-match miss
 	tests/cli/test_rar2_truncation.sh = Reference-confirmed partial-header cuts and valid vintage EOF controls

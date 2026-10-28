@@ -270,7 +270,7 @@ pub const BlockIterator = struct {
 	pub fn next(self: *BlockIterator) ParseError!?ArchiveBlock {
 		if (self.pos >= self.data.len) return null;
 		// Need at least 7 bytes for a base header
-		if (self.data.len - self.pos < 7) return null;
+		if (self.data.len - self.pos < 7) return error.EndOfData;
 
 		var r = Reader.init(self.data[self.pos..]);
 		var block = try parse_block_header(&r);
@@ -742,6 +742,17 @@ test "walk_blocks handles empty remaining data" {
 	var iter = walk_blocks(data);
 	const result = try iter.next();
 	try testing.expectEqual(@as(?ArchiveBlock, null), result);
+}
+
+test "walk_blocks refuses every incomplete base header" {
+	const signature = [_]u8{ 0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x00 };
+	for (1..signature.len) |length| {
+		var iter = walk_blocks(signature[0..length]);
+		try testing.expectError(error.EndOfData, iter.next());
+	}
+	var complete = walk_blocks(&signature);
+	try testing.expect((try complete.next()) != null);
+	try testing.expectEqual(@as(?ArchiveBlock, null), try complete.next());
 }
 
 test "block iterator advances correctly for >4GB file (large flag)" {

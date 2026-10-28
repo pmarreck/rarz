@@ -4,12 +4,12 @@ Completed records: [docs/PLAN_LOG.md](docs/PLAN_LOG.md). Historical decisions an
 
 ## Current milestone
 
-- [ ] Publish the accumulated tested milestone and verify exact-commit CI; full migration acceptance passed all 451 units and CLI suites (context: docs/plan_context/v70-memory.md).
+- [ ] Publish the RAR2 partial-header fix after its complete 452-unit/CLI acceptance and verify exact-commit CI (context: docs/plan_context/rar2-truncation.md).
 - [ ] Qualify native macOS ARM64, Linux ARM64, and Windows runtime/isolation on their respective runners; current evidence is Linux AMD64 runtime plus five-target cross-build/publication checks (context: docs/plan_context/build-layout.md).
 
 ## Correctness queue
 
-- [ ] Reproduce and fix the three RAR2 suffix-truncation false acceptances from the statistical campaign with persistent failing regressions (context: docs/COVERAGE_20261015.md).
+- [ ] Reproduce and prevent FFI collection from swallowing parser errors and verifying a surviving archive prefix; cover single and multi-volume readers.
 - [ ] Determine whether header/checksum damage can be proved before returning UNVERIFIABLE for the six corrupted inputs resembling encrypted headers (context: docs/COVERAGE_20261015.md).
 - [ ] Reproduce and fix writer header overflow for names near 4096 bytes (#20).
 - [ ] Verify unknown-block skip semantics against the format contract and add rejection controls where required (#29).
@@ -50,12 +50,7 @@ Completed records: [docs/PLAN_LOG.md](docs/PLAN_LOG.md). Historical decisions an
 
 ## Recent completions
 
-- [x] Implement cross-platform-project-build-arch build/run/test layout, verified five-target publication, native profile checks, and assessment selection; complete ./test passed with native runtime limits documented (done 2026-10-27 23:02 EDT; uncommitted, context: docs/plan_context/build-layout.md).
+- [x] Reject the three RAR2 partial-header campaign misses and all 18 related cuts while preserving valid vintage EOF; complete ./test passed 452 units and all CLI suites (done 2026-10-27 23:19 EDT; commit pending, context: docs/plan_context/rar2-truncation.md).
+- [x] Publish corruption assessment, v70 memory correction, timestamps, and Nix target publication; exact commit 5e11586 passed Mechatron Prime CI in 87 seconds (done 2026-10-27 23:11 EDT; context: docs/plan_context/build-layout.md).
+- [x] Implement cross-platform-project-build-arch build/run/test layout, verified five-target publication, native profile checks, and assessment selection; complete ./test passed with native runtime limits documented (done 2026-10-27 23:02 EDT; commit 5e11586, context: docs/plan_context/build-layout.md).
 - [x] Trace and fix eager dictionary writes; pass 450 ReleaseSafe units and the full pristine/two-mutation v70 gate at 11.03 GiB peak, preserving source corpus bytes (done 2026-10-27 21:41 EDT; uncommitted, context: docs/plan_context/v70-memory.md).
-- [x] Add ./assess-coverage and finish the 18-pair campaign at 95% confidence and ±5-point precision; retain all 14 anomaly replays and report incomplete verification explicitly (done 2026-10-15 14:00 EDT; uncommitted, context: docs/COVERAGE_20261015.md).
-- [x] Add red-first real-signal and completion-evidence controls for acceptance receipts, preserving original interruption evidence and preparing a separate future wrapper (done 2026-10-14 16:13 EDT; uncommitted, no heavy rerun).
-- [x] Fix timestamp creation and format-aware listing with independent focused controls; full acceptance remains blocked by v70 memory throttling (done 2026-10-14 15:58 EDT; uncommitted, context: docs/plan_context/timestamps.md).
-- [x] Publish the dependency refresh and replayable archive evidence index (done 2026-10-09 23:57 EDT; 8b3b59d).
-- [x] Fix static-musl package execution and add installed CLI smoke coverage (done 2026-10-10 00:25 EDT; 2ba2300).
-- [x] Publish explicit outcome classification and required-case controls after complete acceptance and exact CI (done 2026-10-10 02:20 EDT; 7ddc241).
-- [x] Reconcile stale issue/implementation checkboxes and archive the legacy plan with a recoverable original (done 2026-10-14 EDT; documentation migration pending acceptance).

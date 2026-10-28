@@ -167,3 +167,13 @@ Completed PLAN.md items retired by plan-retire, oldest retirement first.
 - [x] Legacy Phase 2 decompression, compressed validation, solid-state reuse, BLAKE2sp payload verification, and multi-volume items were superseded by the completed implementations and existing evidence matrix.
 - [x] Source inspection confirms the RAR4 iterator uses u64 data sizes, the create FFI allocates beyond 64 entries, SFX detection is exported, and the build banner follows the actual optimization mode.
 - [x] Input-side streaming remains a separate possible enhancement; the accepted output-side streaming requirement was already delivered. Password and result-model redesign deferrals remain in the active plan.
+
+## Retired 2026-10-27
+
+- [x] [Recent completions] Add ./assess-coverage and finish the 18-pair campaign at 95% confidence and ±5-point precision; retain all 14 anomaly replays and report incomplete verification explicitly (done 2026-10-15 14:00 EDT; uncommitted, context: docs/COVERAGE_20261015.md).
+- [x] [Recent completions] Add red-first real-signal and completion-evidence controls for acceptance receipts, preserving original interruption evidence and preparing a separate future wrapper (done 2026-10-14 16:13 EDT; uncommitted, no heavy rerun).
+- [x] [Recent completions] Fix timestamp creation and format-aware listing with independent focused controls; full acceptance remains blocked by v70 memory throttling (done 2026-10-14 15:58 EDT; uncommitted, context: docs/plan_context/timestamps.md).
+- [x] [Recent completions] Publish the dependency refresh and replayable archive evidence index (done 2026-10-09 23:57 EDT; 8b3b59d).
+- [x] [Recent completions] Fix static-musl package execution and add installed CLI smoke coverage (done 2026-10-10 00:25 EDT; 2ba2300).
+- [x] [Recent completions] Publish explicit outcome classification and required-case controls after complete acceptance and exact CI (done 2026-10-10 02:20 EDT; 7ddc241).
+- [x] [Recent completions] Reconcile stale issue/implementation checkboxes and archive the legacy plan with a recoverable original (done 2026-10-14 EDT; documentation migration pending acceptance).

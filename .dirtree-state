@@ -15,6 +15,7 @@ annotate=[
 	docs/evidence/rar-fixtures.sha256 = Content hashes of the committed archive fixture corpus
 	docs/plan_context/build-layout.md = Build layout, publication controls, and qualification limits
 	docs/plan_context/development-history.md = Archived development decisions and measurements; superseded claims remain historical
+	docs/plan_context/rar2-truncation.md = Diagnosis and independent controls for incomplete legacy archive headers
 	docs/plan_context/timestamps.md = Timestamp encodings, independent interop controls and metadata API limits
 	docs/plan_context/v70-memory.md = Dictionary allocation trace, lazy history initialization, and v70 gate evidence
 	include/rarz.h = Stable C ABI for detection, archive inspection, validation summaries, verification, extraction, and creation
@@ -29,6 +30,7 @@ annotate=[
 	tests/cli/test_mtime.sh = Verify RAR timestamps against independent extraction, range guards and format-aware listings
 	tests/cli/test_packet_status.sh = Exercise real signal exits, incomplete packets and historical receipt protection
 	tests/cli/test_precision_volumes.sh = Multi-volume precision: unrar-damaged => rarz must never report VALID (differential truncation sweep)
+	tests/cli/test_rar2_truncation.sh = Reference-confirmed partial-header cuts and valid vintage EOF controls
 	tests/cli/test_rar4_volumes.sh = RAR4 multi-volume validation gates: agreement with unrar, plus per-volume damage detection
 	tests/cli/test_required_cases.sh = Inject required-fixture and known-damage completeness cases, including real empty-corpus driver failures
 	tests/cli/test_solid.sh = Solid-archive acceptance: extraction byte-identical to unrar, VALID verdict, and corruption still detected (differential vs unrar)
